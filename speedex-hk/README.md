@@ -1,7 +1,7 @@
 # speedex HK timing proxy（基于本 fork 的 mitmproxy）
 
 speedex 延迟研究 harness 的 HK 出口测量代理：mitmproxy addon + 控制面 + 部署件。
-**本分支（speedex-hk）是 proxy 侧代码的规范主仓**——addon/部署脚本只在
+**本 fork 的 `main` 分支是 proxy 侧代码的规范主仓**——addon/部署脚本只在
 `speedex-hk/` 目录演进（2026-09-14 自 speedex 主仓 `deploy/hk-proxy/` 迁出；
 speedex 主仓只保留消费侧 `scripts/lib/hk-timing-client.mjs` 等与部署文档 docs/）。
 
@@ -42,15 +42,13 @@ ssh root@HK SPEEDEX_HK_INSTANCE=experiment bash /opt/speedex-mitm-src/install.sh
 
 ## 上游 rebase（定期维护）
 
-本分支 `speedex-hk` = 上游 `main` + 本目录（独立路径，与上游文件零重叠，正常不会冲突）：
+fork 的 `main` = 上游 `main` + 本目录（独立路径，与上游文件零重叠，正常不会冲突）：
 
 ```bash
 git fetch upstream
-git rebase upstream/main speedex-hk
-git push --force-with-lease origin speedex-hk   # rebase 后必须强推（已含 lease 防误盖）
+git rebase upstream/main main
+git push --force-with-lease origin main   # rebase 后必须强推（已含 lease 防误盖）
 ```
-
-fork 的 `main` 保持只跟踪上游（`git push origin upstream/main:main`），不放业务代码。
 
 ## 隐私/安全基线
 
