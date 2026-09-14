@@ -141,8 +141,10 @@ import threading
 import time
 import urllib.request
 import uuid
-from collections import defaultdict, deque
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from collections import defaultdict
+from collections import deque
+from http.server import BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer
 
 try:
     import msgpack  # mitmproxy 依赖自带
@@ -150,21 +152,42 @@ except Exception:  # pragma: no cover
     msgpack = None
 
 try:
-    from websockets.sync.client import connect as ws_connect  # pip: websockets（install.sh 装）
+    from websockets.sync.client import (
+        connect as ws_connect,  # pip: websockets（install.sh 装）
+    )
 except Exception:  # pragma: no cover
     ws_connect = None
 
 # ── 链 RPC（HK 侧 receipt 轮询用；与 speedex configs/chains 对齐）──
 CHAINS = {
-    "bsc": {"family": "evm", "rpc": "https://bsc-dataseed1.binance.org", "chainIds": {56, "56", "0x38"}},
-    "robinhood": {"family": "evm", "rpc": "https://rpc.mainnet.chain.robinhood.com", "chainIds": {4663, "4663", "0x1237"}},
-    "solana": {"family": "solana", "rpc": "https://api.mainnet-beta.solana.com", "chainIds": set()},
+    "bsc": {
+        "family": "evm",
+        "rpc": "https://bsc-dataseed1.binance.org",
+        "chainIds": {56, "56", "0x38"},
+    },
+    "robinhood": {
+        "family": "evm",
+        "rpc": "https://rpc.mainnet.chain.robinhood.com",
+        "chainIds": {4663, "4663", "0x1237"},
+    },
+    "solana": {
+        "family": "solana",
+        "rpc": "https://api.mainnet-beta.solana.com",
+        "chainIds": set(),
+    },
 }
 CHAIN_ID_TO_NAME = {}
 for _name, _c in CHAINS.items():
     for _cid in _c["chainIds"]:
         CHAIN_ID_TO_NAME[_cid] = _name
-CHAIN_NAME_STR = {"bsc": "bsc", "solana": "solana", "sol": "solana", "robinhood": "robinhood", "rh": "robinhood", "bscchain": "bsc"}
+CHAIN_NAME_STR = {
+    "bsc": "bsc",
+    "solana": "solana",
+    "sol": "solana",
+    "robinhood": "robinhood",
+    "rh": "robinhood",
+    "bscchain": "bsc",
+}
 
 RECEIPT_POLL_INTERVAL_S = 0.8
 RECEIPT_POLL_TIMEOUT_S = 90.0
@@ -208,8 +231,12 @@ MAX_WS_BUFFER_PER_RUN = 64
 # 不是任何平台的锚来源——首个 `orderId|order_id|clientOrderId|id` 命中不分键名写 orderId、
 # 数字 orderId（无引号）漏配、任意嵌套 `"id"` 冒充订单号，均会让 FINISHED 帧「冲突」而整帧
 # 静默丢弃（hkL1aMs=None）。锚只从 schema-known 字段结构化抽取（_binance_resp_ids 等）。
-_EVM_HASH_RE = re.compile(r'"(?:transactionHash|txHash|hash|tx_hash|txid|signature)"\s*:\s*"(0x[0-9a-fA-F]{64}|[1-9A-HJ-NP-Za-km-z]{80,90})"')
-_ORDER_ID_RE = re.compile(r'"(?:orderId|order_id|clientOrderId|id)"\s*:\s*"([0-9A-Za-z\-]{6,64})"')
+_EVM_HASH_RE = re.compile(
+    r'"(?:transactionHash|txHash|hash|tx_hash|txid|signature)"\s*:\s*"(0x[0-9a-fA-F]{64}|[1-9A-HJ-NP-Za-km-z]{80,90})"'
+)
+_ORDER_ID_RE = re.compile(
+    r'"(?:orderId|order_id|clientOrderId|id)"\s*:\s*"([0-9A-Za-z\-]{6,64})"'
+)
 
 # 腿锚身份键（独立锚 + 路由身份）：成功/hash 采纳与 WS 帧→腿路由只看这三键
 _IDENTITY_KEYS = ("orderId", "clientOrderId", "txHash")
@@ -314,7 +341,7 @@ def _chain_from_text(body):
                 name = CHAIN_NAME_STR.get(v.lower())
                 if name:
                     return name
-    m = re.search(r'[?&]chain=(\w+)', body or "")
+    m = re.search(r"[?&]chain=(\w+)", body or "")
     if m:
         return CHAIN_NAME_STR.get(m.group(1).lower()) or None
     return None
@@ -364,7 +391,11 @@ def _anchor_verdict(anchor, ids):
     同词汇）：共同身份键（orderId/clientOrderId/txHash）全部相等 → 'positive'；一部分相等
     一部分不等 → 'conflict'（同单身份自相矛盾，优先拒绝）；全部不等 → 'miss'（他单，
     不毒化）；无共同键 → 'none'。返回 (verdict, shared)。"""
-    shared = [k for k in _IDENTITY_KEYS if anchor.get(k) is not None and ids.get(k) is not None]
+    shared = [
+        k
+        for k in _IDENTITY_KEYS
+        if anchor.get(k) is not None and ids.get(k) is not None
+    ]
     if not shared:
         return "none", shared
     eq = [_ident_norm(k, anchor[k]) == _ident_norm(k, ids[k]) for k in shared]
@@ -420,7 +451,11 @@ def _binance_resp_ids(text):
     txId 归一一致的唯一值（>1 个不同值 = 帧自相矛盾 → 不取 hash，记 ambiguous）。
     失败 ack（code≠000000、无 data.orderId）不提供身份——请求体 clientOrderId 仍是锚。"""
     j = _j(text)
-    data = j.get("data") if isinstance(j, dict) and isinstance(j.get("data"), dict) else None
+    data = (
+        j.get("data")
+        if isinstance(j, dict) and isinstance(j.get("data"), dict)
+        else None
+    )
     if not data:
         return {}
     out = {}
@@ -505,8 +540,13 @@ def _walk_resp_ids(text, order_keys, hash_keys):
     amb = []
     for e in entries:
         found = _collect_schema_values(e, keys)
-        oid, oid_amb = _single_value([v for k in order_keys for v in envelope[k] + found[k]], _id_value)
-        h, h_amb = _single_value([v for k in hash_keys for v in envelope[k] + found[k]], _transaction_id_value)
+        oid, oid_amb = _single_value(
+            [v for k in order_keys for v in envelope[k] + found[k]], _id_value
+        )
+        h, h_amb = _single_value(
+            [v for k in hash_keys for v in envelope[k] + found[k]],
+            _transaction_id_value,
+        )
         entry = {}
         if oid:
             entry["orderId"] = oid
@@ -517,7 +557,9 @@ def _walk_resp_ids(text, order_keys, hash_keys):
         if h_amb:
             amb.append("txHash")
         per.append(entry)
-    ident = [p for p in per if p.get("orderId") is not None or p.get("txHash") is not None]
+    ident = [
+        p for p in per if p.get("orderId") is not None or p.get("txHash") is not None
+    ]
     if not ident:
         return {"_ambiguous": sorted(set(amb))} if amb else {}
     # 跨 entry 合并：只并**正向一致**的 entry（≥1 共同身份键且共同键全等）；
@@ -527,7 +569,11 @@ def _walk_resp_ids(text, order_keys, hash_keys):
     for p in ident:
         placed = False
         for g in groups:
-            shared = [k for k in ("orderId", "txHash") if g.get(k) is not None and p.get(k) is not None]
+            shared = [
+                k
+                for k in ("orderId", "txHash")
+                if g.get(k) is not None and p.get(k) is not None
+            ]
             if not shared:
                 continue
             if all(_ident_norm(k, g[k]) == _ident_norm(k, p[k]) for k in shared):
@@ -538,7 +584,9 @@ def _walk_resp_ids(text, order_keys, hash_keys):
                 break
             conflict = True
         if not placed:
-            groups.append({k: p.get(k) for k in ("orderId", "txHash") if p.get(k) is not None})
+            groups.append(
+                {k: p.get(k) for k in ("orderId", "txHash") if p.get(k) is not None}
+            )
     if len(groups) == 1 and not conflict:
         out = dict(groups[0])
         if amb:
@@ -558,7 +606,18 @@ def _okx_resp_ids(text):
 
 
 _GMGN_ORDER_KEYS = ("orderId", "order_id", "oi")
-_GMGN_HASH_KEYS = ("hash", "tx_hash", "txHash", "txhash", "transactionHash", "transaction_hash", "txid", "tx_id", "txId", "signature")
+_GMGN_HASH_KEYS = (
+    "hash",
+    "tx_hash",
+    "txHash",
+    "txhash",
+    "transactionHash",
+    "transaction_hash",
+    "txid",
+    "tx_id",
+    "txId",
+    "signature",
+)
 
 
 def _gmgn_resp_ids(text):
@@ -591,7 +650,11 @@ def _fomo_resp_ids(text):
     out = {}
     ro = j.get("responseObject") if isinstance(j.get("responseObject"), dict) else {}
     v2 = ro.get("v2Swap") if isinstance(ro.get("v2Swap"), dict) else {}
-    rid = v2.get("relaySwapId") if v2.get("relaySwapId") is not None else ro.get("relaySwapId")
+    rid = (
+        v2.get("relaySwapId")
+        if v2.get("relaySwapId") is not None
+        else ro.get("relaySwapId")
+    )
     if isinstance(rid, str) and re.fullmatch(r"0[xX][0-9a-fA-F]{64}", rid):
         out["orderId"] = rid
     dcid = v2.get("destinationChainId")
@@ -618,7 +681,9 @@ def _okx_ws_entries(payload):
     if not isinstance(obj, dict):
         return []
     arg = obj.get("arg") or {}
-    if "dex-across-order-info" not in str(arg.get("channel")) and "dex-swap-order-info" not in str(arg.get("channel")):
+    if "dex-across-order-info" not in str(
+        arg.get("channel")
+    ) and "dex-swap-order-info" not in str(arg.get("channel")):
         return []
     data = obj.get("data")
     if isinstance(data, dict):
@@ -641,7 +706,9 @@ def _okx_ws_entries(payload):
         if str(dd.get("chainId") or "") == "501":
             ids["chain"] = "solana"
         elif dd.get("chainId") is not None:
-            c = CHAIN_ID_TO_NAME.get(str(dd["chainId"])) or CHAIN_ID_TO_NAME.get(dd["chainId"])
+            c = CHAIN_ID_TO_NAME.get(str(dd["chainId"])) or CHAIN_ID_TO_NAME.get(
+                dd["chainId"]
+            )
             if c:
                 ids["chain"] = c
         out.append({"ids": ids, "success": str(dd.get("status")) == "1"})
@@ -677,7 +744,13 @@ def _gmgn_ws_entries(payload):
             c = CHAIN_NAME_STR.get(str(d0["ch"]).lower())
             if c:
                 ids["chain"] = c
-        out.append({"ids": ids, "success": str(d0.get("st")) == "successful" and str(d0.get("si")) == "buy"})
+        out.append(
+            {
+                "ids": ids,
+                "success": str(d0.get("st")) == "successful"
+                and str(d0.get("si")) == "buy",
+            }
+        )
     return out
 
 
@@ -710,7 +783,13 @@ def _padre_frame_fresh(payload, leg, ids):
     found = {}
 
     def grab(n):
-        for key in ("creationTime", "firstUserClickMs", "createdAt", "createTime", "timestamp"):
+        for key in (
+            "creationTime",
+            "firstUserClickMs",
+            "createdAt",
+            "createTime",
+            "timestamp",
+        ):
             v = n.get(key)
             if isinstance(v, (int, float)) and v > 10**9:
                 found["ts"] = v
@@ -755,7 +834,10 @@ def _padre_ids_correlate(ids, anchor):
         if expected is None or observed is None:
             continue
         if key == "txHash":
-            expected, observed = _transaction_id_value(expected), _transaction_id_value(observed)
+            expected, observed = (
+                _transaction_id_value(expected),
+                _transaction_id_value(observed),
+            )
             if expected is None or observed is None:
                 return False
         if str(expected) != str(observed):
@@ -794,7 +876,9 @@ def _padre_ws_ids(payload):
     return out
 
 
-_BINANCE_BIZ_RE = re.compile(r"^(WEB3_DEX_.*_ORDER_CHANGE|DEX_ALL_ORDER|marketOrderInfo)$")
+_BINANCE_BIZ_RE = re.compile(
+    r"^(WEB3_DEX_.*_ORDER_CHANGE|DEX_ALL_ORDER|marketOrderInfo)$"
+)
 
 # 同一 content entry 的 schema hash 字段集合（与 binance-ws.mjs 同四键）
 _BINANCE_HASH_KEYS = ("orderTxId", "txHash", "signature", "txId")
@@ -839,7 +923,11 @@ def _binance_ws(payload, leg):
         # 自证关联不算数；缺 id 或无锚的 FINISHED 不得凭时间窗充数（陈旧重放假成功）。
         if leg.get("orderId") and oid and str(oid) == str(leg.get("orderId")):
             return True
-        if leg.get("clientOrderId") and cid and str(cid) == str(leg.get("clientOrderId")):
+        if (
+            leg.get("clientOrderId")
+            and cid
+            and str(cid) == str(leg.get("clientOrderId"))
+        ):
             return True
     return False
 
@@ -910,7 +998,12 @@ def _fomo_ws_ids(payload):
 
 RULES = {
     "okx": {
-        "match_order": lambda h, p, m: h == "web3.okx.com" and m == "POST" and re.search(r"/priapi/v6/dx/trade/multi/(batch)?[Bb]roadcast", p) is not None,
+        "match_order": lambda h, p, m: (
+            h == "web3.okx.com"
+            and m == "POST"
+            and re.search(r"/priapi/v6/dx/trade/multi/(batch)?[Bb]roadcast", p)
+            is not None
+        ),
         "extract_ids": _okx_resp_ids,
         "ws_hosts": ("wsdexpri.okx.com",),
         # 逐 entry 单元解析取代首-entry-only 的 ws_success/ws_ids
@@ -918,7 +1011,11 @@ RULES = {
         "extract_chain": _chain_from_text,
     },
     "gmgn": {
-        "match_order": lambda h, p, m: h == "gmgn.ai" and m == "POST" and ("swap_batch_order" in p or "/txproxy/v2/send_transaction" in p),
+        "match_order": lambda h, p, m: (
+            h == "gmgn.ai"
+            and m == "POST"
+            and ("swap_batch_order" in p or "/txproxy/v2/send_transaction" in p)
+        ),
         "extract_ids": _gmgn_resp_ids,
         "ws_hosts": ("ws.gmgn.ai",),
         "ws_entries": _gmgn_ws_entries,
@@ -928,9 +1025,18 @@ RULES = {
         # 下单走 WS msgpack（方法串未钉死）——出站时刻用次优 HTTP：Turnkey 签名调用。
         # Turnkey ActivityResponse 不含订单/交易身份 → 无独立锚 → sign 腿
         # 结构上不可晋升（HK-L1a′ 暂不可观测）；DONE 门/新鲜度门保留给未来锚源。
-        "match_order": lambda h, p, m: h == "api.turnkey.com" and m == "POST" and "/public/v1/submit/sign_raw_payload" in p,
+        "match_order": lambda h, p, m: (
+            h == "api.turnkey.com"
+            and m == "POST"
+            and "/public/v1/submit/sign_raw_payload" in p
+        ),
         "extract_ids": _padre_resp_ids,
-        "ws_hosts": ("backend3.padre.gg", "backend.padre.gg", "backend2.padre.gg", "txn-service.padre.gg"),
+        "ws_hosts": (
+            "backend3.padre.gg",
+            "backend.padre.gg",
+            "backend2.padre.gg",
+            "txn-service.padre.gg",
+        ),
         "ws_success": _padre_ws,
         "ws_ids": _padre_ws_ids,
         "extract_chain": _chain_from_text,
@@ -939,15 +1045,25 @@ RULES = {
         "ws_frame_fresh": _padre_frame_fresh,
     },
     "binance": {
-        "match_order": lambda h, p, m: m == "POST" and "/bapi/defi/v2/private/wallet-direct/web-dex/place-order" in p,
+        "match_order": lambda h, p, m: (
+            m == "POST"
+            and "/bapi/defi/v2/private/wallet-direct/web-dex/place-order" in p
+        ),
         "extract_ids": _binance_resp_ids,
-        "ws_hosts": ("nbstream.binance.com", "web3-stream.binance.com", "data-stream.binance.vision", "stream.binance.com"),
+        "ws_hosts": (
+            "nbstream.binance.com",
+            "web3-stream.binance.com",
+            "data-stream.binance.vision",
+            "stream.binance.com",
+        ),
         "ws_success": _binance_ws,
         "ws_ids": _binance_ws_ids,
         "extract_chain": _chain_from_text,
     },
     "fomo": {
-        "match_order": lambda h, p, m: h == "prod-api.fomo.family" and p.startswith("/swaps/v2") and m == "POST",
+        "match_order": lambda h, p, m: (
+            h == "prod-api.fomo.family" and p.startswith("/swaps/v2") and m == "POST"
+        ),
         "extract_ids": _fomo_resp_ids,
         "ws_hosts": ("ws.relay.link",),
         "ws_success": _fomo_ws,
@@ -958,9 +1074,18 @@ RULES = {
 
 
 def _jsonrpc(url, method, params, timeout=10):
-    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
+    body = json.dumps(
+        {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    ).encode()
     # 默认 Python-urllib UA 被 robinhood RPC 403（HK 出证实测）；换显式 UA 即通
-    req = urllib.request.Request(url, data=body, headers={"content-type": "application/json", "User-Agent": "speedex-hk-timing/1.0"})
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "content-type": "application/json",
+            "User-Agent": "speedex-hk-timing/1.0",
+        },
+    )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode()).get("result")
 
@@ -977,6 +1102,7 @@ class KeepAliveJsonRpc:
 
     def __init__(self, url, timeout=1.5, user_agent="speedex-hk-timing/1.0"):
         from urllib.parse import urlsplit
+
         self._parts = urlsplit(url)
         self.timeout = timeout
         self.user_agent = user_agent
@@ -985,10 +1111,14 @@ class KeepAliveJsonRpc:
     def _connect(self):
         if self._parts.scheme != "https":
             raise ValueError("keep-alive rpc only supports https")
-        self._conn = http.client.HTTPSConnection(self._parts.netloc, timeout=self.timeout)
+        self._conn = http.client.HTTPSConnection(
+            self._parts.netloc, timeout=self.timeout
+        )
 
     def __call__(self, method, params, timeout=None):
-        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+        body = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+        )
         headers = {"content-type": "application/json", "User-Agent": self.user_agent}
         path = self._parts.path or "/"
         for attempt in range(2):
@@ -1020,6 +1150,7 @@ class ChainHeadWindow:
     No network is started by Store/tests. Control /mark explicitly starts this
     collector. Hook snapshots only consult samples received before hook entry.
     """
+
     def __init__(self, rpc_call=_jsonrpc, connect=ws_connect, clock=None):
         self.rpc_call = rpc_call
         self.connect = connect
@@ -1034,7 +1165,11 @@ class ChainHeadWindow:
         # keep-alive 轮询客户端（per-chain 懒建；注入 rpc_call 时尊重注入，不建）
         self._ka = {}
         # 轮询可观测：成功/失败/末次错误（/health.diag.headPoll 透出，2026-09-12 head-v4）
-        self.diag = {"pollOk": defaultdict(int), "pollFail": defaultdict(int), "lastErr": {}}
+        self.diag = {
+            "pollOk": defaultdict(int),
+            "pollFail": defaultdict(int),
+            "lastErr": {},
+        }
 
     def diag_snapshot(self):
         with self.lock:
@@ -1085,9 +1220,19 @@ class ChainHeadWindow:
     def add(self, chain, result, source, sent=None):
         sol = chain == "solana"
         try:
-            height = result.get("slot") if sol and isinstance(result, dict) else result if sol else int(result["number"], 16)
+            height = (
+                result.get("slot")
+                if sol and isinstance(result, dict)
+                else result
+                if sol
+                else int(result["number"], 16)
+            )
             block_hash = None if sol else result["hash"]
-            if type(height) is not int or height < 0 or (not sol and not re.fullmatch(r"0x[0-9a-fA-F]{64}", block_hash)):
+            if (
+                type(height) is not int
+                or height < 0
+                or (not sol and not re.fullmatch(r"0x[0-9a-fA-F]{64}", block_hash))
+            ):
                 return
             # Solana 在 processed 承诺下无区块 hash——slotSubscribe 的 parent 槽位是
             # 唯一的分叉连续性证据；getSlot 轮询是裸整数（无 parent，同今的降级回退：
@@ -1111,13 +1256,38 @@ class ChainHeadWindow:
             # accepted head (parent == previous slot); same height with a different
             # proven parent is a fork. Discontinuity clears and re-anchors, mirroring
             # the EVM hash/parentHash conflict rule.
-            if previous and (height < previous["height"] or (height == previous["height"] and block_hash != previous["hash"]) or
-                (not sol and height == previous["height"] + 1 and result.get("parentHash", "").lower() != previous["hash"].lower()) or
-                (sol and parent is not None and ((height > previous["height"] and parent != previous["height"]) or
-                 (height == previous["height"] and previous.get("parent") is not None and previous["parent"] != parent)))):
+            if previous and (
+                height < previous["height"]
+                or (height == previous["height"] and block_hash != previous["hash"])
+                or (
+                    not sol
+                    and height == previous["height"] + 1
+                    and result.get("parentHash", "").lower() != previous["hash"].lower()
+                )
+                or (
+                    sol
+                    and parent is not None
+                    and (
+                        (height > previous["height"] and parent != previous["height"])
+                        or (
+                            height == previous["height"]
+                            and previous.get("parent") is not None
+                            and previous["parent"] != parent
+                        )
+                    )
+                )
+            ):
                 buf.clear()
-            buf.append({"height": height, "hash": block_hash, "parent": parent, "observedTs": at,
-                        "source": source, "roundtripMs": None if sent is None else at - sent})
+            buf.append(
+                {
+                    "height": height,
+                    "hash": block_hash,
+                    "parent": parent,
+                    "observedTs": at,
+                    "source": source,
+                    "roundtripMs": None if sent is None else at - sent,
+                }
+            )
 
     def snapshot(self, run_id, at):
         with self.lock:
@@ -1126,14 +1296,26 @@ class ChainHeadWindow:
             out = {}
             for chain, buf in self.samples.items():
                 sample = next((x for x in reversed(buf) if x["observedTs"] <= at), None)
-                base = {"version": 1, "chain": chain, "epoch": run_id,
-                        "anchor": "proxy-order-request", "vantage": "hk",
-                        "commitment": "processed" if chain == "solana" else "latest",
-                        "anchorTs": at, "clockErrorMs": 0, "intervalMs": 500, "maxAgeMs": 2000}
+                base = {
+                    "version": 1,
+                    "chain": chain,
+                    "epoch": run_id,
+                    "anchor": "proxy-order-request",
+                    "vantage": "hk",
+                    "commitment": "processed" if chain == "solana" else "latest",
+                    "anchorTs": at,
+                    "clockErrorMs": 0,
+                    "intervalMs": 500,
+                    "maxAgeMs": 2000,
+                }
                 if sample:
                     age = at - sample["observedTs"]
-                    out[chain] = {**base, **sample, "sampleAgeMs": age,
-                                  "status": "ok" if age <= 2000 else "stale-head"}
+                    out[chain] = {
+                        **base,
+                        **sample,
+                        "sampleAgeMs": age,
+                        "status": "ok" if age <= 2000 else "stale-head",
+                    }
                 else:
                     out[chain] = {**base, "status": "no-pre-anchor-head"}
             return out
@@ -1143,26 +1325,39 @@ class ChainHeadWindow:
         while not self.stop.is_set():
             with self.lock:
                 buf = self.samples[chain]
-                fresh = bool(buf and buf[-1]["source"] == "ws-head" and self.clock() - buf[-1]["observedTs"] < 1000)
+                fresh = bool(
+                    buf
+                    and buf[-1]["source"] == "ws-head"
+                    and self.clock() - buf[-1]["observedTs"] < 1000
+                )
             if not fresh:
                 sent = self.clock()
                 try:
                     sol = chain == "solana"
-                    result = self._poll_call(chain, "getSlot" if sol else "eth_getBlockByNumber",
-                        [{"commitment": "processed"}] if sol else ["latest", False])
+                    result = self._poll_call(
+                        chain,
+                        "getSlot" if sol else "eth_getBlockByNumber",
+                        [{"commitment": "processed"}] if sol else ["latest", False],
+                    )
                     self.add(chain, result, "rpc-poll", sent)
                     with self.lock:
                         self.diag["pollOk"][chain] += 1
                 except Exception as e:
                     with self.lock:
                         self.diag["pollFail"][chain] += 1
-                        self.diag["lastErr"][chain] = f"{type(e).__name__}: {str(e)[:80]}"
+                        self.diag["lastErr"][chain] = (
+                            f"{type(e).__name__}: {str(e)[:80]}"
+                        )
             self.stop.wait(0.5)
 
     def _ws(self, chain):
         if self.connect is None:
             return
-        url = CHAINS[chain]["rpc"].replace("https://", "wss://").replace("http://", "ws://")
+        url = (
+            CHAINS[chain]["rpc"]
+            .replace("https://", "wss://")
+            .replace("http://", "ws://")
+        )
         sol = chain == "solana"
         while not self.stop.is_set():
             try:
@@ -1170,9 +1365,18 @@ class ChainHeadWindow:
                     with self.lock:
                         self.sockets.append(ws)
                     try:
-                        ws.send(json.dumps({"jsonrpc": "2.0", "id": 1,
-                            "method": "slotSubscribe" if sol else "eth_subscribe",
-                            "params": [] if sol else ["newHeads"]}))
+                        ws.send(
+                            json.dumps(
+                                {
+                                    "jsonrpc": "2.0",
+                                    "id": 1,
+                                    "method": "slotSubscribe"
+                                    if sol
+                                    else "eth_subscribe",
+                                    "params": [] if sol else ["newHeads"],
+                                }
+                            )
+                        )
                         subscription = None
                         while not self.stop.is_set():
                             try:
@@ -1183,12 +1387,21 @@ class ChainHeadWindow:
                                 if msg.get("error"):
                                     break
                                 subscription = msg.get("result")
-                            elif subscription is not None and msg.get("params", {}).get("subscription") == subscription and msg.get("method") == ("slotNotification" if sol else "eth_subscription"):
+                            elif (
+                                subscription is not None
+                                and msg.get("params", {}).get("subscription")
+                                == subscription
+                                and msg.get("method")
+                                == ("slotNotification" if sol else "eth_subscription")
+                            ):
                                 self.add(chain, msg["params"]["result"], "ws-head")
                     finally:
                         with self.lock:
                             self.sockets.remove(ws)
-                            if self.samples[chain] and self.samples[chain][-1]["source"] == "ws-head":
+                            if (
+                                self.samples[chain]
+                                and self.samples[chain][-1]["source"] == "ws-head"
+                            ):
                                 self.samples[chain].clear()
             except Exception:
                 pass
@@ -1212,6 +1425,7 @@ def _start_heads(run_id, manifest):
 # 口径与 speedex scripts/lib/platform-ws-latency.mjs 对齐（method 名一致）；
 # 失败一律 None——绝不发明数字。
 
+
 def _probe_http_ping(host, path, timeout=6, conn_cls=None):
     """binance 口径：同一 keep-alive 连接上预热 1 次（丢弃）+ 3 热样本中位数；
     ms=round(rtt/2)，与 EU httpPingRtt 同口径。http.client 显式复用连接
@@ -1221,9 +1435,14 @@ def _probe_http_ping(host, path, timeout=6, conn_cls=None):
     try:
         conn = cls(host, timeout=timeout)
         try:
+
             def once():
                 t0 = time.monotonic()
-                conn.request("GET", path, headers={"accept": "*/*", "user-agent": "speedex-hk-probe"})
+                conn.request(
+                    "GET",
+                    path,
+                    headers={"accept": "*/*", "user-agent": "speedex-hk-probe"},
+                )
                 r = conn.getresponse()
                 r.read()  # 读空 body——连接才可复用（keep-alive）
                 return round((time.monotonic() - t0) * 1000)
@@ -1231,7 +1450,12 @@ def _probe_http_ping(host, path, timeout=6, conn_cls=None):
             once()  # 预热：TCP+TLS 握手吸收在第一次
             samples = sorted(once() for _ in range(3))
             rtt = samples[1]
-            return {"ms": max(1, round(rtt / 2)), "rttMs": rtt, "method": "http-ping", "at": int(time.time() * 1000)}
+            return {
+                "ms": max(1, round(rtt / 2)),
+                "rttMs": rtt,
+                "method": "http-ping",
+                "at": int(time.time() * 1000),
+            }
         finally:
             conn.close()
     except Exception:
@@ -1251,14 +1475,23 @@ def _probe_https_warm(host, path, timeout=6, conn_cls=None):
 
             def once():
                 t0 = time.monotonic()
-                conn.request("GET", path, headers={"accept": "*/*", "user-agent": "speedex-hk-probe"})
+                conn.request(
+                    "GET",
+                    path,
+                    headers={"accept": "*/*", "user-agent": "speedex-hk-probe"},
+                )
                 r = conn.getresponse()
                 r.read()  # 读空 body——连接才可复用（keep-alive）
                 return round((time.monotonic() - t0) * 1000)
 
             once()  # 预热：握手吸收在第一次
             rtt = once()  # 热连接第二次 ≈ 1×RTT + 服务器处理（EU httpsWarmRtt 同口径）
-            return {"ms": rtt, "rttMs": rtt, "method": "https-warm", "at": int(time.time() * 1000)}
+            return {
+                "ms": rtt,
+                "rttMs": rtt,
+                "method": "https-warm",
+                "at": int(time.time() * 1000),
+            }
         finally:
             conn.close()
     except Exception:
@@ -1273,7 +1506,11 @@ def _probe_okx_ws(timeout=6):
         return None
     try:
         nonce = hashlib.md5(str(time.monotonic_ns()).encode()).hexdigest()
-        with ws_connect("wss://wsdexpri.okx.com/ws/v5/ipublic", open_timeout=timeout, close_timeout=2) as ws:
+        with ws_connect(
+            "wss://wsdexpri.okx.com/ws/v5/ipublic",
+            open_timeout=timeout,
+            close_timeout=2,
+        ) as ws:
             t0 = time.monotonic()  # 握手完成后才起表
             ws.send(f"ping|{nonce}|{int(time.time() * 1000)}")
             while time.monotonic() - t0 < timeout:
@@ -1281,7 +1518,12 @@ def _probe_okx_ws(timeout=6):
                 m = re.match(r"^pong\|([0-9a-f]{32})$", str(msg), re.I)
                 if m and m.group(1).lower() == nonce:
                     rtt = round((time.monotonic() - t0) * 1000)
-                    return {"ms": max(1, round(rtt / 2)), "rttMs": rtt, "method": "ws-ping", "at": int(time.time() * 1000)}
+                    return {
+                        "ms": max(1, round(rtt / 2)),
+                        "rttMs": rtt,
+                        "method": "ws-ping",
+                        "at": int(time.time() * 1000),
+                    }
         return None
     except Exception:
         return None
@@ -1295,18 +1537,27 @@ def _probe_padre_ws(timeout=6):
     try:
         mid = int(time.time() * 1000) % 0x7FFFFFFF
         frame = msgpack.packb([8, mid, "/ping/ping", f"hk-{mid:x}"])
-        with ws_connect("wss://backend3.padre.gg/_multiplex", open_timeout=timeout, close_timeout=2) as ws:
+        with ws_connect(
+            "wss://backend3.padre.gg/_multiplex", open_timeout=timeout, close_timeout=2
+        ) as ws:
             t0 = time.monotonic()  # 握手完成后才起表
             ws.send(frame)
             while time.monotonic() - t0 < timeout:
                 msg = ws.recv(timeout=max(0.1, timeout - (time.monotonic() - t0)))
                 try:
-                    v = msgpack.unpackb(msg if isinstance(msg, bytes) else bytes(msg), raw=False)
+                    v = msgpack.unpackb(
+                        msg if isinstance(msg, bytes) else bytes(msg), raw=False
+                    )
                 except Exception:
                     continue
                 if isinstance(v, list) and len(v) >= 2 and v[0] == 9 and v[1] == mid:
                     rtt = round((time.monotonic() - t0) * 1000)
-                    return {"ms": max(1, round(rtt / 2)), "rttMs": rtt, "method": "ws-ping", "at": int(time.time() * 1000)}
+                    return {
+                        "ms": max(1, round(rtt / 2)),
+                        "rttMs": rtt,
+                        "method": "ws-ping",
+                        "at": int(time.time() * 1000),
+                    }
         return None
     except Exception:
         return None
@@ -1318,12 +1569,19 @@ def _probe_fomo_ws(timeout=6):
         return None
     try:
         t0 = time.monotonic()
-        with ws_connect("wss://prod-api.fomo.family/ws", open_timeout=timeout, close_timeout=2) as ws:
+        with ws_connect(
+            "wss://prod-api.fomo.family/ws", open_timeout=timeout, close_timeout=2
+        ) as ws:
             while time.monotonic() - t0 < timeout:
                 msg = ws.recv(timeout=max(0.1, timeout - (time.monotonic() - t0)))
                 if "challenge" in str(msg):
                     rtt = round((time.monotonic() - t0) * 1000)
-                    return {"ms": rtt, "rttMs": rtt, "method": "ws-challenge", "at": int(time.time() * 1000)}
+                    return {
+                        "ms": rtt,
+                        "rttMs": rtt,
+                        "method": "ws-challenge",
+                        "at": int(time.time() * 1000),
+                    }
         return None
     except Exception:
         return None
@@ -1372,13 +1630,20 @@ def get_egress():
     if _EGRESS_CACHE["data"] and now - _EGRESS_CACHE["at"] < _EGRESS_TTL_S:
         return _EGRESS_CACHE["data"]
     try:
-        req = urllib.request.Request("http://ip-api.com/json/?fields=status,country,countryCode,regionName,city,isp,query", headers={"user-agent": "speedex-hk-probe"})
+        req = urllib.request.Request(
+            "http://ip-api.com/json/?fields=status,country,countryCode,regionName,city,isp,query",
+            headers={"user-agent": "speedex-hk-probe"},
+        )
         with urllib.request.urlopen(req, timeout=8) as r:
             j = json.loads(r.read().decode())
         if j.get("status") == "success":
             _EGRESS_CACHE["data"] = {
                 "ip": j.get("query"),
-                "label": " / ".join(x for x in (j.get("country"), j.get("regionName"), j.get("city")) if x),
+                "label": " / ".join(
+                    x
+                    for x in (j.get("country"), j.get("regionName"), j.get("city"))
+                    if x
+                ),
                 "isp": j.get("isp"),
                 "countryCode": j.get("countryCode"),  # vantage 推导源
             }
@@ -1395,10 +1660,16 @@ def _vantage(fetch=False):
     eg = None
     if fetch:
         eg = get_egress()
-    elif _EGRESS_CACHE["data"] and time.monotonic() - _EGRESS_CACHE["at"] < _EGRESS_TTL_S:
+    elif (
+        _EGRESS_CACHE["data"] and time.monotonic() - _EGRESS_CACHE["at"] < _EGRESS_TTL_S
+    ):
         eg = _EGRESS_CACHE["data"]
     cc = (eg or {}).get("countryCode")
-    return f"{cc.strip().lower()}-proxy" if isinstance(cc, str) and cc.strip() else "unknown-proxy"
+    return (
+        f"{cc.strip().lower()}-proxy"
+        if isinstance(cc, str) and cc.strip()
+        else "unknown-proxy"
+    )
 
 
 def _collection_identity():
@@ -1508,7 +1779,9 @@ class Store:
         self.open_legs = {}  # platform -> 等待成功信号的最近腿（关窗即撤销）
         self.events = defaultdict(list)
         self.gone = deque(maxlen=GONE_IDS_MAX)  # 已回收 runId 墓碑
-        self.diag = defaultdict(int)  # 诊断计数（如 orderReqNoWindow——关窗后拒绝的下单请求）
+        self.diag = defaultdict(
+            int
+        )  # 诊断计数（如 orderReqNoWindow——关窗后拒绝的下单请求）
         # per-run 诊断计数（timeline.diag 透出——WS 帧带身份却无腿可归属 /
         # 锚冲突拒收 / 锚身份冲突 / 歧义等「静默丢失」全部可见）
         self.run_diag = defaultdict(lambda: defaultdict(int))
@@ -1544,7 +1817,9 @@ class Store:
         if m and m["closed"] is None:
             return True
         return any(
-            leg.get("receiptPolling") and leg.get("tReceiptMs") is None and not leg.get("incomplete")
+            leg.get("receiptPolling")
+            and leg.get("tReceiptMs") is None
+            and not leg.get("incomplete")
             for leg in self.legs.get(run_id, [])
         )
 
@@ -1552,7 +1827,9 @@ class Store:
         """有界 retention——完成的 run 只留最近 RETENTION_RUNS 个，其余回收
         （墓碑进 gone，timeline 明确标 gone 而非空完整 timeline）。"""
         kept = 0
-        for rid in sorted(self.marks, key=lambda r: self.marks[r]["opened"], reverse=True):
+        for rid in sorted(
+            self.marks, key=lambda r: self.marks[r]["opened"], reverse=True
+        ):
             if self._run_pinned_locked(rid):
                 continue
             if kept < RETENTION_RUNS:
@@ -1591,13 +1868,25 @@ class Store:
                     if not isinstance(x, dict):
                         continue
                     r = x.get("rounds")
-                    r = r if isinstance(r, int) and not isinstance(r, bool) and 1 <= r <= 64 else 1
+                    r = (
+                        r
+                        if isinstance(r, int)
+                        and not isinstance(r, bool)
+                        and 1 <= r <= 64
+                        else 1
+                    )
                     if len(manifest_legs) >= 256 or total + r > 4096:
                         break
                     manifest_legs.append(
                         {
-                            "platform": (str(x.get("platform"))[:32] if x.get("platform") else None),
-                            "chain": (str(x.get("chain"))[:32] if x.get("chain") else None),
+                            "platform": (
+                                str(x.get("platform"))[:32]
+                                if x.get("platform")
+                                else None
+                            ),
+                            "chain": (
+                                str(x.get("chain"))[:32] if x.get("chain") else None
+                            ),
                             "rounds": r,
                         }
                     )
@@ -1635,13 +1924,18 @@ class Store:
     def any_open(self):
         with self.lock:
             now = time.monotonic()
-            return any(m["closed"] is None and now - m["opened"] < MARK_TTL_S for m in self.marks.values())
+            return any(
+                m["closed"] is None and now - m["opened"] < MARK_TTL_S
+                for m in self.marks.values()
+            )
 
     def _open_run_ids_locked(self, now):
         """（须持锁）开窗 run 列表，最新在前；TTL 到期的窗口顺手关闭+冻结。"""
         out = []
         # 最新在前（插入序取最旧是错的）；TTL 到期自动关窗+冻结
-        for rid, m in sorted(self.marks.items(), key=lambda kv: kv[1]["opened"], reverse=True):
+        for rid, m in sorted(
+            self.marks.items(), key=lambda kv: kv[1]["opened"], reverse=True
+        ):
             if m["closed"] is None and now - m["opened"] < MARK_TTL_S:
                 out.append(rid)
             elif m["closed"] is None:
@@ -1688,18 +1982,29 @@ class Store:
                 return i
         return None
 
-    def _same_order_bound_leg_locked(self, run_id, ident, except_leg=None, platform=None):
+    def _same_order_bound_leg_locked(
+        self, run_id, ident, except_leg=None, platform=None
+    ):
         """（须持锁）同 run 内与 ident 同订单的已绑槽腿。正向匹配——
         至少一个共同身份键（orderId/clientOrderId）且全部共同键相等；共同键冲突或
         无共同键 = 无法证明同单，不匹配（不猜）。dup/未绑槽的腿不作归并目标。
         带 platform 维度——同 orderId 跨平台不合并；被否决
         （_anchorVeto）的腿锚已自相矛盾，同样不作归并目标。"""
         for other in self.legs.get(run_id, []):
-            if other is except_leg or other.get("dup") or other.get("slot") is None or other.get("_anchorVeto"):
+            if (
+                other is except_leg
+                or other.get("dup")
+                or other.get("slot") is None
+                or other.get("_anchorVeto")
+            ):
                 continue
             if platform is not None and other.get("platform") != platform:
                 continue
-            shared = [k for k in ("orderId", "clientOrderId") if ident.get(k) is not None and other.get(k) is not None]
+            shared = [
+                k
+                for k in ("orderId", "clientOrderId")
+                if ident.get(k) is not None and other.get(k) is not None
+            ]
             if shared and all(str(other[k]) == str(ident[k]) for k in shared):
                 return other
         return None
@@ -1719,14 +2024,24 @@ class Store:
             return True  # 锚自相矛盾的腿保持 diagnostic——不改判、不消费新槽
         if leg.get("dup"):
             formal0 = leg.get("_dupOf")
-            if isinstance(formal0, dict) and not formal0.get("windowClosed") and self._dup_identity_conflict_locked(leg, formal0):
+            if (
+                isinstance(formal0, dict)
+                and not formal0.get("windowClosed")
+                and self._dup_identity_conflict_locked(leg, formal0)
+            ):
                 self._reopen_dup_locked(leg)
                 return False
             return True
-        ident = {k: leg.get(k) for k in ("orderId", "clientOrderId") if leg.get(k) is not None}
+        ident = {
+            k: leg.get(k)
+            for k in ("orderId", "clientOrderId")
+            if leg.get(k) is not None
+        }
         if not ident:
             return False  # 身份缺失——不猜
-        formal = self._same_order_bound_leg_locked(leg.get("runId"), ident, leg, platform=leg.get("platform"))
+        formal = self._same_order_bound_leg_locked(
+            leg.get("runId"), ident, leg, platform=leg.get("platform")
+        )
         if formal is None:
             return False
         if (
@@ -1761,7 +2076,11 @@ class Store:
         （一侧缺失不算——缺失不是反证）。"""
         la, fa = leg.get("_anchor") or {}, formal.get("_anchor") or {}
         for k in _IDENTITY_KEYS:
-            if la.get(k) is not None and fa.get(k) is not None and _ident_norm(k, la[k]) != _ident_norm(k, fa[k]):
+            if (
+                la.get(k) is not None
+                and fa.get(k) is not None
+                and _ident_norm(k, la[k]) != _ident_norm(k, fa[k])
+            ):
                 return True
         return False
 
@@ -1782,9 +2101,18 @@ class Store:
         if leg.get("runId"):
             self.run_diag[leg["runId"]]["orderDupReopened"] += 1
         mark = self.marks.get(leg.get("runId")) or {}
-        if mark.get("manifestLegs") and leg.get("anchorRole") == "order" and leg.get("slot") is None and not leg.get("unbound"):
+        if (
+            mark.get("manifestLegs")
+            and leg.get("anchorRole") == "order"
+            and leg.get("slot") is None
+            and not leg.get("unbound")
+        ):
             chain = leg.get("chain")
-            b = self._bind_slot_locked(leg["runId"], leg["platform"], chain) if chain else None
+            b = (
+                self._bind_slot_locked(leg["runId"], leg["platform"], chain)
+                if chain
+                else None
+            )
             if b is not None:
                 leg["slot"] = b
             else:
@@ -1813,7 +2141,14 @@ class Store:
         self.diag["orderReqDuplicate"] += 1
         # 已落地证据随 formal 资格移交（首写不覆盖本腿已有值）；dup 腿清空成功/receipt
         # ——成功永不留在 dup 腿（移交同律）
-        for k in ("tSuccessPushMs", "wsSha", "successAnchorKeys", "tReceiptMs", "receipt", "txHash"):
+        for k in (
+            "tSuccessPushMs",
+            "wsSha",
+            "successAnchorKeys",
+            "tReceiptMs",
+            "receipt",
+            "txHash",
+        ):
             if leg.get(k) is None and formal.get(k) is not None:
                 leg[k] = formal[k]
             if k != "txHash":
@@ -1854,7 +2189,9 @@ class Store:
                 if k not in conflicts:
                     conflicts.append(k)
                 if source_leg is not None:
-                    sd = source_leg.setdefault("_anchorDiag", {}).setdefault("conflicts", [])
+                    sd = source_leg.setdefault("_anchorDiag", {}).setdefault(
+                        "conflicts", []
+                    )
                     if k not in sd:
                         sd.append(k)
                 self.diag["anchorConflict"] += 1
@@ -1903,7 +2240,11 @@ class Store:
             return
         leg["anchorRole"] = "order"
         mark = self.marks.get(leg.get("runId")) or {}
-        if mark.get("manifestLegs") and leg.get("slot") is None and not leg.get("unbound"):
+        if (
+            mark.get("manifestLegs")
+            and leg.get("slot") is None
+            and not leg.get("unbound")
+        ):
             if self._dedup_order_identity_locked(leg):
                 return
             chain = leg.get("chain") or (leg.get("receipt") or {}).get("chain")
@@ -1937,15 +2278,27 @@ class Store:
             return None
         mark = self.marks.get(run_id) or {}
         detail = mark.get("manifestLegs")
-        role = "preview" if platform == "fomo" else ("sign" if platform == "padre" else "order")
+        role = (
+            "preview"
+            if platform == "fomo"
+            else ("sign" if platform == "padre" else "order")
+        )
         slot = None
         unbound = False
         pending_bind = False
         dup = False
         dup_of = None
         if detail and role == "order":
-            ident = {k: ev.get(k) for k in ("orderId", "clientOrderId") if ev.get(k) is not None}
-            formal = self._same_order_bound_leg_locked(run_id, ident, platform=platform) if ident else None
+            ident = {
+                k: ev.get(k)
+                for k in ("orderId", "clientOrderId")
+                if ev.get(k) is not None
+            }
+            formal = (
+                self._same_order_bound_leg_locked(run_id, ident, platform=platform)
+                if ident
+                else None
+            )
             if formal is not None:
                 # 同单重复请求归入同一授权槽（诊断腿，不占新槽）；登记
                 # 归并目标——成功帧按身份路由时归到 formal 腿，永不留在 dup 腿
@@ -1962,7 +2315,14 @@ class Store:
                     unbound = True
                     self.diag["orderReqUnbound"] += 1
         # 到达序是纯观察事实（含 preview/sign/dup/unbound 腿——到达即序）
-        obs_idx = sum(1 for x in self.legs[run_id] if x["platform"] == platform and x.get("chain") == chain) + 1
+        obs_idx = (
+            sum(
+                1
+                for x in self.legs[run_id]
+                if x["platform"] == platform and x.get("chain") == chain
+            )
+            + 1
+        )
         leg = {
             "platform": platform,
             "chain": chain,
@@ -2009,7 +2369,9 @@ class Store:
         """hook 入口绑定窗口身份；之后解析不能把旧请求重新归给新窗口。"""
         with self.lock:
             now = time.monotonic()
-            for r, m in sorted(self.marks.items(), key=lambda kv: kv[1]["opened"], reverse=True):
+            for r, m in sorted(
+                self.marks.items(), key=lambda kv: kv[1]["opened"], reverse=True
+            ):
                 if m["closed"] is None and now - m["opened"] < MARK_TTL_S:
                     if observed_ms >= m["opened"] * 1000:
                         return r, m["epoch"]
@@ -2029,7 +2391,12 @@ class Store:
             if mark and mark["closed"] is None and now - mark["opened"] >= MARK_TTL_S:
                 mark["closed"] = now
                 self._freeze_run_locked(rid)
-            if not mark or mark["closed"] is not None or mark.get("epoch") != epoch or ev["t"] < mark["opened"] * 1000:
+            if (
+                not mark
+                or mark["closed"] is not None
+                or mark.get("epoch") != epoch
+                or ev["t"] < mark["opened"] * 1000
+            ):
                 self.diag["orderReqNoWindow"] += 1
                 return None, None
             if len(self.legs[rid]) >= MAX_LEGS_PER_RUN:
@@ -2106,13 +2473,18 @@ class Store:
                     if newest:
                         self.run_diag[newest][key] += 1
                 return None, reason
+
             # 候选排序：非 dup > 已绑槽（formal）> 出站时刻——order/sign 腿取最早（首次
             # 下单请求 = EU 侧 order_http_out 同义，平台重发含在 L1a′ 内，与 docs/binance.md
             # §90 口径一致）；preview 腿取最晚（fomo 预览/执行 L7 不可区分，同 relaySwapId
             # 的最后一次 /swaps/v2 最接近执行 POST——沿用 r7 前「最新腿」近似，不放大预览提前量）
             def _pref(x):
                 t = x.get("tOrderOutMs") or 0
-                return (bool(x.get("dup")), x.get("slot") is None, -t if x.get("anchorRole") == "preview" else t)
+                return (
+                    bool(x.get("dup")),
+                    x.get("slot") is None,
+                    -t if x.get("anchorRole") == "preview" else t,
+                )
 
             positives.sort(key=_pref)
             target = positives[0]
@@ -2143,7 +2515,9 @@ class Store:
                 reason = "dup-merged"
             return target, reason
 
-    def buffer_ws_unit(self, platform, host, payload, ids, success, t, tw, count_diag=True):
+    def buffer_ws_unit(
+        self, platform, host, payload, ids, success, t, tw, count_diag=True
+    ):
         """WS 成功/身份帧可能先于其 HTTP 响应到达（docs/okx.md §2.4：
         Sol 的 /broadcast 常晚于 WS 确认）——零命中且本开窗该平台还有**无锚腿**
         （响应未到、锚待定）时缓冲该单元：保留单调源时间 t / 墙钟 tw / 窗口身份
@@ -2159,7 +2533,9 @@ class Store:
             if rid is None:
                 return False
             anchorless = any(
-                leg["platform"] == platform and not leg.get("windowClosed") and not (leg.get("_anchor") or {})
+                leg["platform"] == platform
+                and not leg.get("windowClosed")
+                and not (leg.get("_anchor") or {})
                 for leg in self.legs.get(rid, [])
             )
             if not anchorless:
@@ -2200,7 +2576,9 @@ class Store:
                 return []
             taken, rest = [], []
             for e in self.ws_buffer.get(run_id) or []:
-                if e.get("platform") == platform and e.get("epoch") == mark.get("epoch"):
+                if e.get("platform") == platform and e.get("epoch") == mark.get(
+                    "epoch"
+                ):
                     taken.append(e)
                 else:
                     rest.append(e)
@@ -2249,7 +2627,9 @@ class Store:
                         if leg.get(k) is None:
                             leg[k] = v
                     elif _ident_norm(k, anchor[k]) != _ident_norm(k, v):
-                        conflicts = leg.setdefault("_anchorDiag", {}).setdefault("conflicts", [])
+                        conflicts = leg.setdefault("_anchorDiag", {}).setdefault(
+                            "conflicts", []
+                        )
                         if k not in conflicts:
                             conflicts.append(k)
                         self.diag["anchorConflict"] += 1
@@ -2262,7 +2642,9 @@ class Store:
                 self._veto_leg_locked(leg)
             formal = leg.get("_dupOf")
             if formal is not None and not leg.get("_anchorVeto"):
-                self._merge_anchor_locked(formal, {k: kv.get(k) for k in _IDENTITY_KEYS}, source_leg=leg)
+                self._merge_anchor_locked(
+                    formal, {k: kv.get(k) for k in _IDENTITY_KEYS}, source_leg=leg
+                )
 
     def _veto_leg_locked(self, leg):
         """（须持锁）锚身份自相矛盾的腿降级 diagnostic——
@@ -2291,7 +2673,9 @@ class Store:
             diverged = False
             for k in ("orderId", "txHash"):
                 a, b = structured.get(k), legacy.get(k)
-                if (a is None) != (b is None) or (a is not None and _ident_norm(k, a) != _ident_norm(k, b)):
+                if (a is None) != (b is None) or (
+                    a is not None and _ident_norm(k, a) != _ident_norm(k, b)
+                ):
                     diverged = True
             diag["legacyRegexDiverged"] = diverged
             if ambiguous:
@@ -2308,7 +2692,12 @@ class Store:
         轮询腿锁定的 hash；已 settle/已轮询/已冻结 → None。
         被否决腿不起 poller（observed 不增加）。"""
         with self.lock:
-            if leg.get("windowClosed") or leg.get("_anchorVeto") or leg.get("tReceiptMs") is not None or leg.get("receiptPolling"):
+            if (
+                leg.get("windowClosed")
+                or leg.get("_anchorVeto")
+                or leg.get("tReceiptMs") is not None
+                or leg.get("receiptPolling")
+            ):
                 return None
             h = leg.get("txHash")
             if not h or not _receipt_candidates(leg.get("chain"), h):
@@ -2326,9 +2715,13 @@ class Store:
                 if leg is except_leg:
                     continue
                 # r8：dup 腿与其 formal 腿是同一订单的别名——同 id 不算跨腿占用
-                if except_leg is not None and (leg.get("_dupOf") is except_leg or except_leg.get("_dupOf") is leg):
+                if except_leg is not None and (
+                    leg.get("_dupOf") is except_leg or except_leg.get("_dupOf") is leg
+                ):
                     continue
-                if leg.get(key) is not None and _ident_norm(key, leg[key]) == _ident_norm(key, value):
+                if leg.get(key) is not None and _ident_norm(
+                    key, leg[key]
+                ) == _ident_norm(key, value):
                     return True
         return False
 
@@ -2339,7 +2732,9 @@ class Store:
                 c = dict(x)
                 # r8：dup 归并目标以 formal 腿的 orderFlowId 输出（不暴露内部引用）
                 formal = x.get("_dupOf")
-                c["_mergedIntoFlowId"] = formal.get("orderFlowId") if isinstance(formal, dict) else None
+                c["_mergedIntoFlowId"] = (
+                    formal.get("orderFlowId") if isinstance(formal, dict) else None
+                )
                 c["_anchorDiag"] = dict(x.get("_anchorDiag") or {})
                 c["_anchor"] = dict(x.get("_anchor") or {})
                 legs.append(c)
@@ -2349,7 +2744,14 @@ class Store:
             rdiag = dict(self.run_diag.get(run_id) or {})
         if gone:
             # 已回收 run 明确标 gone——区别于「从未见过的 run」（空 timeline）
-            return {"schemaVersion": 2, "runId": run_id, "gone": True, "hkClockAt": _wall_iso(), "legs": [], **_collection_identity()}
+            return {
+                "schemaVersion": 2,
+                "runId": run_id,
+                "gone": True,
+                "hkClockAt": _wall_iso(),
+                "legs": [],
+                **_collection_identity(),
+            }
         if not legs and not mark and run_id in _dropped_run_ids():
             # 热重载接管前旧实例的 run——Store 不随重载交接，如实标 dropped
             # （区别于 gone=retention 回收、以及从未见过的空 timeline）
@@ -2394,7 +2796,11 @@ class Store:
             anchor_ev = {
                 # 独立锚键名（值不出缺省模式；full=1 的 orderId/clientOrderId 另列）——
                 # 空列表 = 无独立锚 → 成功帧结构上不可能正向关联（缺失原因可见）
-                "keys": sorted(k for k in _IDENTITY_KEYS if (x.get("_anchor") or {}).get(k) is not None),
+                "keys": sorted(
+                    k
+                    for k in _IDENTITY_KEYS
+                    if (x.get("_anchor") or {}).get(k) is not None
+                ),
                 "legacyRegexDiverged": adiag.get("legacyRegexDiverged"),
                 "conflicts": list(adiag.get("conflicts") or []),
                 "ambiguous": list(adiag.get("ambiguous") or []),
@@ -2407,7 +2813,9 @@ class Store:
                     # 授权轮——首轮未观测后整体前移）；授权轮由 EU 侧唯一
                     # 关联（精确 tx / 订单身份）回填 authorizedRound，见 client
                     "round": x.get("round"),
-                    "observationIndex": x.get("observationIndex"),  # platform×chain 内到达序（纯观察事实）
+                    "observationIndex": x.get(
+                        "observationIndex"
+                    ),  # platform×chain 内到达序（纯观察事实）
                     # fomo 预览腿 anchorRole=preview、padre 签名腿 anchorRole=sign
                     # （均不计 attempted、不消费 manifest 槽位）；成功帧正向匹配 =
                     # 执行证据 → 晋升 order
@@ -2432,19 +2840,29 @@ class Store:
                     "hkL1aMsVetoed": (l1a if vetoed else None),
                     "hkL3MsVetoed": (l3 if vetoed else None),
                     # full=1（loopback 控制面专用，证据恢复用）：完整 hash；缺省截短（公开安全）
-                    "txHash": (x.get("txHash") if full else _short_hash(x.get("txHash"))),
+                    "txHash": (
+                        x.get("txHash") if full else _short_hash(x.get("txHash"))
+                    ),
                     # full=1：请求/响应建立的订单身份（独立锚）——EU 侧 authorizedRound
                     # 唯一关联的另一证据；缺省不暴露（公开投影也不登记）
-                    "orderId": ((x.get("_anchor") or {}).get("orderId") if full else None),
-                    "clientOrderId": ((x.get("_anchor") or {}).get("clientOrderId") if full else None),
+                    "orderId": (
+                        (x.get("_anchor") or {}).get("orderId") if full else None
+                    ),
+                    "clientOrderId": (
+                        (x.get("_anchor") or {}).get("clientOrderId") if full else None
+                    ),
                     "evidence": {
                         "orderFlowId": x.get("orderFlowId"),
                         "wsFrameSha": x.get("wsSha"),
                         "receipt": x.get("receipt"),
                         # 锚诊断（私有 raw；public DTO 未登记 → fail-closed 不投影）：
                         "anchor": anchor_ev,  # 锚键名/诊断（无身份值）
-                        "successAnchorKeys": x.get("successAnchorKeys"),  # 成功帧正向命中的锚键
-                        "mergedIntoFlowId": x.get("_mergedIntoFlowId"),  # dup 腿 → formal 腿 orderFlowId
+                        "successAnchorKeys": x.get(
+                            "successAnchorKeys"
+                        ),  # 成功帧正向命中的锚键
+                        "mergedIntoFlowId": x.get(
+                            "_mergedIntoFlowId"
+                        ),  # dup 腿 → formal 腿 orderFlowId
                     },
                     "incomplete": incomplete,
                     "atWall": x.get("at_wall"),
@@ -2462,13 +2880,17 @@ class Store:
         bound_orders = [
             (i, x)
             for i, x in enumerate(out)
-            if x.get("anchorRole") == "order" and not x.get("unbound") and not x.get("dup") and not x.get("pendingBind")
+            if x.get("anchorRole") == "order"
+            and not x.get("unbound")
+            and not x.get("dup")
+            and not x.get("pendingBind")
         ]
         attempted = len(bound_orders)
         observed = sum(
             1
             for i, x in bound_orders
-            if (x["tSuccessPushMs"] is not None or x["tReceiptMs"] is not None) and not legs[i].get("_anchorVeto")
+            if (x["tSuccessPushMs"] is not None or x["tReceiptMs"] is not None)
+            and not legs[i].get("_anchorVeto")
         )
         unbound = sum(1 for x in out if x.get("unbound"))
         requested = mark.get("requested")
@@ -2483,7 +2905,9 @@ class Store:
                 requested += need
                 bound = sum(1 for x in legs if x.get("slot") == i)
                 for _ in range(max(0, need - bound)):
-                    placeholders.append(_placeholder_leg(spec.get("platform"), spec.get("chain")))
+                    placeholders.append(
+                        _placeholder_leg(spec.get("platform"), spec.get("chain"))
+                    )
         elif isinstance(requested, int) and requested > attempted:
             for _ in range(requested - attempted):
                 placeholders.append(_placeholder_leg(None, None))
@@ -2492,7 +2916,12 @@ class Store:
             "runId": run_id,
             "mark": mark,
             "hkClockAt": _wall_iso(),
-            "counts": {"requested": requested, "attempted": attempted, "observed": observed, "unbound": unbound},
+            "counts": {
+                "requested": requested,
+                "attempted": attempted,
+                "observed": observed,
+                "unbound": unbound,
+            },
             "legs": out + placeholders,
             # per-run 诊断计数——带身份却无腿可归属的帧 / 锚冲突拒收 / 身份冲突 /
             # 歧义（缺失可见；空 dict = 本 run 无此类事件）
@@ -2512,7 +2941,11 @@ def _head_with_receipt(leg):
     receipt = leg.get("receipt") or {}
     height = receipt.get("blockNumber")
     try:
-        height = int(height, 16) if isinstance(height, str) and height.startswith("0x") else height
+        height = (
+            int(height, 16)
+            if isinstance(height, str) and height.startswith("0x")
+            else height
+        )
     except ValueError:
         height = None
     return {**sample, "inclusion": {"hash": receipt.get("blockHash"), "height": height}}
@@ -2540,7 +2973,14 @@ def _placeholder_leg(platform, chain):
         "hkL1aMsVetoed": None,
         "hkL3MsVetoed": None,
         "txHash": None,
-        "evidence": {"orderFlowId": None, "wsFrameSha": None, "receipt": None, "anchor": None, "successAnchorKeys": None, "mergedIntoFlowId": None},
+        "evidence": {
+            "orderFlowId": None,
+            "wsFrameSha": None,
+            "receipt": None,
+            "anchor": None,
+            "successAnchorKeys": None,
+            "mergedIntoFlowId": None,
+        },
         "incomplete": "no-order-observed",
         "atWall": None,
     }
@@ -2562,7 +3002,11 @@ class _AnchorView:
 
 
 def _delta(t, t0):
-    return round(t - t0, 1) if isinstance(t, (int, float)) and isinstance(t0, (int, float)) else None
+    return (
+        round(t - t0, 1)
+        if isinstance(t, (int, float)) and isinstance(t0, (int, float))
+        else None
+    )
 
 
 def _short_hash(h):
@@ -2572,7 +3016,10 @@ def _short_hash(h):
 
 
 def _wall_iso():
-    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + f".{int((time.time() % 1) * 1000):03d}Z"
+    return (
+        time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        + f".{int((time.time() % 1) * 1000):03d}Z"
+    )
 
 
 def _mono_ms():
@@ -2617,29 +3064,68 @@ def _poll_receipt(run_id, leg_ref, chain, tx_hash, jsonrpc=None):
             try:
                 if spec["family"] == "evm":
                     r = _rpc(spec["rpc"], "eth_getTransactionReceipt", [tx_hash])
-                    if r and str(r.get("transactionHash") or "").lower() != str(tx_hash).lower():
+                    if (
+                        r
+                        and str(r.get("transactionHash") or "").lower()
+                        != str(tx_hash).lower()
+                    ):
                         r = None  # 交易身份不符的回执不采纳（继续轮询至超时）
                     if r and str(r.get("status", "0x0")).lower() == "0x1":
                         # 块身份门：status=1+hash 匹配但缺 blockHash/blockNumber
                         # = 证据不足（pending/畸形回执）——L3 留 null + incomplete，不猜
                         if not r.get("blockHash") or not r.get("blockNumber"):
-                            _settle_incomplete(leg_ref, "receipt-missing-block-identity")
+                            _settle_incomplete(
+                                leg_ref, "receipt-missing-block-identity"
+                            )
                             return
-                        _settle_receipt(leg_ref, {"rpc": spec["rpc"], "chain": cand, "pollIntervalMs": int(RECEIPT_POLL_INTERVAL_S * 1000), "status": 1, "blockHash": r.get("blockHash"), "blockNumber": r.get("blockNumber")})
+                        _settle_receipt(
+                            leg_ref,
+                            {
+                                "rpc": spec["rpc"],
+                                "chain": cand,
+                                "pollIntervalMs": int(RECEIPT_POLL_INTERVAL_S * 1000),
+                                "status": 1,
+                                "blockHash": r.get("blockHash"),
+                                "blockNumber": r.get("blockNumber"),
+                            },
+                        )
                         return
-                    if r and str(r.get("status", "")).lower() == "0x0" and r.get("blockNumber"):
+                    if (
+                        r
+                        and str(r.get("status", "")).lower() == "0x0"
+                        and r.get("blockNumber")
+                    ):
                         _settle_incomplete(leg_ref, "receipt status=0 (reverted)")
                         return
                 else:
-                    r = _rpc(spec["rpc"], "getSignatureStatuses", [[tx_hash], {"searchTransactionHistory": True}])
+                    r = _rpc(
+                        spec["rpc"],
+                        "getSignatureStatuses",
+                        [[tx_hash], {"searchTransactionHistory": True}],
+                    )
                     v = (r or {}).get("value") or [None]
                     st0 = v[0] if v else None
-                    if st0 and st0.get("confirmationStatus") in ("confirmed", "finalized") and st0.get("err") is None:
+                    if (
+                        st0
+                        and st0.get("confirmationStatus") in ("confirmed", "finalized")
+                        and st0.get("err") is None
+                    ):
                         # 块身份门：缺 slot = 缺块身份——同律不猜
                         if st0.get("slot") is None:
-                            _settle_incomplete(leg_ref, "receipt-missing-block-identity")
+                            _settle_incomplete(
+                                leg_ref, "receipt-missing-block-identity"
+                            )
                             return
-                        _settle_receipt(leg_ref, {"rpc": spec["rpc"], "chain": cand, "pollIntervalMs": int(RECEIPT_POLL_INTERVAL_S * 1000), "status": 1, "slot": st0.get("slot")})
+                        _settle_receipt(
+                            leg_ref,
+                            {
+                                "rpc": spec["rpc"],
+                                "chain": cand,
+                                "pollIntervalMs": int(RECEIPT_POLL_INTERVAL_S * 1000),
+                                "status": 1,
+                                "slot": st0.get("slot"),
+                            },
+                        )
                         return
                     if st0 and st0.get("err") is not None:
                         _settle_incomplete(leg_ref, "signature err")
@@ -2817,9 +3303,14 @@ class SpeedexHkTiming:
         # 响应抽取的 id/chain 是独立锚（成功判定/hash 采纳只认锚）：
         # 结构化 schema-known 抽取——orderId 与 clientOrderId 分键写锚；旧整-body 正则
         # 只算诊断（legacyRegexDiverged），永不写锚。
-        STORE.update_anchor(leg, {k: ids.get(k) for k in ("txHash", "orderId", "clientOrderId", "chain")})
+        STORE.update_anchor(
+            leg,
+            {k: ids.get(k) for k in ("txHash", "orderId", "clientOrderId", "chain")},
+        )
         try:
-            STORE.note_anchor_diag(leg, ids, _legacy_regex_ids_diag(body), ids.get("_ambiguous"))
+            STORE.note_anchor_diag(
+                leg, ids, _legacy_regex_ids_diag(body), ids.get("_ambiguous")
+            )
         except Exception:
             pass
         # 响应建立订单身份后正向去重——同 run 同单已绑槽 → 本腿归入
@@ -2828,7 +3319,11 @@ class SpeedexHkTiming:
         # 闩锁启动 poller——每腿至多一个，轮询腿锁定 hash
         h = STORE.claim_receipt_poll(leg)
         if h:
-            threading.Thread(target=_poll_receipt, args=(rid, leg, leg.get("chain"), h, _jsonrpc), daemon=True).start()
+            threading.Thread(
+                target=_poll_receipt,
+                args=(rid, leg, leg.get("chain"), h, _jsonrpc),
+                daemon=True,
+            ).start()
         # 响应建立锚后重审该平台本 run 的早到缓冲帧——与实时帧
         # 同一管线（路由/冲突/跨腿去重/新鲜度门），成功时刻用缓冲的单调源时间
         self._drain_ws_buffer(rid, leg["platform"])
@@ -2890,7 +3385,15 @@ class SpeedexHkTiming:
             return
         for unit in units:
             try:
-                self._adopt_ws_unit(platform, host, payload, unit["ids"], unit.get("success"), t_obs, tw_obs)
+                self._adopt_ws_unit(
+                    platform,
+                    host,
+                    payload,
+                    unit["ids"],
+                    unit.get("success"),
+                    t_obs,
+                    tw_obs,
+                )
             except Exception:
                 pass
 
@@ -2916,7 +3419,18 @@ class SpeedexHkTiming:
             return []
         return [{"ids": ids, "success": None}]
 
-    def _adopt_ws_unit(self, platform, host, payload, ids, success_flag, t_obs, tw_obs, allow_buffer=True, rebuffered=False):
+    def _adopt_ws_unit(
+        self,
+        platform,
+        host,
+        payload,
+        ids,
+        success_flag,
+        t_obs,
+        tw_obs,
+        allow_buffer=True,
+        rebuffered=False,
+    ):
         """单单元（整帧或单 entry）路由+采纳。零命中且本开窗该平台
         还有无锚腿（响应未到、锚待定）→ 缓冲（保留单调源时间/窗口 epoch/方向），
         锚建立后由 _drain_ws_buffer 重审——与实时帧同一管线同一门（新鲜度/锚正向/
@@ -2927,16 +3441,40 @@ class SpeedexHkTiming:
         leg, route = STORE.route_ws_frame(platform, ids, defer_nomatch=allow_buffer)
         if not leg:
             if route == "no-leg-match" and allow_buffer:
-                if not STORE.buffer_ws_unit(platform, host, payload, ids, success_flag, t_obs, tw_obs, count_diag=not rebuffered):
-                    STORE.note_frame_diag("wsFrameNoLegMatch")  # 无锚待定腿/超预算——零命中即终态
+                if not STORE.buffer_ws_unit(
+                    platform,
+                    host,
+                    payload,
+                    ids,
+                    success_flag,
+                    t_obs,
+                    tw_obs,
+                    count_diag=not rebuffered,
+                ):
+                    STORE.note_frame_diag(
+                        "wsFrameNoLegMatch"
+                    )  # 无锚待定腿/超预算——零命中即终态
             return
         t_order = leg.get("tOrderOutMs")
-        if isinstance(t_order, (int, float)) and isinstance(t_obs, (int, float)) and t_obs < t_order:
+        if (
+            isinstance(t_order, (int, float))
+            and isinstance(t_obs, (int, float))
+            and t_obs < t_order
+        ):
             # 新鲜性门：信号源时间先于该腿的下单请求 = 不可能是本单的
             # 回应（陈旧/重放疑似——缓冲帧尤其要防「先到帧撞上后建腿的未来锚」）。
             # 不采纳；与零命中同路回缓冲/计数（该腿永不可能成为本帧的合法目标）。
             if allow_buffer:
-                if not STORE.buffer_ws_unit(platform, host, payload, ids, success_flag, t_obs, tw_obs, count_diag=not rebuffered):
+                if not STORE.buffer_ws_unit(
+                    platform,
+                    host,
+                    payload,
+                    ids,
+                    success_flag,
+                    t_obs,
+                    tw_obs,
+                    count_diag=not rebuffered,
+                ):
                     STORE.note_frame_diag("wsFrameNoLegMatch")
             return
         try:
@@ -2953,7 +3491,9 @@ class SpeedexHkTiming:
             # ③同 run 内已被其他腿占用的 id/hash 不再挂载（跨腿去重；chain 是属性
             #   不是身份，不参与去重）。
             conflict = any(
-                leg.get(k) and ids.get(k) and _ident_norm(k, ids[k]) != _ident_norm(k, leg[k])
+                leg.get(k)
+                and ids.get(k)
+                and _ident_norm(k, ids[k]) != _ident_norm(k, leg[k])
                 for k in _IDENTITY_KEYS
             )
             if conflict:
@@ -2966,17 +3506,26 @@ class SpeedexHkTiming:
             # 正向匹配 = 独立锚任一身份键相等（含响应 hash 锚——OKX/GMGN 成功
             # 本就接受 txHash 相等；路由到此的腿已由 route_ws_frame 保证正向命中）
             positive = any(
-                anchor.get(k) and ids.get(k) and _ident_norm(k, ids[k]) == _ident_norm(k, anchor[k])
+                anchor.get(k)
+                and ids.get(k)
+                and _ident_norm(k, ids[k]) == _ident_norm(k, anchor[k])
                 for k in _IDENTITY_KEYS
             )
             rid_leg = leg.get("runId")
             kv = {}
             for k, v in ids.items():
-                if k not in ("txHash", "orderId", "clientOrderId", "chain") or v is None:
+                if (
+                    k not in ("txHash", "orderId", "clientOrderId", "chain")
+                    or v is None
+                ):
                     continue
                 if k == "txHash" and not positive:
                     continue
-                if k in ("txHash", "orderId", "clientOrderId") and rid_leg and STORE.id_claimed(rid_leg, k, v, except_leg=leg):
+                if (
+                    k in ("txHash", "orderId", "clientOrderId")
+                    and rid_leg
+                    and STORE.id_claimed(rid_leg, k, v, except_leg=leg)
+                ):
                     continue
                 kv[k] = v
             if kv:
@@ -2984,7 +3533,11 @@ class SpeedexHkTiming:
             # HTTP/WS 入口共用闩锁——每腿至多一个 poller，轮询腿锁定 hash
             h = STORE.claim_receipt_poll(leg)
             if h:
-                threading.Thread(target=_poll_receipt, args=(leg.get("runId"), leg, leg.get("chain"), h, _jsonrpc), daemon=True).start()
+                threading.Thread(
+                    target=_poll_receipt,
+                    args=(leg.get("runId"), leg, leg.get("chain"), h, _jsonrpc),
+                    daemon=True,
+                ).start()
         except Exception:
             pass
         with STORE.lock:
@@ -2993,22 +3546,35 @@ class SpeedexHkTiming:
         try:
             # 逐 entry 平台（ws_entries）的成功 = 同 entry 状态（路由已保证锚
             # 正向）；整帧平台沿用 ws_success(payload, 锚视图) 判定
-            ok = success_flag if success_flag is not None else RULES[platform]["ws_success"](payload, _AnchorView(leg))
+            ok = (
+                success_flag
+                if success_flag is not None
+                else RULES[platform]["ws_success"](payload, _AnchorView(leg))
+            )
         except Exception:
             ok = False
         if not ok:
             return
         with STORE.lock:
-            if leg.get("tSuccessPushMs") is not None or leg.get("windowClosed") or leg.get("_anchorVeto"):
+            if (
+                leg.get("tSuccessPushMs") is not None
+                or leg.get("windowClosed")
+                or leg.get("_anchorVeto")
+            ):
                 # 被否决腿不写成功（route_ws_frame 已排除——此为纵深守卫）
                 return
             leg["tSuccessPushMs"] = t_obs
-            leg["wsSha"] = hashlib.sha256(payload if isinstance(payload, bytes) else str(payload).encode()).hexdigest()[:16]
+            leg["wsSha"] = hashlib.sha256(
+                payload if isinstance(payload, bytes) else str(payload).encode()
+            ).hexdigest()[:16]
             # 记录成功帧正向命中的锚键（evidence.successAnchorKeys——关联依据可审计）
             anchor_now = leg.get("_anchor") or {}
             leg["successAnchorKeys"] = [
-                k for k in _IDENTITY_KEYS
-                if anchor_now.get(k) is not None and ids.get(k) is not None and _ident_norm(k, ids[k]) == _ident_norm(k, anchor_now[k])
+                k
+                for k in _IDENTITY_KEYS
+                if anchor_now.get(k) is not None
+                and ids.get(k) is not None
+                and _ident_norm(k, ids[k]) == _ident_norm(k, anchor_now[k])
             ]
             # preview（fomo /swaps/v2，Relay success requestId≡锚 relaySwapId）/
             # sign（padre sign_raw_payload，同 DONE 节点合法 hash+独立锚正向匹配）腿
@@ -3017,7 +3583,17 @@ class SpeedexHkTiming:
             if leg.get("anchorRole") in ("preview", "sign"):
                 STORE._promote_leg_locked(leg)
         # 事件记进腿自己的 run（不 open_run_ids()[0] 取最旧窗）
-        STORE.add_event(leg["runId"], {"t": t_obs, "tw": tw_obs, "kind": "ws_success", "platform": platform, "host": host, "sha": leg["wsSha"]})
+        STORE.add_event(
+            leg["runId"],
+            {
+                "t": t_obs,
+                "tw": tw_obs,
+                "kind": "ws_success",
+                "platform": platform,
+                "host": host,
+                "sha": leg["wsSha"],
+            },
+        )
 
     def _drain_ws_buffer(self, rid, platform):
         """响应/subscribe 建立锚后，重审本 run 该平台的早到缓冲
@@ -3029,7 +3605,16 @@ class SpeedexHkTiming:
             return
         for ent in STORE.take_ws_buffer(rid, platform):
             try:
-                self._adopt_ws_unit(ent["platform"], ent["host"], ent["payload"], ent["ids"], ent.get("success"), ent["t"], ent["tw"], rebuffered=True)
+                self._adopt_ws_unit(
+                    ent["platform"],
+                    ent["host"],
+                    ent["payload"],
+                    ent["ids"],
+                    ent.get("success"),
+                    ent["t"],
+                    ent["tw"],
+                    rebuffered=True,
+                )
             except Exception:
                 pass
 
@@ -3081,7 +3666,9 @@ class _Ctrl(BaseHTTPRequestHandler):
                 return self._send(400, {"error": "runId required"})
             # 可选 manifest（{"rounds": n} 或 {"legs": [{platform, chain, rounds}…]}）——
             # 授权轮次登记；无 manifest 行为同今（向后兼容）
-            manifest = b.get("manifest") if isinstance(b.get("manifest"), dict) else None
+            manifest = (
+                b.get("manifest") if isinstance(b.get("manifest"), dict) else None
+            )
             with HEAD_CONTROL_LOCK:
                 STORE.mark_open(rid, str(b.get("note") or "")[:200], manifest)
                 _start_heads(rid, manifest)
@@ -3111,7 +3698,10 @@ class _Ctrl(BaseHTTPRequestHandler):
                 "legs": n_legs,
                 "seenReq": SpeedexHkTiming.seen_req,
                 "at": _wall_iso(),
-                "diag": {**diag, "headPoll": HEADS.diag_snapshot()},  # 关窗后拒绝的下单请求计数等诊断 + 链头轮询可观测（head-v4）
+                "diag": {
+                    **diag,
+                    "headPoll": HEADS.diag_snapshot(),
+                },  # 关窗后拒绝的下单请求计数等诊断 + 链头轮询可观测（head-v4）
                 # build manifest
                 "addonVersion": ADDON_VERSION,
                 "instanceId": INSTANCE_ID,
@@ -3176,7 +3766,16 @@ def _ctrl_registry():
     if reg is None:
         # knownRuns：当前服务实例已知的 runId 清单（/mark、/mark/close 时发布）；
         # takeover：本实例接管时捕获的「旧实例已知 run 丢弃」事实
-        reg = {"server": None, "thread": None, "serving": False, "instanceId": None, "loadedInstanceId": None, "bindError": None, "knownRuns": None, "takeover": None}
+        reg = {
+            "server": None,
+            "thread": None,
+            "serving": False,
+            "instanceId": None,
+            "loadedInstanceId": None,
+            "bindError": None,
+            "knownRuns": None,
+            "takeover": None,
+        }
         sys.modules[_CTRL_REG_KEY] = reg
     return reg
 
@@ -3189,7 +3788,11 @@ def _publish_known_runs():
         reg = _ctrl_registry()
         with STORE.lock:
             runs = sorted(STORE.marks.keys())
-        reg["knownRuns"] = {"instanceId": INSTANCE_ID, "runs": runs[-GONE_IDS_MAX:], "at": _wall_iso()}
+        reg["knownRuns"] = {
+            "instanceId": INSTANCE_ID,
+            "runs": runs[-GONE_IDS_MAX:],
+            "at": _wall_iso(),
+        }
     except Exception:
         pass
 
@@ -3238,8 +3841,17 @@ def _start_ctrl():
         # 接管事实留存——旧实例已知 run 对新实例 Store 而言全部丢失（Store
         # 不随重载交接）；timeline 对这些 runId 标 droppedInReload，/health 暴露计数
         prev = reg.get("knownRuns")
-        if isinstance(prev, dict) and prev.get("instanceId") and prev["instanceId"] != INSTANCE_ID and prev.get("runs"):
-            reg["takeover"] = {"fromInstanceId": prev["instanceId"], "droppedRuns": list(prev["runs"]), "at": _wall_iso()}
+        if (
+            isinstance(prev, dict)
+            and prev.get("instanceId")
+            and prev["instanceId"] != INSTANCE_ID
+            and prev.get("runs")
+        ):
+            reg["takeover"] = {
+                "fromInstanceId": prev["instanceId"],
+                "droppedRuns": list(prev["runs"]),
+                "at": _wall_iso(),
+            }
         if reg.get("serving"):
             reg["serving"] = False
             try:
@@ -3257,7 +3869,10 @@ def _start_ctrl():
         srv = ThreadingHTTPServer(("127.0.0.1", _ctrl_port()), _Ctrl)
     except OSError as e:
         reg["bindError"] = f"{type(e).__name__}: {e}"
-        print(f"[speedex_hk_timing] ctrl bind :{_ctrl_port()} failed（/health 将如实报错）: {e}", file=sys.stderr)
+        print(
+            f"[speedex_hk_timing] ctrl bind :{_ctrl_port()} failed（/health 将如实报错）: {e}",
+            file=sys.stderr,
+        )
         return
     reg.update(server=srv, instanceId=INSTANCE_ID, bindError=None, serving=True)
     th = threading.Thread(target=srv.serve_forever, daemon=True)
