@@ -1,0 +1,90 @@
+# ============================================================================
+# speedex HK 选择性解密 overlay（GMGN/OKX selective MITM）——脚手架，默认 OFF
+#
+# ⚠ DO-NOT-ENABLE ⚠
+# 本文件是**实验 overlay 模板**，不是生效配置。生产 speedex-mitm.service 与
+# 实验 speedex-mitm-exp.service 的 allow_hosts 均**不含**本文件的候选主机——
+# GMGN/OKX 保持刻意透传。未经 docs/plans/hk-selective-mitm.md 的实验 SOP
+# （含 RHF-09/RHF-17 关联修复门、隔离无资金验证、逐步 A/B、单独授权）与
+# 当次明确授权，不得把下述任何 regex 并入任何 unit 的 allow_hosts。
+#
+# 来源：docs/archive/2026-09-08-rh-fomo-review.md §11（可行性复核与实施方案；已被 2026-09-09 final review 接替）。
+# 机制事实（已在两台 HK 节点安装版 NextLayer 实现 + mitmproxy 官方
+# ignore-domains 文档核实）：allow_hosts 在 **TLS 之前的 TCP 层**分流——
+# 不在集合内的主机整条连接透传，addon hook 根本不触发；集合内的主机才被
+# MITM。因此按 host 选择性解密**不影响透传主机**，但**不能在解密前按 HTTP
+# path 再分**——拦截 web3.okx.com 必然同时覆盖同主机的报价 API。
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 候选主机集合（review §11 原始 regex，逻辑值）
+#
+#   GMGN: gmgn.ai（swap_batch_order/txproxy 身份）+ ws.gmgn.ai（tg 订单成功）
+#   OKX : web3.okx.com（broadcast/batchBroadcast + across/swap；报价同宿主）
+#         + wsdexpri.okx.com（订单成功推送）
+#
+# 第一阶段不扩为 *.okx.com，不纳入 www.okx.com 或第三方 RPC/fanout。
+# 端口组不可省：next_layer 匹配会追加端口（host:port），$ 锚定漏配端口组会让
+# 过滤静默失效（见 docs/hk-proxy-timing.md §9）。(:443)? 与生产集合的
+# (:\d+)? 二选一皆可——这些主机只讲 443；保持 $ 锚定 + 端口组是硬要求。
+# ----------------------------------------------------------------------------
+#
+# [raw] 完整候选集（WS-only 阶段之后的订单 HTTP 阶段）：
+#   ^(gmgn\.ai|ws\.gmgn\.ai|web3\.okx\.com|wsdexpri\.okx\.com)(:443)?$
+#
+# [raw] WS-only 阶段（A/B 第二步——先只验 WS 解密兼容性）：
+#   ^(ws\.gmgn\.ai|wsdexpri\.okx\.com)(:443)?$
+
+# ----------------------------------------------------------------------------
+# systemd 转义（已核验形式）
+#
+# ExecStart 行内双引号中，systemd 把 \\ 折叠为 \ ——生产 unit 现行
+# "allow_hosts=^(.*\\.)?(turnkey\\.com|...)(:\\d+)?$" 形式已在两台节点实测
+# 分流正确（review §11 核验记录），故**每个反斜杠写两遍**是已证明的形式。
+# 本 regex 无 %（若有须写 %%-——systemd specifier 展开）、无内层双引号。
+# 改完后必须核验运行进程实际收到的串（见文末「转义核验」）。
+#
+# [systemd] WS-only 阶段（并入生产集合后的完整 allow_hosts 行）：
+#   --set "allow_hosts=^(?:(.*\\.)?(turnkey\\.com|padre\\.gg|binance\\.com|fomo\\.family|relay\\.link)(:\\d+)?|(ws\\.gmgn\\.ai|wsdexpri\\.okx\\.com)(:443)?)$"
+#
+# [systemd] 订单 HTTP 阶段（完整候选集并入生产集合）：
+#   --set "allow_hosts=^(?:(.*\\.)?(turnkey\\.com|padre\\.gg|binance\\.com|fomo\\.family|relay\\.link)(:\\d+)?|(gmgn\\.ai|ws\\.gmgn\\.ai|web3\\.okx\\.com|wsdexpri\\.okx\\.com)(:443)?)$"
+#
+# 只许改**实验 unit**（speedex-mitm-exp.service）；生产 unit 的 allow_hosts
+# 不属于本 overlay 范围。每次只改一个因素（SOP 第 3 步）：切集合后必须重建
+# 实验连接——已有 WSS 长连不会重新握手，旧连接上的观察不算该阶段数据。
+# ----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+# 诊断最小化规则（实验模式唯一允许的日志面；addon 代码归平行工作流，此处为
+# 消费方契约——install.sh 实验分支对 unit 做可执行的粗粒度护栏）
+#
+# 允许记录：
+#   - host（SNI/CONNECT 目标主机）
+#   - 已登记 path 类别（schema-known 的 path 枚举标签，不是原始 path+query）
+#   - 固定错误类别（枚举：tls-handshake-fail / http-403 / challenge /
+#     quote-api-fail / resource-exhausted / …—固定词表，不拼接原始报文）
+#   - HTTP 状态码、协议（h1/h2/ws）、WS 帧计数与帧尺寸
+#   - 资源水位（RSS/句柄/事件循环lag 等聚合数）
+#   - 脱敏身份（订单 id/hash 的结构化短化，与现行 timeline 短化口径一致）
+#
+# 禁止落盘/落日志（违反即实验作废并撤销授权）：
+#   - Authorization/Cookie 等认证头、token、签名请求体
+#   - 完整 query string（只许登记 path 类别）
+#   - 完整业务抓包（flow dump/save_stream_file/flow_detail≥2）
+#   - 请求修改、自动订单重试、任何独立广播（观察-only）
+#
+# install.sh 实验分支的可执行护栏（粗粒度，精细字段纪律由 addon 侧负责）：
+#   实验 unit 出现 flow_detail=2/3 或 save_stream_file → 拒绝安装。
+# ----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+# 转义核验（每次改 unit 后必做；review §11 标注「需验证 systemd 实际转义」）
+#
+#   PID=$(systemctl show -p MainPID --value speedex-mitm-exp)
+#   tr '\0' '\n' < /proc/$PID/cmdline | grep '^allow_hosts='
+#
+# 进程实际收到的必须是**单反斜杠**逻辑值（systemd 已把 \\ 折叠成 \）。
+# 若输出仍含 \\. → mitmproxy 拿到的正则字面含反斜杠，匹配静默失效——
+# 不得凭 unit 文件目测通过。
+# ----------------------------------------------------------------------------
