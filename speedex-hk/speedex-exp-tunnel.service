@@ -1,0 +1,21 @@
+# speedex HK 实验代理产品流量隧道（EU 本机 systemd unit，2026-09-14 入库——
+# 此前仅存活在宿主机 /etc/systemd/system/，docs/proxy.md「2026-09-10 MITM-only 政策」段
+# 的唯一未跟踪生命周期）。安装：sudo cp 本文件 /etc/systemd/system/ &&
+# sudo systemctl daemon-reload && sudo systemctl enable --now speedex-exp-tunnel。
+# 注意：停机/重启前先停该服务——18072 端口占用会让 hk-timing 离线测试假红；
+# ExecStart 的 ssh 目标只出自受信注册表 configs/hk-nodes.json（当前 hk-vmiss-1）。
+[Unit]
+Description=speedex HK experiment proxy tunnel (127.0.0.1:18544/18072 -> hk1 loopback)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bytenoob
+Environment=SSH_AUTH_SOCK=
+ExecStart=/usr/bin/ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=2 -L 127.0.0.1:18544:127.0.0.1:18544 -L 127.0.0.1:18072:127.0.0.1:18072 root@38.207.174.197
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,35 @@
+[Unit]
+Description=speedex HK timing proxy (mitmdump + speedex_hk_timing addon)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 认证用 htpasswd 文件（0600，root only；由 install.sh 的 gen-htpasswd.sh 从
+# /opt/speedex-mitm/proxy.env 生成）——凭据绝不展开为 argv（/proc/<pid>/cmdline
+# 本机可读）。轮换口令：改 proxy.env 后重跑 install.sh——htpasswd 内容变更会
+# 自动纳入受控 restart（运行中 mitmproxy 的 verifier 内存凭据需重启才刷新）。
+WorkingDirectory=/opt/speedex-mitm
+# 只拦截测量所需主机，其余全部透传（小内存 VM 减负；okx/gmgn 拦截会断扩展后端，刻意不拦）
+ExecStart=/opt/speedex-mitm/venv/bin/mitmdump \
+  --mode regular \
+  --listen-host 0.0.0.0 \
+  --listen-port 8443 \
+  --proxyauth @/opt/speedex-mitm/htpasswd \
+  --set confdir=/opt/speedex-mitm/.mitmproxy \
+  --set flow_detail=1 \
+  --set stream_large_bodies=256k \
+  --set body_size_limit=2m \
+  --set keep_host_header=false \
+  --set block_global=false \
+  --set "allow_hosts=^(.*\\.)?(turnkey\\.com|padre\\.gg|binance\\.com|fomo\\.family|relay\\.link)(:\\d+)?$" \
+  -s /opt/speedex-mitm/speedex_hk_timing.py \
+  --quiet
+Restart=always
+RestartSec=3
+# 1G 小机：mitmproxy RSS 常态 150-300MB，留余量
+MemoryMax=700M
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
