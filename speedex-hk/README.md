@@ -1,9 +1,9 @@
 # speedex HK timing proxy（基于本 fork 的 mitmproxy）
 
 speedex 延迟研究 harness 的 HK 出口测量代理：mitmproxy addon + 控制面 + 部署件。
-主仓：`git@github.com:bufrr/speedex.git`（dashboard / orchestrator / runners / EU 客户端
-`scripts/lib/hk-timing-client.mjs` 等）；本目录是 proxy 侧的**发布副本**——
-改动先在主仓 `deploy/hk-proxy/` 完成并过测试，再同步到本分支（目录内容一一对应）。
+**本分支（speedex-hk）是 proxy 侧代码的规范主仓**——addon/部署脚本只在
+`speedex-hk/` 目录演进（2026-09-14 自 speedex 主仓 `deploy/hk-proxy/` 迁出；
+speedex 主仓只保留消费侧 `scripts/lib/hk-timing-client.mjs` 等与部署文档 docs/）。
 
 ## 内容
 
@@ -11,6 +11,7 @@ speedex 延迟研究 harness 的 HK 出口测量代理：mitmproxy addon + 控�
 | --- | --- |
 | `speedex_hk_timing.py` | mitmproxy addon：下单/成功信号锚关联 + 链 receipt 轮询 + 控制面（`/mark` `/mark/close` `/timeline/<rid>` `/health` `/egress` `/latency`） |
 | `test_speedex_hk_timing.py` | addon 离线测试（合成 flow/frame 夹具，144 项）：`python3 test_speedex_hk_timing.py` |
+| `tests/` | 安装/单元行为测试（Node 22，`node --test tests/*.test.mjs`，15 项） |
 | `install.sh` | 幂等安装/受控重启（用法见文件头；实验实例 `SPEEDEX_HK_INSTANCE=experiment`） |
 | `gen-htpasswd.sh` | 代理认证 htpasswd 生成（{SHA}，凭据不进 argv） |
 | `speedex-mitm.service` | 生产 unit（0.0.0.0:8443 + 控制面 8072） |
@@ -18,13 +19,26 @@ speedex 延迟研究 harness 的 HK 出口测量代理：mitmproxy addon + 控�
 | `speedex-exp-tunnel.service` | EU 侧常驻 SSH 隧道 unit（18544/18072 → HK 实验实例 loopback） |
 | `selective-decrypt.overlay.example` | GMGN/OKX 选择性解密候选 overlay（DO-NOT-ENABLE，须 SOP + 当次授权） |
 | `AGENTS.md` | 本目录的硬约束（凭据/隐私/锚纪律——改动前必读） |
-| `docs/` | 协议与运维文档副本（hk-proxy-timing / proxy / hk-selective-mitm） |
+| `docs/` | 协议与运维文档副本（speedex 主仓 docs/ 是权威面，此处为随代码快照） |
+
+## 跨仓合同（改动必须双侧同步）
+
+- **控制面 8072**：addon `_ctrl_port()` 缺省 ↔ speedex 主仓 `scripts/lib/hk-timing-client.mjs` `HK_CTRL_PORT`；实验实例 18072 ↔ 主仓 `configs/hk-nodes.json` instances 映射。
+- **timeline/health 形状**：speedex 主仓 hk-timing-client / public-projector 的 DTO 消费方。
 
 ## 部署目标版本
 
 mitmproxy pip 钉版（`install.sh`）：12.2.3（python 3.13 节点）/ 11.0.2（python 3.11 节点），
 `websockets==17.1`、`msgpack==1.1.2/1.1.0`。上游源码树**不被本目录修改**——
 我们只消费 pip 安装的 mitmproxy hook API。
+
+## 部署（scp 源即本目录）
+
+```bash
+scp speedex-hk/{speedex_hk_timing.py,install.sh,gen-htpasswd.sh,speedex-mitm.service,speedex-mitm-exp.service} root@HK:/opt/speedex-mitm-src/
+ssh root@HK bash /opt/speedex-mitm-src/install.sh                                # 生产实例
+ssh root@HK SPEEDEX_HK_INSTANCE=experiment bash /opt/speedex-mitm-src/install.sh # 实验实例
+```
 
 ## 上游 rebase（定期维护）
 
