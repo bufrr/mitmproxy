@@ -6604,5 +6604,28 @@ class TestChainHeadFreshnessAtAnchors(unittest.TestCase):
             c.close()
 
 
+class TestArcSupport(unittest.TestCase):
+    def test_arc_identity_and_frozen_head(self):
+        from collections import deque
+        for body in [{"chain":"arc"}, {"chainId":5042}, {"chainId":"0x13b2"}]:
+            self.assertEqual(A._chain_from_text(json.dumps(body)), "arc")
+        self.assertEqual(A._receipt_candidates("arc", "0x"+"aa"*32), ["arc"])
+        self.assertIn("arc", A._receipt_candidates(None, "0x"+"aa"*32))
+        now = [1000]
+        c = A.ChainHeadWindow(clock=lambda: now[0])
+        c.run_id = "arc-synthetic"
+        c.samples = {"arc": deque(maxlen=512)}
+        c.add("arc", {"number":"0x64", "hash":"0x"+"aa"*32}, "ws-head")
+        snap = c.snapshot("arc-synthetic", 1100)["arc"]
+        self.assertEqual(snap["height"], 100)
+        self.assertEqual(snap["anchor"], "proxy-order-request")
+        self.assertEqual(snap["vantage"], "hk")
+        now[0] = 1200
+        c.add("arc", {"number":"0x65", "hash":"0x"+"bb"*32}, "ws-head")
+        self.assertEqual(snap["height"],100)
+        self.assertEqual(c.snapshot("other",1300), {})
+        c.close()
+
+
 if __name__ == "__main__":
     unittest.main()

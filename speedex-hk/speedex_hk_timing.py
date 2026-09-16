@@ -175,12 +175,18 @@ CHAINS = {
         "rpc": "https://api.mainnet-beta.solana.com",
         "chainIds": set(),
     },
+    "arc": {
+        "family": "evm",
+        "rpc": "https://rpc.mainnet.arc.io",
+        "chainIds": {5042, "5042", "0x13b2"},
+    },
 }
 CHAIN_ID_TO_NAME = {}
 for _name, _c in CHAINS.items():
     for _cid in _c["chainIds"]:
         CHAIN_ID_TO_NAME[_cid] = _name
 CHAIN_NAME_STR = {
+    "arc": "arc",
     "bsc": "bsc",
     "solana": "solana",
     "sol": "solana",
@@ -208,7 +214,7 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # 槽位必须衔接已接受头、同高异父=分叉；不连续即清空重锚，与 EVM hash/parentHash
 # 冲突清空同律；样本保留 parent 字段）。修订经过见 git 历史；行为由
 # deploy/hk-proxy/test_speedex_hk_timing.py 与 tests/hk-timing*.test.mjs 钉住。
-ADDON_VERSION = "2026.09.12-head-v4"
+ADDON_VERSION = "2026.09.16-arc-head-v5"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -3032,11 +3038,11 @@ STORE = Store()
 
 def _receipt_candidates(chain, tx_hash):
     """receipt 轮询候选链：chain 已知 → 单候选；未知 → hash 形状推断
-    （0x+64hex → EVM 两链依序；base58 长串 → solana）。空 = 不可轮询。"""
+    （0x+64hex → 已登记 EVM 链依序；base58 长串 → solana）。空 = 不可轮询。"""
     if chain and CHAINS.get(chain):
         return [chain]
     if isinstance(tx_hash, str) and tx_hash.startswith("0x") and len(tx_hash) == 66:
-        return ["bsc", "robinhood"]
+        return [name for name, cfg in CHAINS.items() if cfg["family"] == "evm"]
     if isinstance(tx_hash, str) and not tx_hash.startswith("0x") and len(tx_hash) >= 80:
         return ["solana"]
     return []
