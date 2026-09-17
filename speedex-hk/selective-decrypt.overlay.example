@@ -88,3 +88,12 @@
 # 若输出仍含 \\. → mitmproxy 拿到的正则字面含反斜杠，匹配静默失效——
 # 不得凭 unit 文件目测通过。
 # ----------------------------------------------------------------------------
+
+
+# 2026-09-17 实际广播扩展（仍为显式授权的实验 overlay，模板不会自动启用）。
+# 保留目标实例原有 allow_hosts，只追加精确主机。JSON-RPC/Origin/身份门仍由 addon 判定。
+# EVM：已观察 BSC fanout 与 ARC mainnet；RH 官方 RPC 同构接口仅为捕获能力，待新样本验收。
+# Sol：当前四区域及历史带 2 后缀的 BlockRazor /v2/sendTransaction。
+# [raw] 追加部分（与原 regex 作 OR，保留端口和边界锚）：
+# ^(?:okx\.(?:bsc-rpc\.com|(?:rpc|builder)\.48\.club|bsc\.blockrazor\.xyz|bscnetwork\.blockrazor\.io)|(?:frankfurt|hongkong|newyork|tokyo)2?\.solana\.blockrazor\.io|rpc\.mainnet\.(?:arc\.io|chain\.robinhood\.com))(:\d+)?$
+# 部署需从运行进程核对最终逻辑 regex；不得用默认模板覆盖现有 GMGN/OKX 拦截范围。
