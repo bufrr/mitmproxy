@@ -4541,6 +4541,7 @@ class TestR8IdentityRouting(unittest.TestCase):
             {
                 "orderFlowId",
                 "wsFrameSha",
+                "success",
                 "receipt",
                 "anchor",
                 "successAnchorKeys",
@@ -5874,11 +5875,20 @@ class TestR10EarlyWsBuffer(unittest.TestCase):
         A.addons[0].response(f)
         leg = A.STORE.legs[run][0]
         t_first = leg.get("tSuccessPushMs")
+        witness = dict(leg["successEvidence"])
+        self.assertEqual(witness["status"], "1")
+        self.assertEqual(witness["observedAtMs"], t_first)
+        self.assertEqual(witness["txHash"], self.H1)
+        self.assertEqual(witness["frameSha"], leg["wsSha"])
+        self.assertIn("txHash", witness["matchedKeys"])
         self.assertIsNotNone(t_first)
         evs = [e for e in A.STORE.events[run] if e.get("kind") == "ws_success"]
         self.assertEqual(len(evs), 1, "重放副本不产生第二次成功事件")
         A.addons[0].websocket_message(self._okx_success())  # 采纳后实时重放
         self.assertEqual(leg.get("tSuccessPushMs"), t_first, "首写冻结——重放不覆盖")
+        self.assertEqual(leg["successEvidence"], witness)
+        self.assertEqual(A.STORE.timeline(run, full=True)["legs"][0]["evidence"]["success"], witness)
+        self.assertNotEqual(A.STORE.timeline(run)["legs"][0]["evidence"]["success"]["txHash"], self.H1)
         time.sleep(0.25)
         tl = A.STORE.timeline(run)
         self.assertEqual(tl["counts"]["observed"], 1)
@@ -6774,6 +6784,21 @@ class TestExactBroadcastAnchors(unittest.TestCase):
         A.STORE.mark_open(self.run)
         A.addons[0].response(f)
         self.assertEqual(leg['_anchor'], {})
+
+
+class TestStrictProductStatus(unittest.TestCase):
+    def test_exact_channel_and_status_without_envelope_splicing(self):
+        h = "0x" + "ab" * 32
+        def frame(status="1", channel="dex-across-order-info", data=None):
+            return json.dumps({"arg": {"channel": channel}, "note": "dex-across-order-info", "data": data if data is not None else {"dexData": {"status": status, "orderId": "o1", "txHash": h}}})
+        self.assertTrue(A._okx_ws_entries(frame())[0]["success"])
+        for status in [1, True, "confirmed", "success", None, "0", "-1"]:
+            self.assertFalse(any(x["success"] for x in A._okx_ws_entries(frame(status=status))))
+        for channel in ["other", "prefix-dex-across-order-info", "dex-swap-order-info-suffix"]:
+            self.assertEqual(A._okx_ws_entries(frame(channel=channel)), [])
+        for dd in [None, [], "invalid", {"status": "1"}]:
+            units = A._okx_ws_entries(frame(data={"status": "1", "orderId": "o1", "txHash": h, "dexData": dd}))
+            self.assertFalse(any(x["success"] and x["ids"].get("txHash") for x in units))
 
 
 if __name__ == "__main__":
