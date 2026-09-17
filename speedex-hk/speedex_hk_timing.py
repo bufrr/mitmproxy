@@ -214,7 +214,7 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # 槽位必须衔接已接受头、同高异父=分叉；不连续即清空重锚，与 EVM hash/parentHash
 # 冲突清空同律；样本保留 parent 字段）。修订经过见 git 历史；行为由
 # deploy/hk-proxy/test_speedex_hk_timing.py 与 tests/hk-timing*.test.mjs 钉住。
-ADDON_VERSION = "2026.09.17-broadcast-anchor-v6"
+ADDON_VERSION = "2026.09.17-strict-success-v7"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -765,9 +765,7 @@ def _okx_ws_entries(payload):
     if not isinstance(obj, dict):
         return []
     arg = obj.get("arg") or {}
-    if "dex-across-order-info" not in str(
-        arg.get("channel")
-    ) and "dex-swap-order-info" not in str(arg.get("channel")):
+    if not isinstance(arg, dict) or arg.get("channel") not in ("dex-across-order-info", "dex-swap-order-info"):
         return []
     data = obj.get("data")
     if isinstance(data, dict):
@@ -778,7 +776,7 @@ def _okx_ws_entries(payload):
         return []
     out = []
     for node in nodes:
-        dd = node.get("dexData") if isinstance(node.get("dexData"), dict) else node
+        dd = node.get("dexData") if "dexData" in node else node
         if not isinstance(dd, dict):
             continue
         ids = {}
@@ -795,7 +793,7 @@ def _okx_ws_entries(payload):
             )
             if c:
                 ids["chain"] = c
-        out.append({"ids": ids, "success": str(dd.get("status")) == "1"})
+        out.append({"ids": ids, "success": type(dd.get("status")) is str and dd.get("status") == "1"})
     return out
 
 
@@ -2231,6 +2229,7 @@ class Store:
         for k in (
             "tSuccessPushMs",
             "wsSha",
+            "successEvidence",
             "successAnchorKeys",
             "tReceiptMs",
             "receipt",
@@ -2447,6 +2446,7 @@ class Store:
             "orderId": None,
             "clientOrderId": None,
             "wsSha": None,
+            "successEvidence": None,
             "receipt": None,
             "incomplete": None,
             "receiptPolling": False,  # receipt poller 闩锁（每腿至多一个）
@@ -2971,6 +2971,7 @@ class Store:
                     "evidence": {
                         "orderFlowId": x.get("orderFlowId"),
                         "wsFrameSha": x.get("wsSha"),
+                        "success": ({**x["successEvidence"], "txHash": x["successEvidence"]["txHash"] if full else _short_hash(x["successEvidence"]["txHash"])} if x.get("successEvidence") else None),
                         "receipt": x.get("receipt"),
                         # 锚诊断（私有 raw；public DTO 未登记 → fail-closed 不投影）：
                         "anchor": anchor_ev,  # 锚键名/诊断（无身份值）
@@ -3703,6 +3704,18 @@ class SpeedexHkTiming:
             leg["wsSha"] = hashlib.sha256(
                 payload if isinstance(payload, bytes) else str(payload).encode()
             ).hexdigest()[:16]
+            # Bounded, replayable success witness. Never retain the business frame.
+            obj = _decode_ws(payload)
+            tx = _transaction_id_value(ids.get("txHash"))
+            digest = hashlib.sha256((tx.lower() if tx and tx.startswith("0x") else tx or "").encode()).hexdigest()
+            channel = ((obj.get("arg") or {}).get("channel") if platform == "okx" else obj.get("channel")) if isinstance(obj, dict) else None
+            if platform in ("okx", "gmgn") and tx:
+                leg["successEvidence"] = {
+                    "version": 1, "platform": platform, "channel": channel,
+                    "status": "1" if platform == "okx" else "successful",
+                    "txHash": tx, "txDigest": "-".join(digest[i:i+16] for i in range(0, 64, 16)),
+                    "observedAtMs": t_obs, "frameSha": leg["wsSha"],
+                }
             # 记录成功帧正向命中的锚键（evidence.successAnchorKeys——关联依据可审计）
             anchor_now = leg.get("_anchor") or {}
             leg["successAnchorKeys"] = [
@@ -3712,6 +3725,8 @@ class SpeedexHkTiming:
                 and ids.get(k) is not None
                 and _ident_norm(k, ids[k]) == _ident_norm(k, anchor_now[k])
             ]
+            if leg.get("successEvidence"):
+                leg["successEvidence"]["matchedKeys"] = list(leg["successAnchorKeys"])
             # preview（fomo /swaps/v2，Relay success requestId≡锚 relaySwapId）/
             # sign（padre sign_raw_payload，同 DONE 节点合法 hash+独立锚正向匹配）腿
             # 被成功帧正向匹配 = 执行证据——原子晋升 order 并补授权槽绑定；
