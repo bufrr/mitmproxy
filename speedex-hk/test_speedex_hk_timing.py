@@ -5994,9 +5994,12 @@ class TestR10CaptureIdentity(unittest.TestCase):
         self._env = _EnvGuard(self, "SPEEDEX_HK_ALLOW_HOSTS", "SPEEDEX_HK_CTRL_PORT")
         os.environ.pop("SPEEDEX_HK_ALLOW_HOSTS", None)
         os.environ.pop("SPEEDEX_HK_CTRL_PORT", None)
-        self.assertNotIn(
-            "mitmproxy", sys.modules, "离线环境无 mitmproxy——env/不可观测路径"
-        )
+        # Explicitly model a missing dependency even on a deployment host with
+        # mitmproxy installed. Other tests may already have imported its ctx.
+        from unittest.mock import patch
+        guard = patch.dict(sys.modules, {"mitmproxy": None, "mitmproxy.ctx": None})
+        guard.start()
+        self.addCleanup(guard.stop)
 
     def _fake_mitmproxy(self, allow_hosts):
         """注入假 mitmproxy 模块（ctx.options.allow_hosts）——离线验证真实生效值路径。"""
