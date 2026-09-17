@@ -6627,5 +6627,151 @@ class TestArcSupport(unittest.TestCase):
         c.close()
 
 
+
+class TestExactBroadcastAnchors(unittest.TestCase):
+    H = "0x" + "ab" * 32
+
+    def setUp(self):
+        fresh()
+        self.clock = time.monotonic() * 1000 + 10
+        self.head = 40
+        from unittest.mock import patch
+        for target, replacement in [
+            ("_mono_ms", lambda: self.clock),
+            ("_poll_receipt", lambda *_: None),
+        ]:
+            p = patch.object(A, target, replacement); p.start(); self.addCleanup(p.stop)
+        p = patch.object(A.HEADS, "snapshot", lambda rid, t: {c: {
+            "version": 1, "chain": c, "epoch": rid, "height": self.head,
+            "anchorTs": t, "observedTs": t - 1, "sampleAgeMs": 1,
+        } for c in A.CHAINS}); p.start(); self.addCleanup(p.stop)
+        self.run = "broadcast-window"
+        A.STORE.mark_open(self.run, manifest={"version": 1, "runId": self.run, "legs": [
+            {"platform": "okx", "chain": c, "rounds": 2} for c in A.CHAINS]})
+        self.clock += 100
+
+    def raw(self, chain="bsc", tx=None, request_id=1):
+        tx = tx or self.H
+        if chain == "solana":
+            f = FakeFlow("hongkong.solana.blockrazor.io", "/v2/sendTransaction?auth=synthetic-secret",
+                         req_body="A" * 128, resp_body=tx)
+        else:
+            host = {"bsc": "okx.bscnetwork.blockrazor.io", "arc": "rpc.mainnet.arc.io",
+                    "robinhood": "rpc.mainnet.chain.robinhood.com"}[chain]
+            f = FakeFlow(host, "/", req_body=json.dumps({"jsonrpc": "2.0", "id": request_id,
+                "method": "eth_sendRawTransaction", "params": ["0x" + "12" * 100]}),
+                resp_body=json.dumps({"jsonrpc": "2.0", "id": request_id, "result": tx}))
+        f.request.headers = {"origin": "https://web3.okx.com"}
+        f.response.status_code = 200
+        return f
+
+    def platform(self, chain="bsc", tx=None, oid="order-one"):
+        cid = {"bsc": 56, "robinhood": 4663, "arc": 5042, "solana": 501}[chain]
+        return FakeFlow("web3.okx.com", "/priapi/v6/dx/trade/multi/broadcast",
+            req_body=json.dumps({"chainId": cid, "signedInfoList": [{"txHash": tx or self.H}], "orderId": oid}),
+            resp_body=json.dumps({"code": "0", "data": {"transactionHash": tx or self.H, "orderId": oid}}))
+
+    def success(self, tx=None):
+        return ws_frame("wsdexpri.okx.com", json.dumps({"arg": {"channel": "dex-swap-order-info"},
+            "data": {"dexData": {"status": "1", "orderId": "order-one", "transactionHash": tx or self.H}}}))
+
+    def test_delayed_raw_ack_rehomes_success_and_original_head(self):
+        early = self.raw(); t0 = self.clock
+        A.addons[0].request(early)
+        self.clock += 10
+        A.addons[0].websocket_message(self.success())
+        success_t = self.clock
+        self.clock += 1000; self.head = 50
+        late = self.platform(); A.addons[0].request(late); A.addons[0].response(late)
+        self.assertTrue(A.STORE.ws_buffer[self.run], "early success waits for exact raw-flow identity")
+        self.clock += 300
+        A.addons[0].response(early)
+        formal = [x for x in A.STORE.legs[self.run] if not x['dup']]
+        self.assertEqual(len(formal), 1)
+        leg = formal[0]
+        self.assertEqual(leg['tOrderOutMs'], t0)
+        self.assertEqual(leg['tSuccessPushMs'], success_t)
+        self.assertEqual(leg['_headSnapshots']['bsc']['height'], 40)
+        self.assertEqual(leg['_headSnapshots']['bsc']['anchorTs'], t0)
+        tl = A.STORE.timeline(self.run, full=True)
+        row = next(x for x in tl['legs'] if x['anchorRole'] == 'order' and not x['dup'])
+        self.assertEqual(row['hkL1aMs'], 10)
+        self.assertEqual(row['orderRequestSource'], 'okx-evm-send')
+        self.assertEqual(tl['counts']['attempted'], 1)
+        self.assertNotIn('synthetic-secret', json.dumps(tl))
+        self.assertNotIn('121212121212121212121212', json.dumps(tl))
+
+    def test_each_chain_fanout_uses_one_slot_and_ack_is_not_success(self):
+        for chain in A.CHAINS:
+            tx = "3" * 88 if chain == "solana" else "0x" + {"bsc": "aa", "arc": "bb", "robinhood": "cc"}[chain] * 32
+            for _ in range(4):
+                f = self.raw(chain, tx); A.addons[0].request(f); A.addons[0].response(f); self.clock += 1
+            p = self.platform(chain, tx); A.addons[0].request(p); A.addons[0].response(p)
+            legs = [x for x in A.STORE.legs[self.run] if x.get('chain') == chain and not x['dup']]
+            self.assertEqual(len(legs), 1, chain)
+            self.assertIsNone(legs[0]['tSuccessPushMs'], 'RPC acceptance is never platform success')
+            self.assertEqual(legs[0]['txHash'], tx)
+        self.assertEqual(A.STORE.timeline(self.run)['counts']['attempted'], 4)
+
+    def test_no_origin_wrong_endpoint_response_or_id_cannot_supply_identity(self):
+        for change in [lambda f: f.request.headers.clear(), lambda f: setattr(f.request, 'pretty_host', 'okx.bscnetwork.blockrazor.io.evil.invalid'),
+                       lambda f: setattr(f.request, 'method', 'OPTIONS'), lambda f: setattr(f.request, 'path', '/credential-path'), lambda f: setattr(f.request, '_body', '{"method":"eth_call"}')]:
+            f=self.raw(); change(f); A.addons[0].request(f); self.assertNotIn('speedex_leg', f.metadata)
+        for change in [lambda f: setattr(f.response, 'status_code', 500),
+                       lambda f: setattr(f.response, '_body', json.dumps({'jsonrpc':'2.0','id':2,'result':self.H})),
+                       lambda f: setattr(f.response, '_body', json.dumps({'jsonrpc':'2.0','id':1,'result':self.H,'error':{'code':-1}}))]:
+            f=self.raw(); change(f); A.addons[0].request(f); A.addons[0].response(f)
+            self.assertEqual(f.metadata['speedex_leg'][0]['_anchor'], {})
+        self.assertEqual(A.STORE.timeline(self.run)['counts']['observed'], 0)
+        self.assertEqual(A.STORE.timeline(self.run)['counts']['attempted'], 0)
+
+    def test_unconfirmed_earlier_broadcast_never_leaves_a_shorter_qualified_timer(self):
+        raw = self.raw(); A.addons[0].request(raw)
+        self.clock += 1000
+        late = self.platform(); A.addons[0].request(late); A.addons[0].response(late)
+        self.clock += 10; A.addons[0].websocket_message(self.success())
+        tl = A.STORE.timeline(self.run, full=True)
+        row = next(x for x in tl['legs'] if x.get('anchorRole') == 'order' and not x.get('dup'))
+        self.assertIsNone(row['hkL1aMs'])
+        self.assertEqual(row['incomplete'], 'broadcast-anchor-unconfirmed')
+        self.assertEqual(row['chainHead']['status'], 'broadcast-anchor-unconfirmed')
+        A.addons[0].response(raw)
+        tl = A.STORE.timeline(self.run, full=True)
+        row = next(x for x in tl['legs'] if x.get('anchorRole') == 'order' and not x.get('dup'))
+        self.assertEqual(row['hkL1aMs'], 1010)
+
+    def test_many_reverse_ack_transfers_flatten_aliases_and_keep_first_head(self):
+        flows = []
+        for i in range(12):
+            f = self.raw(request_id=i); A.addons[0].request(f); flows.append(f); self.clock += 1
+        for f in reversed(flows):
+            A.addons[0].response(f)
+        first = flows[0].metadata['speedex_leg'][0]
+        self.assertTrue(all(x.get('_dupOf') is first for x in A.STORE.legs[self.run] if x is not first))
+        self.assertEqual(A.STORE.timeline(self.run)['counts']['attempted'], 1)
+        self.assertTrue(first['receiptPolling'])
+        self.assertEqual(sum(bool(x['receiptPolling']) for x in A.STORE.legs[self.run]), 1)
+
+    def test_same_hash_conflicting_order_or_chain_is_not_deduplicated(self):
+        a=self.platform(oid='order-one'); A.addons[0].request(a)
+        b=self.platform(oid='order-two'); A.addons[0].request(b)
+        c=self.platform(chain='arc'); A.addons[0].request(c)
+        self.assertTrue(all(not x['dup'] for x in A.STORE.legs[self.run]))
+
+    def test_hook_snapshot_precedes_parse_and_closed_window_rejects_ack(self):
+        f=self.raw(); original=f.request.get_text
+        def slow_parse():
+            self.head=70
+            return original()
+        f.request.get_text=slow_parse
+        A.addons[0].request(f)
+        leg=f.metadata['speedex_leg'][0]
+        self.assertEqual(leg['_headSnapshots']['bsc']['height'],40)
+        A.STORE.mark_close(self.run)
+        A.STORE.mark_open(self.run)
+        A.addons[0].response(f)
+        self.assertEqual(leg['_anchor'], {})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -214,7 +214,7 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # 槽位必须衔接已接受头、同高异父=分叉；不连续即清空重锚，与 EVM hash/parentHash
 # 冲突清空同律；样本保留 parent 字段）。修订经过见 git 历史；行为由
 # deploy/hk-proxy/test_speedex_hk_timing.py 与 tests/hk-timing*.test.mjs 钉住。
-ADDON_VERSION = "2026.09.16-arc-head-v5"
+ADDON_VERSION = "2026.09.17-broadcast-anchor-v6"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -609,6 +609,84 @@ def _okx_resp_ids(text):
     逐 entry 解析（_walk_resp_ids——batchBroadcast 的 data 列表逐元素独立，
     不跨 entry 拼接身份）。透传平台，HK 下 hook 不触发——规则保留。"""
     return _walk_resp_ids(text, ("orderId",), ("transactionHash", "txHash"))
+
+
+# Observed product fanout destinations. No arbitrary host or substring matching.
+OKX_RPC_HOSTS = {
+    "okx.bsc-rpc.com": "bsc", "okx.rpc.48.club": "bsc",
+    "okx.builder.48.club": "bsc", "okx.bsc.blockrazor.xyz": "bsc",
+    "okx.bscnetwork.blockrazor.io": "bsc",
+    "rpc.mainnet.arc.io": "arc", "rpc.mainnet.chain.robinhood.com": "robinhood",
+}
+OKX_SOL_SEND_HOSTS = {
+    f"{region}{suffix}.solana.blockrazor.io"
+    for region in ("frankfurt", "hongkong", "newyork", "tokyo") for suffix in ("", "2")
+}
+
+
+def _okx_broadcast_request_ids(body):
+    """Only the observed single-transaction signedInfoList envelope, never signatures."""
+    if len(body) > 262144:
+        return {}
+    obj = _j(body)
+    if not isinstance(obj, dict):
+        return {}
+    rows = obj.get("signedInfoList")
+    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+        return {}
+    tx = _transaction_id_value(rows[0].get("txHash"))
+    if not tx:
+        return {}
+    out = {"txHash": tx}
+    oid = _id_value(obj.get("orderId"))
+    if oid:
+        out["orderId"] = oid
+    return out
+
+
+def _okx_rpc_request(host, path, method, headers, body):
+    """Request classification only. Response on this exact flow supplies tx identity.
+    Origin is a product-path filter, never an identity/security credential. Body/query
+    and headers are neither retained nor sent anywhere by this observer.
+    """
+    if method != "POST" or len(body) > 262144 or headers.get("origin") != "https://web3.okx.com":
+        return None
+    if host in OKX_SOL_SEND_HOSTS and path == "/v2/sendTransaction":
+        # Observed BlockRazor endpoint accepts a bare base64 transaction.
+        if 80 <= len(body) <= 16400 and re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", body):
+            return {"chain": "solana", "source": "okx-solana-send", "id": None}
+        return None
+    if host not in OKX_RPC_HOSTS or path != "/":
+        return None
+    obj = _j(body)
+    if not isinstance(obj, dict) or obj.get("jsonrpc") != "2.0" or obj.get("method") != "eth_sendRawTransaction":
+        return None
+    rid, params = obj.get("id"), obj.get("params")
+    if isinstance(rid, bool) or not isinstance(rid, (str, int)) or len(str(rid)) > 128:
+        return None
+    if not isinstance(params, list) or len(params) != 1 or not isinstance(params[0], str):
+        return None
+    if not re.fullmatch(r"0x(?:[0-9a-fA-F]{2}){16,131000}", params[0]):
+        return None
+    return {"chain": OKX_RPC_HOSTS[host], "source": "okx-evm-send", "id": rid}
+
+
+def _okx_rpc_response(meta, response):
+    if response.status_code != 200:
+        return {}
+    body = response.get_text() or ""
+    if len(body) > 4096:
+        return {}
+    if meta["source"] == "okx-solana-send":
+        tx = _transaction_id_value(body.strip())
+        return {"txHash": tx} if tx and not tx.startswith("0x") else {}
+    obj = _j(body)
+    if not isinstance(obj, dict) or obj.get("jsonrpc") != "2.0" or obj.get("error") is not None:
+        return {}
+    if type(obj.get("id")) is not type(meta["id"]) or obj.get("id") != meta["id"]:
+        return {}
+    tx = _transaction_id_value(obj.get("result"))
+    return {"txHash": tx} if tx and tx.startswith("0x") else {}
 
 
 _GMGN_ORDER_KEYS = ("orderId", "order_id", "oi")
@@ -1989,7 +2067,7 @@ class Store:
         return None
 
     def _same_order_bound_leg_locked(
-        self, run_id, ident, except_leg=None, platform=None
+        self, run_id, ident, except_leg=None, platform=None, chain=None
     ):
         """（须持锁）同 run 内与 ident 同订单的已绑槽腿。正向匹配——
         至少一个共同身份键（orderId/clientOrderId）且全部共同键相等；共同键冲突或
@@ -2006,12 +2084,12 @@ class Store:
                 continue
             if platform is not None and other.get("platform") != platform:
                 continue
-            shared = [
-                k
-                for k in ("orderId", "clientOrderId")
-                if ident.get(k) is not None and other.get(k) is not None
-            ]
-            if shared and all(str(other[k]) == str(ident[k]) for k in shared):
+            if platform == "okx" and chain and other.get("chain") and other["chain"] != chain:
+                continue
+            keys = _IDENTITY_KEYS if platform == "okx" else ("orderId", "clientOrderId")
+            other_ids = (other.get("_anchor") or {}) if platform == "okx" else other
+            shared = [k for k in keys if ident.get(k) is not None and other_ids.get(k) is not None]
+            if shared and all(_ident_norm(k, other_ids[k]) == _ident_norm(k, ident[k]) for k in shared):
                 return other
         return None
 
@@ -2038,15 +2116,13 @@ class Store:
                 self._reopen_dup_locked(leg)
                 return False
             return True
-        ident = {
-            k: leg.get(k)
-            for k in ("orderId", "clientOrderId")
-            if leg.get(k) is not None
-        }
+        source = (leg.get("_anchor") or {}) if leg.get("platform") == "okx" else leg
+        keys = _IDENTITY_KEYS if leg.get("platform") == "okx" else ("orderId", "clientOrderId")
+        ident = {k: source.get(k) for k in keys if source.get(k) is not None}
         if not ident:
             return False  # 身份缺失——不猜
         formal = self._same_order_bound_leg_locked(
-            leg.get("runId"), ident, leg, platform=leg.get("platform")
+            leg.get("runId"), ident, leg, platform=leg.get("platform"), chain=leg.get("chain")
         )
         if formal is None:
             return False
@@ -2144,6 +2220,11 @@ class Store:
         formal["pendingBind"] = False
         formal["dup"] = True
         formal["_dupOf"] = leg
+        # Keep fanout aliases flat when out-of-order responses repeatedly transfer
+        # the slot. Receipt callbacks and identity claims must reach one owner.
+        for alias in self.legs.get(leg.get("runId"), []):
+            if alias is not formal and alias.get("_dupOf") is formal:
+                alias["_dupOf"] = leg
         self.diag["orderReqDuplicate"] += 1
         # 已落地证据随 formal 资格移交（首写不覆盖本腿已有值）；dup 腿清空成功/receipt
         # ——成功永不留在 dup 腿（移交同律）
@@ -2211,6 +2292,18 @@ class Store:
             if leg.get("windowClosed"):
                 return
             self._dedup_order_identity_locked(leg, allow_transfer=True)
+
+    def confirm_broadcast_identity(self, leg):
+        """A raw RPC response proves identity/acceptance, never platform success.
+        Identity-pending requests do not consume slots. On confirmation, deduplicate
+        and transfer the formal slot to the earliest request before binding anew.
+        """
+        with self.lock:
+            if leg.get("windowClosed") or leg.get("_anchorVeto") or not (leg.get("_anchor") or {}).get("txHash"):
+                return
+            leg["anchorRole"] = "order"
+            if not self._dedup_order_identity_locked(leg, allow_transfer=True):
+                self._promote_leg_locked(leg)
 
     def _receipt_backfill_rebind_locked(self, leg):
         """（须持锁，_settle_receipt 写入 receipt 后调用）receipt 实证链
@@ -2289,6 +2382,8 @@ class Store:
             if platform == "fomo"
             else ("sign" if platform == "padre" else "order")
         )
+        if ev.get("orderRequestSource") in ("okx-evm-send", "okx-solana-send"):
+            role = "send"  # identity-pending fanout: no authorized slot until exact-flow ack
         slot = None
         unbound = False
         pending_bind = False
@@ -2297,11 +2392,11 @@ class Store:
         if detail and role == "order":
             ident = {
                 k: ev.get(k)
-                for k in ("orderId", "clientOrderId")
+                for k in (_IDENTITY_KEYS if platform == "okx" else ("orderId", "clientOrderId"))
                 if ev.get(k) is not None
             }
             formal = (
-                self._same_order_bound_leg_locked(run_id, ident, platform=platform)
+                self._same_order_bound_leg_locked(run_id, ident, platform=platform, chain=chain)
                 if ident
                 else None
             )
@@ -2341,7 +2436,8 @@ class Store:
             "dup": dup,  # 与同 run 已绑槽腿正向同单的重复请求（诊断）
             "pendingBind": pending_bind,  # order 链未实证——等 receipt 补绑
             "tOrderOutMs": ev["t"],
-            "_headSnapshots": HEADS.snapshot(run_id, ev["t"]),
+            "_headSnapshots": ev["headSnapshots"] if "headSnapshots" in ev else HEADS.snapshot(run_id, ev["t"]),
+            "orderRequestSource": ev.get("orderRequestSource", "platform-order"),
             "tOrderOutWallMs": ev.get("twms"),
             "orderFlowId": ev.get("flowId"),
             "tFirstRespMs": None,
@@ -2702,6 +2798,7 @@ class Store:
                 leg.get("windowClosed")
                 or leg.get("_anchorVeto")
                 or leg.get("tReceiptMs") is not None
+                or leg.get("dup")
                 or leg.get("receiptPolling")
             ):
                 return None
@@ -2782,7 +2879,9 @@ class Store:
                 # no-success-observed；有成功无 receipt → no-receipt-observed。
                 # dup 腿的成功一律归 formal 腿——关窗后如实标 duplicate-of-bound-leg
                 # （不是 no-success-observed：同单证据在 formal 腿上，见 evidence.mergedIntoFlowId）
-                if x.get("anchorRole") in ("preview", "sign"):
+                if x.get("anchorRole") == "send":
+                    incomplete = "broadcast-identity-unconfirmed"
+                elif x.get("anchorRole") in ("preview", "sign"):
                     incomplete = "no-execution-proof"
                 elif x.get("dup"):
                     incomplete = "duplicate-of-bound-leg"
@@ -2796,6 +2895,17 @@ class Store:
             # hkL3MsVetoed 诊断键；腿带 anchorVeto:true 不再以 bound/eligible 呈现
             # （消费者按 anchorVeto 排除）。内部腿的原始事件时间戳保留不动——证据不删。
             vetoed = bool(x.get("_anchorVeto"))
+            unresolved_send = x.get("platform") == "okx" and x.get("anchorRole") == "order" and any(
+                prior.get("platform") == "okx" and prior.get("anchorRole") == "send"
+                and prior.get("chain") == x.get("chain")
+                and prior.get("tOrderOutMs", float("inf")) < t0
+                for prior in legs
+            )
+            if unresolved_send:
+                incomplete = "broadcast-anchor-unconfirmed"
+            chain_head = _head_with_receipt(x)
+            if unresolved_send and chain_head:
+                chain_head = {**chain_head, "status": "broadcast-anchor-unconfirmed"}
             l1a = _delta(x.get("tSuccessPushMs"), t0)
             l3 = _delta(x.get("tReceiptMs"), t0)
             adiag = x.get("_anchorDiag") or {}
@@ -2835,13 +2945,14 @@ class Store:
                     "dup": bool(x.get("dup")),
                     "pendingBind": bool(x.get("pendingBind")),
                     "tOrderOutMs": t0,
-                    "chainHead": _head_with_receipt(x),
+                    "orderRequestSource": x.get("orderRequestSource"),
+                    "chainHead": chain_head,
                     "tFirstRespMs": x.get("tFirstRespMs"),
                     "tSuccessPushMs": x.get("tSuccessPushMs"),
                     "tReceiptMs": x.get("tReceiptMs"),
                     # 否决腿合格指标 null + 撤销值入诊断键
-                    "hkL1aMs": (None if vetoed else l1a),
-                    "hkL3Ms": (None if vetoed else l3),
+                    "hkL1aMs": (None if vetoed or unresolved_send else l1a),
+                    "hkL3Ms": (None if vetoed or unresolved_send else l3),
                     "anchorVeto": vetoed,
                     "hkL1aMsVetoed": (l1a if vetoed else None),
                     "hkL3MsVetoed": (l3 if vetoed else None),
@@ -3238,8 +3349,10 @@ class SpeedexHkTiming:
         path = flow.request.path.split("?")[0]
         method = flow.request.method
         platform = _classify_order(host, path, method)
-        if not platform:
+        raw_candidate = method == "POST" and (host in OKX_RPC_HOSTS or host in OKX_SOL_SEND_HOSTS)
+        if not platform and not raw_candidate:
             return
+        head_snapshots = HEADS.snapshot(window[0], t_obs)
         # body 解析在锁外完成；完成后复验入口捕获的不可变窗口身份再建腿。
         # close A/open B 或同 runId 重开都使该请求失效，不能借新窗口继续采纳。
         body = ""
@@ -3247,9 +3360,16 @@ class SpeedexHkTiming:
             body = flow.request.get_text() or ""
         except Exception:
             pass
+        raw = _okx_rpc_request(host, path, method, getattr(flow.request, "headers", {}), body) if raw_candidate else None
+        if not platform and not raw:
+            return
+        if raw:
+            platform = "okx"
+            flow.metadata["speedex_rpc"] = raw
+        request_ids = _okx_broadcast_request_ids(body) if platform == "okx" and not raw else {}
         chain = None
         try:
-            chain = RULES[platform]["extract_chain"](body)
+            chain = raw["chain"] if raw else RULES[platform]["extract_chain"](body)
         except Exception:
             chain = None
         ev = {
@@ -3262,6 +3382,9 @@ class SpeedexHkTiming:
             "path": path,
             "flowId": flow.id,
             "bodySha": hashlib.sha256(body.encode()).hexdigest()[:16] if body else None,
+            "headSnapshots": head_snapshots,
+            "orderRequestSource": raw["source"] if raw else "platform-order",
+            **request_ids,
         }
         # Binance：出站请求体即知 clientOrderId（比等 ack 更早）——
         # 建腿前抽取为订单身份去重输入（同单重复请求归入同一授权槽，不占新槽）
@@ -3273,6 +3396,10 @@ class SpeedexHkTiming:
         if leg is None:
             return
         flow.metadata["speedex_leg"] = (leg, rid)  # 直接持引用
+        if request_ids:
+            STORE.update_anchor(leg, request_ids)
+            STORE.dedup_order_identity(leg)
+            self._drain_ws_buffer(rid, platform)
         # Binance：请求体 clientOrderId 写入请求侧独立锚（成功判定只认锚；
         # 建腿前的去重抽取见上方 ev 构造）
         if platform == "binance" and body:
@@ -3303,7 +3430,8 @@ class SpeedexHkTiming:
             pass
         rule = RULES[leg["platform"]]
         try:
-            ids = rule["extract_ids"](body) or {}
+            raw = flow.metadata.get("speedex_rpc")
+            ids = _okx_rpc_response(raw, flow.response) if raw else (rule["extract_ids"](body) or {})
         except Exception:
             ids = {}
         # 响应抽取的 id/chain 是独立锚（成功判定/hash 采纳只认锚）：
@@ -3321,6 +3449,8 @@ class SpeedexHkTiming:
             pass
         # 响应建立订单身份后正向去重——同 run 同单已绑槽 → 本腿归入
         # 同一授权槽（释放占用槽、标 dup 诊断）；身份缺失/冲突不猜
+        if flow.metadata.get("speedex_rpc"):
+            STORE.confirm_broadcast_identity(leg)
         STORE.dedup_order_identity(leg)
         # 闩锁启动 poller——每腿至多一个，轮询腿锁定 hash
         h = STORE.claim_receipt_poll(leg)
