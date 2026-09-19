@@ -6914,6 +6914,45 @@ class TestIdentifiedSendNoPoison(unittest.TestCase):
         self.assertIsNone(row["incomplete"], "已晋升的早期 send 不再毒化后续订单")
         self.assertEqual(row["hkL1aMs"], 10)
 
+    def test_responseless_send_promotes_on_receipt_settle(self):
+        """v9 回归（cjxmw 实证形）：OKX 页扇出中止 → 响应永不到达（tFirstRespMs
+        恒 null）；请求侧身份 + receipt 落定 = 受理证据 → 晋升，后续订单不毒化。"""
+        body1 = "0x" + "12" * 100
+        tx1 = A._evm_raw_tx_hash(body1)
+        r1 = FakeFlow("rpc.mainnet.chain.robinhood.com", "/",
+            req_body=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction", "params": [body1]}),
+            resp_body="")
+        r1.request.headers = {"origin": "https://web3.okx.com"}
+        r1.response.status_code = 200
+        A.addons[0].request(r1)
+        send_leg = r1.metadata["speedex_leg"][0]
+        self.assertEqual(send_leg["anchorRole"], "send")
+        self.assertIsNone(send_leg.get("tFirstRespMs"), "响应永不到达（扇出中止形态）")
+        # 链上 receipt 落定（桩 _poll_receipt 为空操作——直接调 settle 模拟落定）
+        self.clock += 300
+        A._settle_receipt(send_leg, {"rpc": "stub", "chain": "robinhood", "pollIntervalMs": 800,
+            "status": 1, "blockHash": "0x" + "ab" * 32, "blockNumber": "0x67"})
+        self.assertEqual(send_leg["anchorRole"], "order", "receipt 落定 = 受理证据 → 晋升")
+        self.assertEqual(send_leg["tReceiptMs"], self.clock)
+        # 后续订单不再毒化
+        self.clock += 1000
+        body2 = "0x" + "34" * 100
+        tx2 = A._evm_raw_tx_hash(body2)
+        p2 = FakeFlow("web3.okx.com", "/priapi/v6/dx/trade/multi/broadcast",
+            req_body=json.dumps({"chainId": 4663, "signedInfoList": [{"txHash": tx2}], "orderId": "order-two"}),
+            resp_body=json.dumps({"code": "0", "data": {"transactionHash": tx2, "orderId": "order-two"}}))
+        p2.request.headers = {"origin": "https://web3.okx.com"}
+        p2.response.status_code = 200
+        A.addons[0].request(p2); A.addons[0].response(p2)
+        self.clock += 10
+        A.addons[0].websocket_message(ws_frame("wsdexpri.okx.com", json.dumps(
+            {"arg": {"channel": "dex-swap-order-info"},
+             "data": {"dexData": {"status": "1", "orderId": "order-two", "transactionHash": tx2}}})))
+        tl = A.STORE.timeline(self.run, full=True)
+        row = next(x for x in tl["legs"] if x.get("txHash") == tx2 and not x.get("dup"))
+        self.assertIsNone(row["incomplete"], "已晋升的早期 send 不再毒化后续订单")
+        self.assertEqual(row["hkL1aMs"], 10)
+
     def test_transport_failed_send_still_poisons(self):
         """兜底不放宽：传输层失败（500）的 send 身份不可证 → 后续订单仍如实缺失。"""
         body1 = "0x" + "12" * 100

@@ -215,7 +215,7 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # 槽位必须衔接已接受头、同高异父=分叉；不连续即清空重锚，与 EVM hash/parentHash
 # 冲突清空同律；样本保留 parent 字段）。修订经过见 git 历史；行为由
 # deploy/hk-proxy/test_speedex_hk_timing.py 与 tests/hk-timing*.test.mjs 钉住。
-ADDON_VERSION = "2026.09.19-req-broadcast-identity-v8"
+ADDON_VERSION = "2026.09.19-req-receipt-promote-v9"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -3388,6 +3388,7 @@ def _poll_receipt(run_id, leg_ref, chain, tx_hash, jsonrpc=None):
 
 
 def _settle_receipt(leg_ref, receipt):
+    promote = None
     with STORE.lock:
         # formal 资格转移后，旧 formal 在飞 poller 的回写经
         # dup→formal 链重定向到新 formal——receipt 同成功一样永不留在 dup 腿
@@ -3417,6 +3418,15 @@ def _settle_receipt(leg_ref, receipt):
         # receipt 实证链回填 leg.chain，并给等实证链的 pendingBind 腿
         # 按 manifest 槽补绑（DONE·receipt 两种事件顺序同计数同腿身份；不猜链）
         STORE._receipt_backfill_rebind_locked(leg)
+        if leg.get("anchorRole") == "send":
+            promote = leg
+    # v9（2026-09-19）：响应缺失的广播流（OKX 页扇出中止——tFirstRespMs 恒 null
+    # 实证）——链上 receipt 落定本身就是受理证据（poller 只轮本腿 hash，身份
+    # 数学精确且已过 status=1+块身份门）。send 腿在此经同一 confirm 路径
+    # 晋升/绑槽/转移；响应在场时 confirm 已在 response() 先发生（幂等）。
+    # 锁外调用：confirm_broadcast_identity 自持锁（锁内嵌套 = 自死锁）。
+    if promote is not None:
+        STORE.confirm_broadcast_identity(promote)
 
 
 def _settle_incomplete(leg_ref, why):
@@ -3533,6 +3543,19 @@ class SpeedexHkTiming:
             # 请求到达即知 tx 身份；响应侧 hash 仍是交叉验证（不一致 → 锚冲突否决律）。
             # 签名原文不持久化，只有推导 hash 入锚。
             STORE.update_anchor(leg, {"txHash": raw["reqTxHash"]})
+            STORE.dedup_order_identity(leg)
+            # v9（2026-09-19）：响应可能永不到达（OKX 页扇出后中止重复请求——
+            # tFirstRespMs 恒 null，cjxmw 实证）——请求侧身份在场即起 receipt 轮询；
+            # 链上 receipt 落定（status=1+hash 匹配+块身份）本身就是受理证据，
+            # _settle_receipt 内经同一 confirm 路径晋升/绑槽。响应到达时
+            # response() 的 confirm/poller 闩锁均幂等（每腿至多一个 poller）。
+            h = STORE.claim_receipt_poll(leg)
+            if h:
+                threading.Thread(
+                    target=_poll_receipt,
+                    args=(rid, leg, leg.get("chain"), h, _jsonrpc),
+                    daemon=True,
+                ).start()
         if request_ids:
             STORE.update_anchor(leg, request_ids)
             STORE.dedup_order_identity(leg)
