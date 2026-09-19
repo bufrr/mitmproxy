@@ -215,7 +215,7 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # 槽位必须衔接已接受头、同高异父=分叉；不连续即清空重锚，与 EVM hash/parentHash
 # 冲突清空同律；样本保留 parent 字段）。修订经过见 git 历史；行为由
 # deploy/hk-proxy/test_speedex_hk_timing.py 与 tests/hk-timing*.test.mjs 钉住。
-ADDON_VERSION = "2026.09.19-chain-channel-arrivals-v10"
+ADDON_VERSION = "2026.09.19-chain-arrivals-egress-warm-v10.1"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -3550,10 +3550,32 @@ def _classify_ws(host):
     return None
 
 
+_EGRESS_REFRESH_EPOCH = 0
+
+
 class SpeedexHkTiming:
     """mitmproxy addon hooks。"""
 
     seen_req = 0  # 调试计数：request 钩子触发总数（/health 透出）
+
+    def load(self, loader):
+        # v10.1（2026-09-19 c9tar 实证）：进程/热重载后 egress 缓存为空 → timeline
+        # vantage 落 'unknown-proxy'，EU canonical 推送全批被 hk-clock-unverified 抑制。
+        # 加载即起后台刷新线程：即时一次 + 每 TTL 续期（失败只保留旧缓存，不阻断）。
+        # epoch 守卫——addon 热重载会再起一代线程，旧代发现 epoch 漂移即退出。
+        global _EGRESS_REFRESH_EPOCH
+        _EGRESS_REFRESH_EPOCH += 1
+        epoch = _EGRESS_REFRESH_EPOCH
+
+        def _refresh_loop():
+            while _EGRESS_REFRESH_EPOCH == epoch:
+                try:
+                    _vantage(fetch=True)
+                except Exception:
+                    pass
+                time.sleep(_EGRESS_TTL_S)
+
+        threading.Thread(target=_refresh_loop, daemon=True).start()
 
     def request(self, flow):
         SpeedexHkTiming.seen_req += 1
