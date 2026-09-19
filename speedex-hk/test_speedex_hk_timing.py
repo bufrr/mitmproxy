@@ -6642,10 +6642,15 @@ class TestArcSupport(unittest.TestCase):
 
 
 class TestExactBroadcastAnchors(unittest.TestCase):
-    H = "0x" + "ab" * 32
+    # v8（2026-09-19）：广播请求体数学推导身份（keccak256(raw)/solana 首签名）请求侧入锚。
+    # 夹具默认 tx = 夹具请求体的推导 hash（与生产一致——响应 hash 与请求体恒等）；
+    # 显式 tx 且不配体 = 刻意冲突场景。solana 夹具体 "A"*128（96 个零字节，sigCount=0）
+    # 无请求侧身份 → 保持响应驱动路径覆盖；请求侧 solana 身份由专门测试的 wire 体覆盖。
+    EVM_BODY = "0x" + "12" * 100
 
     def setUp(self):
         fresh()
+        self.H = A._evm_raw_tx_hash(self.EVM_BODY)
         self.clock = time.monotonic() * 1000 + 10
         self.head = 40
         from unittest.mock import patch
@@ -6663,16 +6668,18 @@ class TestExactBroadcastAnchors(unittest.TestCase):
             {"platform": "okx", "chain": c, "rounds": 2} for c in A.CHAINS]})
         self.clock += 100
 
-    def raw(self, chain="bsc", tx=None, request_id=1):
-        tx = tx or self.H
+    def raw(self, chain="bsc", tx=None, request_id=1, body=None):
         if chain == "solana":
+            tx = tx or "3" * 88
             f = FakeFlow("hongkong.solana.blockrazor.io", "/v2/sendTransaction?auth=synthetic-secret",
-                         req_body="A" * 128, resp_body=tx)
+                         req_body=body or "A" * 128, resp_body=tx)
         else:
             host = {"bsc": "okx.bscnetwork.blockrazor.io", "arc": "rpc.mainnet.arc.io",
                     "robinhood": "rpc.mainnet.chain.robinhood.com"}[chain]
+            body = body or self.EVM_BODY
+            tx = tx or A._evm_raw_tx_hash(body)  # 响应 hash 与请求体一致（生产恒等）
             f = FakeFlow(host, "/", req_body=json.dumps({"jsonrpc": "2.0", "id": request_id,
-                "method": "eth_sendRawTransaction", "params": ["0x" + "12" * 100]}),
+                "method": "eth_sendRawTransaction", "params": [body]}),
                 resp_body=json.dumps({"jsonrpc": "2.0", "id": request_id, "result": tx}))
         f.request.headers = {"origin": "https://web3.okx.com"}
         f.response.status_code = 200
@@ -6696,7 +6703,9 @@ class TestExactBroadcastAnchors(unittest.TestCase):
         success_t = self.clock
         self.clock += 1000; self.head = 50
         late = self.platform(); A.addons[0].request(late); A.addons[0].response(late)
-        self.assertTrue(A.STORE.ws_buffer[self.run], "early success waits for exact raw-flow identity")
+        # v8：请求侧推导身份（keccak(raw)）在请求到达时已入锚——早到成功帧按身份
+        # 直接路由到 send 腿（保留源时间），不再等 raw-flow 响应缓冲重审。
+        self.assertFalse(A.STORE.ws_buffer.get(self.run), "请求侧身份在场——早到成功帧直接路由，不进缓冲")
         self.clock += 300
         A.addons[0].response(early)
         formal = [x for x in A.STORE.legs[self.run] if not x['dup']]
@@ -6716,9 +6725,12 @@ class TestExactBroadcastAnchors(unittest.TestCase):
 
     def test_each_chain_fanout_uses_one_slot_and_ack_is_not_success(self):
         for chain in A.CHAINS:
-            tx = "3" * 88 if chain == "solana" else "0x" + {"bsc": "aa", "arc": "bb", "robinhood": "cc"}[chain] * 32
+            # v8：EVM 身份 = 请求体推导（keccak256(raw)）——每链独立体得独立 hash；
+            # solana 夹具体无请求侧身份（sigCount=0），走响应驱动路径
+            body = None if chain == "solana" else "0x" + {"bsc": "aa", "arc": "bb", "robinhood": "cc"}[chain] * 100
+            tx = "3" * 88 if chain == "solana" else A._evm_raw_tx_hash(body)
             for _ in range(4):
-                f = self.raw(chain, tx); A.addons[0].request(f); A.addons[0].response(f); self.clock += 1
+                f = self.raw(chain, body=body); A.addons[0].request(f); A.addons[0].response(f); self.clock += 1
             p = self.platform(chain, tx); A.addons[0].request(p); A.addons[0].response(p)
             legs = [x for x in A.STORE.legs[self.run] if x.get('chain') == chain and not x['dup']]
             self.assertEqual(len(legs), 1, chain)
@@ -6730,13 +6742,27 @@ class TestExactBroadcastAnchors(unittest.TestCase):
         for change in [lambda f: f.request.headers.clear(), lambda f: setattr(f.request, 'pretty_host', 'okx.bscnetwork.blockrazor.io.evil.invalid'),
                        lambda f: setattr(f.request, 'method', 'OPTIONS'), lambda f: setattr(f.request, 'path', '/credential-path'), lambda f: setattr(f.request, '_body', '{"method":"eth_call"}')]:
             f=self.raw(); change(f); A.addons[0].request(f); self.assertNotIn('speedex_leg', f.metadata)
+        derived = A._evm_raw_tx_hash(self.EVM_BODY)
+        # v8：请求侧推导身份在窗口内即入锚（合法）——响应侧的拒绝门管的是「晋升」：
+        # 非 200 / 响应 id 不配 → 不晋升（传输/流完整性失败 ≠ 受理）；attempted 不变
         for change in [lambda f: setattr(f.response, 'status_code', 500),
-                       lambda f: setattr(f.response, '_body', json.dumps({'jsonrpc':'2.0','id':2,'result':self.H})),
-                       lambda f: setattr(f.response, '_body', json.dumps({'jsonrpc':'2.0','id':1,'result':self.H,'error':{'code':-1}}))]:
+                       lambda f: setattr(f.response, '_body', json.dumps({'jsonrpc':'2.0','id':2,'result':derived}))]:
             f=self.raw(); change(f); A.addons[0].request(f); A.addons[0].response(f)
-            self.assertEqual(f.metadata['speedex_leg'][0]['_anchor'], {})
+            self.assertEqual(f.metadata['speedex_leg'][0]['_anchor'], {'txHash': derived})
+            self.assertEqual(f.metadata['speedex_leg'][0]['anchorRole'], 'send', '拒绝门：不晋升')
         self.assertEqual(A.STORE.timeline(self.run)['counts']['observed'], 0)
         self.assertEqual(A.STORE.timeline(self.run)['counts']['attempted'], 0)
+
+    def test_rpc_error_with_matched_id_still_promotes_request_derived_identity(self):
+        """v8 新增：HTTP 200 + JSON-RPC error（already known/nonce too low 等，id 匹配）
+        = 端点已处理本请求——请求侧推导身份晋升照常（RH 实证形态：错误响应无 hash）。"""
+        f = self.raw()
+        f.response._body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'error': {'code': -32000, 'message': 'already known'}})
+        A.addons[0].request(f); A.addons[0].response(f)
+        leg = f.metadata['speedex_leg'][0]
+        self.assertEqual(leg['anchorRole'], 'order')
+        self.assertEqual(leg['txHash'], A._evm_raw_tx_hash(self.EVM_BODY))
+        self.assertEqual(A.STORE.timeline(self.run)['counts']['attempted'], 1)
 
     def test_unconfirmed_earlier_broadcast_never_leaves_a_shorter_qualified_timer(self):
         raw = self.raw(); A.addons[0].request(raw)
@@ -6783,7 +6809,138 @@ class TestExactBroadcastAnchors(unittest.TestCase):
         A.STORE.mark_close(self.run)
         A.STORE.mark_open(self.run)
         A.addons[0].response(f)
-        self.assertEqual(leg['_anchor'], {})
+        self.assertEqual(leg['_anchor'], {'txHash': A._evm_raw_tx_hash(self.EVM_BODY)},
+            '请求侧推导身份在开窗时合法入锚；关窗+重开后的迟到 ack 不再写锚（仍只读）')
+
+
+class TestRequestSideBroadcastIdentity(unittest.TestCase):
+    """v8（2026-09-19）：广播请求体数学推导身份原语钉死——keccak256 公开向量 /
+    well-formed EVM raw 夹具（noble 对拍）/ solana wire 首签名夹具（b58 对拍）。
+    生产正确性另经真实链上重构验证：BSC legacy 与 Arc EIP-1559 落链 tx 由 RPC 字段
+    重建 raw 后 keccak256 == 链上 hash；solana getTransaction(base64) 首签名逐字节回读。"""
+
+    def test_keccak256_vectors(self):
+        self.assertEqual(A._keccak256(b"").hex(),
+            "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")
+        self.assertEqual(A._keccak256(b"abc").hex(),
+            "4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45")
+        # 跨 rate 块（512B > 136B）防单块假设
+        self.assertEqual(A._keccak256(bytes(range(256)) * 2).hex(),
+            "f55ba327291604f0e5be6651752398b7be2331aad65f5763ce067df95cc13be1")
+
+    def test_evm_raw_tx_hash_fixture(self):
+        raw = ("0xf8682a8504a817c80182520894ece5ca8bf9220718e5727754026757512212cb3c825f5e80"
+               "822788a01111111111111111111111111111111111111111111111111111111111111111"
+               "a02222222222222222222222222222222222222222222222222222222222222222")
+        self.assertEqual(A._evm_raw_tx_hash(raw),
+            "0x832757d7e834f3027de0a40d5fcdfcee575d8510bd72bff7a8f65da0aba68b26")
+        for bad in [None, "", "0x", "0xzz", "0x1234", 123]:
+            self.assertIsNone(A._evm_raw_tx_hash(bad), bad)
+
+    def test_sol_wire_first_sig_fixture(self):
+        b64 = ("AQMKERgfJi00O0JJUFdeZWxzeoGIj5adpKuyucDHztXc4+rx+P8GDRQbIikwNz5FTFNa"
+               "YWhvdn2Ei5KZoKeutbyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqg==")
+        self.assertEqual(A._sol_wire_first_sig(b64),
+            "4XR92Zct9ZodXzisJ4kov3upmTvMotYVrg65MHP8aoCjSPJwUa7vjaXK5VhDF7ZiiF16v7cY5BPazCLnVqZ3yzb")
+        for bad in ["", "!!!", "AAAA", None]:
+            self.assertIsNone(A._sol_wire_first_sig(bad), bad)
+
+    def test_request_classification_carries_derived_identity(self):
+        # EVM：eth_sendRawTransaction 分类结果带 reqTxHash（体推导），不写签名原文
+        raw = ("0xf8682a8504a817c80182520894ece5ca8bf9220718e5727754026757512212cb3c825f5e80"
+               "822788a01111111111111111111111111111111111111111111111111111111111111111"
+               "a02222222222222222222222222222222222222222222222222222222222222222")
+        out = A._okx_rpc_request("rpc.mainnet.chain.robinhood.com", "/", "POST",
+            {"origin": "https://web3.okx.com"},
+            json.dumps({"jsonrpc": "2.0", "id": 7, "method": "eth_sendRawTransaction", "params": [raw]}))
+        self.assertEqual(out["reqTxHash"], "0x832757d7e834f3027de0a40d5fcdfcee575d8510bd72bff7a8f65da0aba68b26")
+        self.assertEqual(out["chain"], "robinhood")
+        # solana：bare base64 体
+        out2 = A._okx_rpc_request("hongkong.solana.blockrazor.io", "/v2/sendTransaction", "POST",
+            {"origin": "https://web3.okx.com"},
+            "AQMKERgfJi00O0JJUFdeZWxzeoGIj5adpKuyucDHztXc4+rx+P8GDRQbIikwNz5FTFNa"
+            "YWhvdn2Ei5KZoKeutbyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqg==")
+        self.assertEqual(out2["reqTxHash"],
+            "4XR92Zct9ZodXzisJ4kov3upmTvMotYVrg65MHP8aoCjSPJwUa7vjaXK5VhDF7ZiiF16v7cY5BPazCLnVqZ3yzb")
+
+
+class TestIdentifiedSendNoPoison(unittest.TestCase):
+    """v8 回归（RH/SOL 实证事故形）：R1 广播经请求侧身份晋升后，R2 订单不再被
+    「更早未识别 send」毒化（broadcast-anchor-unconfirmed 不再批量出现）。"""
+
+    def setUp(self):
+        fresh()
+        self.clock = time.monotonic() * 1000 + 10
+        from unittest.mock import patch
+        for target, replacement in [("_mono_ms", lambda: self.clock), ("_poll_receipt", lambda *_: None)]:
+            p = patch.object(A, target, replacement); p.start(); self.addCleanup(p.stop)
+        p = patch.object(A.HEADS, "snapshot", lambda rid, t: {c: {
+            "version": 1, "chain": c, "epoch": rid, "height": 40, "anchorTs": t,
+            "observedTs": t - 1, "sampleAgeMs": 1} for c in A.CHAINS})
+        p.start(); self.addCleanup(p.stop)
+        self.run = "no-poison-window"
+        A.STORE.mark_open(self.run, manifest={"version": 1, "runId": self.run, "legs": [
+            {"platform": "okx", "chain": "robinhood", "rounds": 2}]})
+        self.clock += 100
+
+    def test_identified_earlier_send_does_not_poison_later_orders(self):
+        body1 = "0x" + "12" * 100
+        tx1 = A._evm_raw_tx_hash(body1)
+        # R1：send 请求 + 200 error 响应（already known —— RH 实证形态）→ 请求侧身份晋升
+        r1 = FakeFlow("rpc.mainnet.chain.robinhood.com", "/",
+            req_body=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction", "params": [body1]}),
+            resp_body=json.dumps({"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "already known"}}))
+        r1.request.headers = {"origin": "https://web3.okx.com"}
+        r1.response.status_code = 200
+        A.addons[0].request(r1); A.addons[0].response(r1)
+        send_leg = r1.metadata["speedex_leg"][0]
+        self.assertEqual(send_leg["anchorRole"], "order", "请求侧身份 + id 匹配的 error 响应 → 晋升")
+        self.clock += 1000
+        # R2：另一 tx 的平台订单 + 成功帧——不再被 R1 的 send 毒化
+        body2 = "0x" + "34" * 100
+        tx2 = A._evm_raw_tx_hash(body2)
+        p2 = FakeFlow("web3.okx.com", "/priapi/v6/dx/trade/multi/broadcast",
+            req_body=json.dumps({"chainId": 4663, "signedInfoList": [{"txHash": tx2}], "orderId": "order-two"}),
+            resp_body=json.dumps({"code": "0", "data": {"transactionHash": tx2, "orderId": "order-two"}}))
+        p2.request.headers = {"origin": "https://web3.okx.com"}
+        p2.response.status_code = 200
+        A.addons[0].request(p2); A.addons[0].response(p2)
+        self.clock += 10
+        A.addons[0].websocket_message(ws_frame("wsdexpri.okx.com", json.dumps(
+            {"arg": {"channel": "dex-swap-order-info"},
+             "data": {"dexData": {"status": "1", "orderId": "order-two", "transactionHash": tx2}}})))
+        tl = A.STORE.timeline(self.run, full=True)
+        row = next(x for x in tl["legs"] if x.get("txHash") == tx2 and not x.get("dup"))
+        self.assertIsNone(row["incomplete"], "已晋升的早期 send 不再毒化后续订单")
+        self.assertEqual(row["hkL1aMs"], 10)
+
+    def test_transport_failed_send_still_poisons(self):
+        """兜底不放宽：传输层失败（500）的 send 身份不可证 → 后续订单仍如实缺失。"""
+        body1 = "0x" + "12" * 100
+        r1 = FakeFlow("rpc.mainnet.chain.robinhood.com", "/",
+            req_body=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction", "params": [body1]}),
+            resp_body="")
+        r1.request.headers = {"origin": "https://web3.okx.com"}
+        r1.response.status_code = 500
+        A.addons[0].request(r1); A.addons[0].response(r1)
+        self.assertEqual(r1.metadata["speedex_leg"][0]["anchorRole"], "send", "500 不晋升")
+        self.clock += 1000
+        body2 = "0x" + "34" * 100
+        tx2 = A._evm_raw_tx_hash(body2)
+        p2 = FakeFlow("web3.okx.com", "/priapi/v6/dx/trade/multi/broadcast",
+            req_body=json.dumps({"chainId": 4663, "signedInfoList": [{"txHash": tx2}], "orderId": "order-two"}),
+            resp_body=json.dumps({"code": "0", "data": {"transactionHash": tx2, "orderId": "order-two"}}))
+        p2.request.headers = {"origin": "https://web3.okx.com"}
+        p2.response.status_code = 200
+        A.addons[0].request(p2); A.addons[0].response(p2)
+        self.clock += 10
+        A.addons[0].websocket_message(ws_frame("wsdexpri.okx.com", json.dumps(
+            {"arg": {"channel": "dex-swap-order-info"},
+             "data": {"dexData": {"status": "1", "orderId": "order-two", "transactionHash": tx2}}})))
+        tl = A.STORE.timeline(self.run, full=True)
+        row = next(x for x in tl["legs"] if x.get("txHash") == tx2 and not x.get("dup"))
+        self.assertEqual(row["incomplete"], "broadcast-anchor-unconfirmed")
+        self.assertIsNone(row["hkL1aMs"])
 
 
 class TestStrictProductStatus(unittest.TestCase):

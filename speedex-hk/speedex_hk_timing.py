@@ -129,6 +129,7 @@ scripts/lib/binance-ws.mjs anchorMatchVerdict/extractOrderHistoryHash 的同节�
 cookie/authorization 头、签名 body、私钥材料。事件默认内存态（拉取后可清）。
 """
 
+import base64
 import hashlib
 import http.client
 import importlib.metadata
@@ -214,7 +215,7 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # 槽位必须衔接已接受头、同高异父=分叉；不连续即清空重锚，与 EVM hash/parentHash
 # 冲突清空同律；样本保留 parent 字段）。修订经过见 git 历史；行为由
 # deploy/hk-proxy/test_speedex_hk_timing.py 与 tests/hk-timing*.test.mjs 钉住。
-ADDON_VERSION = "2026.09.17-strict-success-v7"
+ADDON_VERSION = "2026.09.19-req-broadcast-identity-v8"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -247,6 +248,119 @@ _ORDER_ID_RE = re.compile(
 # 腿锚身份键（独立锚 + 路由身份）：成功/hash 采纳与 WS 帧→腿路由只看这三键
 _IDENTITY_KEYS = ("orderId", "clientOrderId", "txHash")
 _ID_VALUE_MAX = 64
+
+
+# ── 广播请求体身份推导（不持久化签名正文，只在内存中算身份）────────────────
+# keccak-256 纯 Python 实现（keccak-f[1600]）：EVM txHash = keccak256(rawSignedTx)。
+# 注意 keccak padding 0x01 与 SHA3-256 的 0x06 不同——不能用 hashlib.sha3_256 替代。
+# 正确性由公开向量与真实链上重构（BSC legacy / Arc EIP-1559 回重建 raw 比对）钉死，
+# 见 test_speedex_hk_timing.py。
+_MASK64 = (1 << 64) - 1
+_KECCAK_RC = (
+    0x0000000000000001, 0x0000000000008082, 0x800000000000808A, 0x8000000080008000,
+    0x000000000000808B, 0x0000000080000001, 0x8000000080008081, 0x8000000000008009,
+    0x000000000000008A, 0x0000000000000088, 0x0000000080008009, 0x000000008000000A,
+    0x000000008000808B, 0x800000000000008B, 0x8000000000008089, 0x8000000000008003,
+    0x8000000000008002, 0x8000000000000080, 0x000000000000800A, 0x800000008000000A,
+    0x8000000080008081, 0x8000000000008080, 0x0000000080000001, 0x8000000080008008,
+)
+_KECCAK_ROT = (
+     0,  1, 62, 28, 27,
+    36, 44,  6, 55, 20,
+     3, 10, 43, 25, 39,
+    41, 45, 15, 21,  8,
+    18,  2, 61, 56, 14,
+)
+
+
+def _rotl64(v, n):
+    return v if n == 0 else (((v << n) | (v >> (64 - n))) & _MASK64)
+
+
+def _keccak_f1600(s):
+    for rc in _KECCAK_RC:
+        c = [s[x] ^ s[x + 5] ^ s[x + 10] ^ s[x + 15] ^ s[x + 20] for x in range(5)]
+        d = [c[(x + 4) % 5] ^ _rotl64(c[(x + 1) % 5], 1) for x in range(5)]
+        for x in range(5):
+            for y in range(5):
+                s[x + 5 * y] ^= d[x]
+        b = [0] * 25
+        for x in range(5):
+            for y in range(5):
+                b[y + 5 * ((2 * x + 3 * y) % 5)] = _rotl64(s[x + 5 * y], _KECCAK_ROT[x + 5 * y])
+        for x in range(5):
+            for y in range(5):
+                s[x + 5 * y] = b[x + 5 * y] ^ ((~b[(x + 1) % 5 + 5 * y] & _MASK64) & b[(x + 2) % 5 + 5 * y])
+        s[0] ^= rc
+
+
+def _keccak256(data):
+    """bytes → 32B keccak-256 digest（rate 136B，pad10*1 域 0x01）。"""
+    rate = 136
+    s = [0] * 25
+    padded = bytearray(data)
+    padded.append(0x01)
+    while len(padded) % rate != rate - 1:
+        padded.append(0)
+    padded.append(0x80)
+    for off in range(0, len(padded), rate):
+        blk = padded[off : off + rate]
+        for i in range(rate // 8):
+            s[i] ^= int.from_bytes(blk[8 * i : 8 * i + 8], "little")
+        _keccak_f1600(s)
+    return b"".join(x.to_bytes(8, "little") for x in s)[:32]
+
+
+def _evm_raw_tx_hash(raw_hex):
+    """eth_sendRawTransaction 的 0x-hex 已签名原文 → txHash（keccak256(rawBytes)）。"""
+    if not isinstance(raw_hex, str) or not raw_hex.startswith("0x"):
+        return None
+    try:
+        raw = bytes.fromhex(raw_hex[2:])
+    except ValueError:
+        return None
+    if len(raw) < 16:
+        return None
+    return "0x" + _keccak256(raw).hex()
+
+
+_B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def _b58encode(b):
+    n = int.from_bytes(b, "big")
+    out = ""
+    while n:
+        n, r = divmod(n, 58)
+        out = _B58_ALPHABET[r] + out
+    pad = 0
+    for byte in b:
+        if byte == 0:
+            pad += 1
+        else:
+            break
+    return "1" * pad + out
+
+
+def _sol_wire_first_sig(b64_body):
+    """solana wire 交易（base64）→ 首个签名（base58）——wire 头 = compact-u16 签名数
+    后紧跟 64B 签名表；与链上 getTransaction 回读签名逐字节一致（实证向量见测试）。"""
+    try:
+        raw = base64.b64decode(b64_body, validate=True)
+    except Exception:
+        return None
+    if not raw:
+        return None
+    count = raw[0]
+    off = 1
+    if count & 0x80:  # compact-u16 双字节形
+        if len(raw) < 2:
+            return None
+        count = (count & 0x7F) | (raw[1] << 7)
+        off = 2
+    if count < 1 or len(raw) < off + 64:
+        return None
+    return _b58encode(raw[off : off + 64])
 
 
 def _j(payload):
@@ -648,13 +762,19 @@ def _okx_rpc_request(host, path, method, headers, body):
     """Request classification only. Response on this exact flow supplies tx identity.
     Origin is a product-path filter, never an identity/security credential. Body/query
     and headers are neither retained nor sent anywhere by this observer.
+    reqTxHash：请求体数学推导身份（keccak256(raw) / wire 首签名）——响应侧 hash 仍是
+    交叉验证，冲突走锚否决律；签名原文不持久化（只有推导 hash 入锚）。
     """
     if method != "POST" or len(body) > 262144 or headers.get("origin") != "https://web3.okx.com":
         return None
     if host in OKX_SOL_SEND_HOSTS and path == "/v2/sendTransaction":
         # Observed BlockRazor endpoint accepts a bare base64 transaction.
         if 80 <= len(body) <= 16400 and re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", body):
-            return {"chain": "solana", "source": "okx-solana-send", "id": None}
+            out = {"chain": "solana", "source": "okx-solana-send", "id": None}
+            sig = _sol_wire_first_sig(body)
+            if sig:
+                out["reqTxHash"] = sig
+            return out
         return None
     if host not in OKX_RPC_HOSTS or path != "/":
         return None
@@ -668,23 +788,34 @@ def _okx_rpc_request(host, path, method, headers, body):
         return None
     if not re.fullmatch(r"0x(?:[0-9a-fA-F]{2}){16,131000}", params[0]):
         return None
-    return {"chain": OKX_RPC_HOSTS[host], "source": "okx-evm-send", "id": rid}
+    out = {"chain": OKX_RPC_HOSTS[host], "source": "okx-evm-send", "id": rid}
+    txh = _evm_raw_tx_hash(params[0])
+    if txh:
+        out["reqTxHash"] = txh
+    return out
 
 
 def _okx_rpc_response(meta, response):
+    """响应解析。返回 dict 可带 _reject 标记（调用方据此拒绝广播身份晋升）：
+    非 200/超尺寸/非 JSON-RPC 信封/响应 id 与请求不配 = 传输或流完整性失败，
+    该响应不是本平台受理证据；id 匹配的 JSON-RPC error（already known /
+    nonce too low 等）= 端点已处理本请求，tx 身份请求侧数学推导已在锚，不标 _reject。
+    """
     if response.status_code != 200:
-        return {}
+        return {"_reject": f"http-{response.status_code}"}
     body = response.get_text() or ""
     if len(body) > 4096:
-        return {}
+        return {"_reject": "oversize"}
     if meta["source"] == "okx-solana-send":
         tx = _transaction_id_value(body.strip())
         return {"txHash": tx} if tx and not tx.startswith("0x") else {}
     obj = _j(body)
-    if not isinstance(obj, dict) or obj.get("jsonrpc") != "2.0" or obj.get("error") is not None:
+    if not isinstance(obj, dict) or obj.get("jsonrpc") != "2.0":
+        return {"_reject": "not-jsonrpc"}
+    if obj.get("error") is not None:
         return {}
     if type(obj.get("id")) is not type(meta["id"]) or obj.get("id") != meta["id"]:
-        return {}
+        return {"_reject": "id-mismatch"}
     tx = _transaction_id_value(obj.get("result"))
     return {"txHash": tx} if tx and tx.startswith("0x") else {}
 
@@ -3397,6 +3528,11 @@ class SpeedexHkTiming:
         if leg is None:
             return
         flow.metadata["speedex_leg"] = (leg, rid)  # 直接持引用
+        if raw and raw.get("reqTxHash"):
+            # OKX 广播请求体数学推导身份（keccak256(raw)/solana wire 首签名）——
+            # 请求到达即知 tx 身份；响应侧 hash 仍是交叉验证（不一致 → 锚冲突否决律）。
+            # 签名原文不持久化，只有推导 hash 入锚。
+            STORE.update_anchor(leg, {"txHash": raw["reqTxHash"]})
         if request_ids:
             STORE.update_anchor(leg, request_ids)
             STORE.dedup_order_identity(leg)
@@ -3434,7 +3570,9 @@ class SpeedexHkTiming:
             raw = flow.metadata.get("speedex_rpc")
             ids = _okx_rpc_response(raw, flow.response) if raw else (rule["extract_ids"](body) or {})
         except Exception:
-            ids = {}
+            # 解析崩溃的响应不能充当受理证据（raw RPC 流）：拒绝晋升；锚写入不受影响
+            # （_reject 非身份键，update_anchor 键白名单忽略）
+            ids = {"_reject": "parse-error"} if flow.metadata.get("speedex_rpc") else {}
         # 响应抽取的 id/chain 是独立锚（成功判定/hash 采纳只认锚）：
         # 结构化 schema-known 抽取——orderId 与 clientOrderId 分键写锚；旧整-body 正则
         # 只算诊断（legacyRegexDiverged），永不写锚。
@@ -3449,8 +3587,11 @@ class SpeedexHkTiming:
         except Exception:
             pass
         # 响应建立订单身份后正向去重——同 run 同单已绑槽 → 本腿归入
-        # 同一授权槽（释放占用槽、标 dup 诊断）；身份缺失/冲突不猜
-        if flow.metadata.get("speedex_rpc"):
+        # 同一授权槽（释放占用槽、标 dup 诊断）；身份缺失/冲突不猜。
+        # 晋升门（2026-09-19 v8）：响应 _reject（非 200/超尺寸/非 JSON-RPC/id 不配）
+        # 不晋升——传输/流完整性失败时请求侧推导身份不能单独证明受理；JSON-RPC
+        # error（already known/nonce too low 等，id 匹配）= 端点已处理，晋升照常。
+        if flow.metadata.get("speedex_rpc") and not ids.get("_reject"):
             STORE.confirm_broadcast_identity(leg)
         STORE.dedup_order_identity(leg)
         # 闩锁启动 poller——每腿至多一个，轮询腿锁定 hash
