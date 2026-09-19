@@ -6997,5 +6997,91 @@ class TestStrictProductStatus(unittest.TestCase):
             self.assertFalse(any(x["success"] and x["ids"].get("txHash") for x in units))
 
 
+class TestChainChannelArrivals(unittest.TestCase):
+    """v10（2026-09-19）：www.okx.com /fullnode|/nodeone 链域通道成功通知到达时刻——
+    HK 钟、精确 tx 身份、每通道首到冻结；与成功判定管线完全分离。"""
+
+    def setUp(self):
+        fresh()
+        self.clock = time.monotonic() * 1000 + 10
+        from unittest.mock import patch
+        for target, replacement in [("_mono_ms", lambda: self.clock), ("_poll_receipt", lambda *_: None)]:
+            p = patch.object(A, target, replacement); p.start(); self.addCleanup(p.stop)
+        p = patch.object(A.HEADS, "snapshot", lambda rid, t: {c: {
+            "version": 1, "chain": c, "epoch": rid, "height": 40, "anchorTs": t,
+            "observedTs": t - 1, "sampleAgeMs": 1} for c in A.CHAINS})
+        p.start(); self.addCleanup(p.stop)
+        self.run = "channel-arrivals-window"
+        A.STORE.mark_open(self.run, manifest={"version": 1, "runId": self.run, "legs": [
+            {"platform": "okx", "chain": "robinhood", "rounds": 1},
+            {"platform": "okx", "chain": "solana", "rounds": 1}]})
+        self.clock += 100
+
+    def send_leg(self, chain, body):
+        host = "rpc.mainnet.chain.robinhood.com" if chain == "robinhood" else "hongkong.solana.blockrazor.io"
+        path = "/" if chain == "robinhood" else "/v2/sendTransaction"
+        f = FakeFlow(host, path, req_body=body, resp_body="")
+        f.request.headers = {"origin": "https://web3.okx.com"}
+        f.response.status_code = 200
+        A.addons[0].request(f)
+        return f.metadata["speedex_leg"][0]
+
+    def chan_frame(self, path, payload):
+        f = FakeFlow("www.okx.com", path)
+        f.websocket = types.SimpleNamespace(messages=[FakeWSMsg(payload)])
+        return f
+
+    def test_nodeone_evm_receipt_frame_records_first_arrival(self):
+        body = "0x" + "12" * 100
+        tx = A._evm_raw_tx_hash(body)
+        self.send_leg("robinhood", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction", "params": [body]}))
+        # eth_subscription 帧：result 内 transactionHash 精确 + status 0x1
+        frame = json.dumps({"jsonrpc": "2.0", "method": "eth_subscription",
+            "params": {"subscription": "0xabc", "result": {"transactionHash": tx, "status": "0x1"}}})
+        self.clock += 700
+        A.addons[0].websocket_message(self.chan_frame("/nodeone/robinhood/mainnet/v1/websocket", frame))
+        self.clock += 500
+        A.addons[0].websocket_message(self.chan_frame("/nodeone/robinhood/mainnet/v1/websocket", frame))  # 第二帧不覆盖首到
+        leg = A.STORE.legs[self.run][0]
+        tl = A.STORE.timeline(self.run, full=True)
+        row = tl["legs"][0]
+        self.assertEqual(row["channelArrivals"], [{"channel": "nodeone", "api": "eth_subscription", "ms": 700}])
+        self.assertIsNone(row["hkL1aMs"], "链域帧不产生成功计时（与成功管线分离）")
+        self.assertIsNone(leg.get("tSuccessPushMs"))
+
+    def test_rejects_wrong_hash_unsuccess_and_nonschema(self):
+        body = "0x" + "12" * 100
+        tx = A._evm_raw_tx_hash(body)
+        self.send_leg("robinhood", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction", "params": [body]}))
+        for result in [
+            {"transactionHash": "0x" + "ff" * 32, "status": "0x1"},   # 异 tx
+            {"transactionHash": tx, "status": "0x0"},                  # 失败态
+            {"transactionHash": tx},                                   # 缺 status
+            {"transactionHash": tx[:-2], "status": "0x1"},             # 前缀相似不完整
+        ]:
+            A.addons[0].websocket_message(self.chan_frame("/nodeone/robinhood/mainnet/v1/websocket",
+                json.dumps({"jsonrpc": "2.0", "method": "eth_subscription", "params": {"subscription": "0x1", "result": result}})))
+        self.assertIsNone(A.STORE.legs[self.run][0].get("_channelArrivals"))
+
+    def test_solana_fullnode_signature_notification(self):
+        sig_bytes = bytes((i * 7 + 3) & 0xFF for i in range(64))
+        sig = A._b58encode(sig_bytes)
+        wire = bytes([1]) + sig_bytes + bytes(32)
+        import base64 as _b64
+        leg = self.send_leg("solana", _b64.b64encode(wire).decode())
+        self.assertEqual(leg.get("txHash"), sig, "请求侧首签名身份")
+        ok_frame = json.dumps({"jsonrpc": "2.0", "method": "signatureNotification",
+            "params": {"subscription": 1, "result": {"context": {"slot": 9}, "value": {"signature": sig, "err": None}}}})
+        err_frame = json.dumps({"jsonrpc": "2.0", "method": "signatureNotification",
+            "params": {"subscription": 1, "result": {"context": {"slot": 9}, "value": {"signature": sig, "err": {"Custom": 1}}}}})
+        A.addons[0].websocket_message(self.chan_frame("/fullnode/sol/discover/ws", err_frame))
+        self.assertIsNone(A.STORE.legs[self.run][-1].get("_channelArrivals"), "err 帧不认")
+        self.clock += 450
+        A.addons[0].websocket_message(self.chan_frame("/fullnode/sol/discover/ws", ok_frame))
+        tl = A.STORE.timeline(self.run, full=True)
+        sol_rows = [x for x in tl["legs"] if x.get("txHash") == sig]
+        self.assertEqual(sol_rows[0]["channelArrivals"], [{"channel": "fullnode", "api": "signatureNotification", "ms": 450}])
+
+
 if __name__ == "__main__":
     unittest.main()

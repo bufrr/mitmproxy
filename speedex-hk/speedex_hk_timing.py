@@ -215,7 +215,7 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # 槽位必须衔接已接受头、同高异父=分叉；不连续即清空重锚，与 EVM hash/parentHash
 # 冲突清空同律；样本保留 parent 字段）。修订经过见 git 历史；行为由
 # deploy/hk-proxy/test_speedex_hk_timing.py 与 tests/hk-timing*.test.mjs 钉住。
-ADDON_VERSION = "2026.09.19-req-receipt-promote-v9"
+ADDON_VERSION = "2026.09.19-chain-channel-arrivals-v10"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -361,6 +361,53 @@ def _sol_wire_first_sig(b64_body):
     if count < 1 or len(raw) < off + 64:
         return None
     return _b58encode(raw[off : off + 64])
+
+
+# ── v10 链域通道（www.okx.com /fullnode|/nodeone WS）窄提取 ────────────────
+# 只取 schema-known 字段的精确 tx 身份；与平台成功判定管线完全分离（这些帧是链上
+# 通知，不是平台订单成功——永不进 success/ws_buffer/资格门）。帧体不持久化。
+_OKX_CHAIN_WS_PATH = re.compile(r"^/(fullnode|nodeone)/([a-z0-9-]+)/", re.I)
+_OKX_EVM_TX_KEYS = ("txHash", "transactionHash", "hash")
+_OKX_SUCCESS_STATUS = ("0x1", "0x01", "1", 1)
+
+
+def _okx_chain_frame_identity(payload, channel, chain):
+    """返回帧内精确 tx 身份（schema-known 窄提取，成功形态才认）：
+    - solana fullnode：signatureNotification 的 params.result.value.signature 精确等值
+      且 err === null；
+    - EVM nodeone/fullnode：eth_subscription 的 params.result 内 txHash/transactionHash/
+      hash 精确 hex64 + 同 result 的 status ∈ {0x1,0x01,1,1}（同子树成功律，与 EU
+      classify-ws 同口径）。
+    不满足 → None（不猜、不部分采纳）。
+    """
+    obj = _decode_ws(payload)
+    if not isinstance(obj, dict):
+        return None
+    params = obj.get("params")
+    result = params.get("result") if isinstance(params, dict) else None
+    if channel == "fullnode" and chain == "solana":
+        if not re.search(r"signatureNotification", str(obj.get("method") or "")):
+            return None
+        if not isinstance(result, dict):
+            return None
+        value = result.get("value")
+        if not isinstance(value, dict) or value.get("err") is not None:
+            return None
+        sig = value.get("signature")
+        return sig if isinstance(sig, str) and 64 <= len(sig) <= 96 else None
+    # EVM：eth_subscription
+    if not re.search(r"eth_subscription", str(obj.get("method") or "")):
+        return None
+    if not isinstance(result, dict):
+        return None
+    status = result.get("status")
+    if status not in _OKX_SUCCESS_STATUS and str(status).lower() not in _OKX_SUCCESS_STATUS:
+        return None
+    for k in _OKX_EVM_TX_KEYS:
+        v = result.get(k)
+        if isinstance(v, str) and re.fullmatch(r"0x[0-9a-fA-F]{64}", v):
+            return v
+    return None
 
 
 def _j(payload):
@@ -2939,6 +2986,30 @@ class Store:
             leg["receiptPolling"] = True
             return h
 
+    def note_channel_arrival(self, chain, tx_value, channel, api, t_ms):
+        """v10：链域通道（nodeone/fullnode，www.okx.com）成功通知到达登记——HK 钟。
+        仅精确 tx 身份匹配（锚内 txHash 恒等）的开窗腿；每腿每通道首到冻结。
+        与成功判定管线完全分离：不触成功/资格/锚门，纯到达时刻记录。"""
+        if not tx_value:
+            return
+        with self.lock:
+            now = time.monotonic()
+            for rid in self._open_run_ids_locked(now):
+                for leg in self.legs.get(rid, []):
+                    if leg.get("dup") or leg.get("windowClosed") or leg.get("_anchorVeto"):
+                        continue
+                    anchor = (leg.get("_anchor") or {}).get("txHash")
+                    if anchor is None:
+                        continue
+                    if _ident_norm("txHash", anchor) != _ident_norm("txHash", tx_value):
+                        continue
+                    if chain and leg.get("chain") and leg["chain"] != chain:
+                        continue
+                    arr = leg.setdefault("_channelArrivals", {})
+                    if channel not in arr:
+                        arr[channel] = {"tMs": t_ms, "api": api}
+                        self.diag["chainChannelArrivals"] = self.diag.get("chainChannelArrivals", 0) + 1
+
     def id_claimed(self, run_id, key, value, except_leg=None):
         """同 run 内某 id/hash 是否已被其他腿占用（防陈旧/跨批重放帧把旧值挂到新腿）。
         只对 txHash/orderId/clientOrderId 调用——chain 是属性不是身份，不去重。"""
@@ -3077,6 +3148,13 @@ class Store:
                     "pendingBind": bool(x.get("pendingBind")),
                     "tOrderOutMs": t0,
                     "orderRequestSource": x.get("orderRequestSource"),
+                    # v10：链域通道（nodeone/fullnode）首到成功通知——HK 钟、精确 tx 身份
+                    # 匹配、与成功判定管线分离；ms 相对本腿 tOrderOutMs（与 hkL1aMs 同锚）
+                    "channelArrivals": [
+                        {"channel": c, "api": v.get("api"), "ms": _delta(v.get("tMs"), t0)}
+                        for c, v in sorted((x.get("_channelArrivals") or {}).items())
+                        if _delta(v.get("tMs"), t0) is not None
+                    ] or None,
                     "chainHead": chain_head,
                     "tFirstRespMs": x.get("tFirstRespMs"),
                     "tSuccessPushMs": x.get("tSuccessPushMs"),
@@ -3651,6 +3729,19 @@ class SpeedexHkTiming:
         if not STORE.any_open():
             return
         host = flow.request.pretty_host
+        # v10：链域通道（www.okx.com /fullnode|/nodeone）——成功通知到达时刻（HK 钟）
+        # 窄提取，与平台成功判定管线完全分离（不进 ws_entries/ws_buffer/成功资格门）。
+        if host == "www.okx.com" and not msg.from_client:
+            path = (flow.request.path or "").split("?")[0]
+            m = _OKX_CHAIN_WS_PATH.match(path)
+            if m:
+                channel = m.group(1).lower()
+                chain = {"sol": "solana"}.get(m.group(2).lower(), m.group(2).lower())
+                txv = _okx_chain_frame_identity(msg.content, channel, chain)
+                if txv:
+                    STORE.note_channel_arrival(chain, txv, channel,
+                        "signatureNotification" if chain == "solana" else "eth_subscription", t_obs)
+            return
         platform = _classify_ws(host)
         if not platform:
             return
