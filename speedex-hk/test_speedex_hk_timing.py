@@ -7063,6 +7063,21 @@ class TestChainChannelArrivals(unittest.TestCase):
                 json.dumps({"jsonrpc": "2.0", "method": "eth_subscription", "params": {"subscription": "0x1", "result": result}})))
         self.assertIsNone(A.STORE.legs[self.run][0].get("_channelArrivals"))
 
+    def test_load_hook_warms_egress_cache_with_epoch_guard(self):
+        """v10.1：load 钩子即时温 egress 缓存（c9tar unknown-proxy 事故防回归）。"""
+        calls = []
+        from unittest.mock import patch
+        p = patch.object(A, "_vantage", lambda fetch=False: calls.append(fetch) or "hk-proxy")
+        p.start(); self.addCleanup(p.stop)
+        epoch_before = A._EGRESS_REFRESH_EPOCH
+        A.addons[0].load(None)
+        self.assertEqual(A._EGRESS_REFRESH_EPOCH, epoch_before + 1, "每代热重载递增 epoch（旧线程让位）")
+        for _ in range(100):
+            if calls:
+                break
+            time.sleep(0.02)
+        self.assertEqual(calls[:1], [True], "load 即时温一次 egress 缓存（fetch=True）")
+
     def test_solana_fullnode_signature_notification(self):
         sig_bytes = bytes((i * 7 + 3) & 0xFF for i in range(64))
         sig = A._b58encode(sig_bytes)
