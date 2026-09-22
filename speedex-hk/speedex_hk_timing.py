@@ -215,7 +215,7 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # 槽位必须衔接已接受头、同高异父=分叉；不连续即清空重锚，与 EVM hash/parentHash
 # 冲突清空同律；样本保留 parent 字段）。修订经过见 git 历史；行为由
 # deploy/hk-proxy/test_speedex_hk_timing.py 与 tests/hk-timing*.test.mjs 钉住。
-ADDON_VERSION = "2026.09.22-chain-arrivals-egress-warm-v10.1-mkt-tap1"
+ADDON_VERSION = "2026.09.22-chain-arrivals-egress-warm-v10.1-mkt-tap2"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -3612,7 +3612,9 @@ class _MarketTap:
             if not head:
                 return
             for a in set(_MARKET_ADDR_RE.findall(head)):
-                key = f"{host}|{a.lower()}"
+                # 按 host|channel|addr 记首见——同一地址可能先后到达多个频道，
+                # host 级首见由消费端取 min 归并（同订阅面竞速需要频道级粒度）
+                key = f"{host}|{ch or '-'}|{a.lower()}"
                 if key in self.addr_first:
                     continue
                 while len(self._order) >= _MARKET_TAP_MAX_ADDR:

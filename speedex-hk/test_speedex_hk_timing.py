@@ -7140,7 +7140,7 @@ class TestMarketTap(unittest.TestCase):
         )
         s = A.MARKET_TAP.snapshot()
         self.assertIn("wsdexpri.okx.com|dex-market-new-token-logo-update", s["channels"])
-        self.assertIn("wsdexpri.okx.com|" + addr, s["addrFirst"])
+        self.assertIn("wsdexpri.okx.com|dex-market-new-token-logo-update|" + addr, s["addrFirst"])
 
 
 if __name__ == "__main__":
