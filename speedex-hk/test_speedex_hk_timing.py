@@ -7026,10 +7026,31 @@ class TestChainChannelArrivals(unittest.TestCase):
         A.addons[0].request(f)
         return f.metadata["speedex_leg"][0]
 
-    def chan_frame(self, path, payload):
-        f = FakeFlow("www.okx.com", path)
+    def chan_frame(self, path, payload, host="www.okx.com"):
+        f = FakeFlow(host, path)
         f.websocket = types.SimpleNamespace(messages=[FakeWSMsg(payload)])
         return f
+
+    def test_okx_ac_host_robinhood_fullnode_discover_ws(self):
+        """2026-09-22：rh 链域通知实证迁至 www.okx.ac/fullnode/robinhood/discover/ws
+        （host 别名放行；同路径正则与 EVM eth_subscription 身份门不变）。"""
+        body = "0x" + "34" * 100
+        tx = A._evm_raw_tx_hash(body)
+        self.send_leg("robinhood", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction", "params": [body]}))
+        frame = json.dumps({"jsonrpc": "2.0", "method": "eth_subscription",
+            "params": {"subscription": "0xac1", "result": {"transactionHash": tx, "status": "0x1"}}})
+        self.clock += 640
+        A.addons[0].websocket_message(self.chan_frame("/fullnode/robinhood/discover/ws", frame, host="www.okx.ac"))
+        leg = A.STORE.legs[self.run][0]
+        row = A.STORE.timeline(self.run, full=True)["legs"][0]
+        self.assertEqual(row["channelArrivals"], [{"channel": "fullnode", "api": "eth_subscription", "ms": 640}])
+        self.assertIsNone(row["hkL1aMs"], "链域帧不产生成功计时")
+        self.assertIsNone(leg.get("tSuccessPushMs"))
+        # 未登记 host 变体（如 www.okx.ac.evil.example）仍拒绝
+        A.STORE.legs[self.run][0].pop("_channelArrivals", None)
+        self.clock += 100
+        A.addons[0].websocket_message(self.chan_frame("/fullnode/robinhood/discover/ws", frame, host="www.okx.ac.evil.example"))
+        self.assertIsNone(A.STORE.legs[self.run][0].get("_channelArrivals"), "相似 host 不放行")
 
     def test_nodeone_evm_receipt_frame_records_first_arrival(self):
         body = "0x" + "12" * 100

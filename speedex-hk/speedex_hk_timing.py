@@ -215,7 +215,7 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # 槽位必须衔接已接受头、同高异父=分叉；不连续即清空重锚，与 EVM hash/parentHash
 # 冲突清空同律；样本保留 parent 字段）。修订经过见 git 历史；行为由
 # deploy/hk-proxy/test_speedex_hk_timing.py 与 tests/hk-timing*.test.mjs 钉住。
-ADDON_VERSION = "2026.09.22-chain-arrivals-egress-warm-v10.1-mkt-tap2"
+ADDON_VERSION = "2026.09.22-chain-arrivals-egress-warm-v10.1-mkt-tap2-okxac"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -367,6 +367,9 @@ def _sol_wire_first_sig(b64_body):
 # 只取 schema-known 字段的精确 tx 身份；与平台成功判定管线完全分离（这些帧是链上
 # 通知，不是平台订单成功——永不进 success/ws_buffer/资格门）。帧体不持久化。
 _OKX_CHAIN_WS_PATH = re.compile(r"^/(fullnode|nodeone)/([a-z0-9-]+)/", re.I)
+# 2026-09-22：OKX 链域通道 host 扩展——robinhood 链通知实证迁至 www.okx.ac
+# （/fullnode/robinhood/discover/ws；路径正则同形命中）。okx.ac 为 OKX 同运营域。
+_OKX_CHAIN_WS_HOSTS = frozenset(("www.okx.com", "www.okx.ac"))
 _OKX_EVM_TX_KEYS = ("txHash", "transactionHash", "hash")
 _OKX_SUCCESS_STATUS = ("0x1", "0x01", "1", 1)
 
@@ -3852,7 +3855,7 @@ class SpeedexHkTiming:
         host = flow.request.pretty_host
         # v10：链域通道（www.okx.com /fullnode|/nodeone）——成功通知到达时刻（HK 钟）
         # 窄提取，与平台成功判定管线完全分离（不进 ws_entries/ws_buffer/成功资格门）。
-        if host == "www.okx.com" and not msg.from_client:
+        if host in _OKX_CHAIN_WS_HOSTS and not msg.from_client:
             path = (flow.request.path or "").split("?")[0]
             m = _OKX_CHAIN_WS_PATH.match(path)
             if m:
