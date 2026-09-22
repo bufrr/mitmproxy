@@ -64,7 +64,8 @@ HTTP 200 且无 error，result 为完整 EVM hash；Sol 回应为完整 base58 s
 未确认身份的 `anchorRole=send` 不占授权槽，关窗仍未知标记 `broadcast-identity-unconfirmed`。
 同一精确 tx 与 `/broadcast` 合并，所有共同身份键一致才去重，最早请求接管槽位和原链头。
 早到平台成功帧保留源时间后重审；RPC 接收回执从不冒充平台成功。若仍有更早且身份未明的
-同链发送，合格 HK 计时和链头暂缺，原因 `broadcast-anchor-unconfirmed`。
+同链发送（已正向同单归并的 dup 腿不算——其身份随已绑槽 formal 腿落定），合格 HK 计时
+和链头暂缺，原因 `broadcast-anchor-unconfirmed`。
 
 新增 `orderRequestSource=platform-order|okx-evm-send|okx-solana-send`，由 speedex 消费者
 保留至公开 DTO 与块距说明/导出；旧记录缺失不回填。签名正文、query 和认证头不持久化。

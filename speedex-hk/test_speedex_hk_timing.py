@@ -6982,6 +6982,197 @@ class TestIdentifiedSendNoPoison(unittest.TestCase):
         self.assertIsNone(row["hkL1aMs"])
 
 
+class TestMergedSendNoPoison(unittest.TestCase):
+    """fix-send-veto（2026-09-22，批 1g7ms 实证形）：solana 扇出形态每轮产生多条
+    okx-solana-send 腿——首条响应晋升绑槽，其余正向同单归并（dup）；页中止的重复
+    扇出流永不获响应（dup 腿不起 poller，anchorRole 停留 send）。已归并 dup 腿的
+    广播身份由已绑槽 formal 腿承载（成功/receipt 同律归并），不再是未知广播——
+    不得再作 broadcast-anchor-unconfirmed 毒化源；未归并（非 dup）的身份未明
+    send 的毒化保护不动（juk09/7ngeq 边界）。"""
+
+    def setUp(self):
+        fresh()
+        self.clock = time.monotonic() * 1000 + 10
+        from unittest.mock import patch
+        for target, replacement in [("_mono_ms", lambda: self.clock), ("_poll_receipt", lambda *_: None)]:
+            p = patch.object(A, target, replacement); p.start(); self.addCleanup(p.stop)
+        p = patch.object(A.HEADS, "snapshot", lambda rid, t: {c: {
+            "version": 1, "chain": c, "epoch": rid, "height": 40, "anchorTs": t,
+            "observedTs": t - 1, "sampleAgeMs": 1} for c in A.CHAINS})
+        p.start(); self.addCleanup(p.stop)
+        self.run = "sol-fanout-window"
+        A.STORE.mark_open(self.run, manifest={"version": 1, "runId": self.run, "legs": [
+            {"platform": "okx", "chain": "solana", "rounds": 3}]})
+        self.clock += 100
+
+    @staticmethod
+    def _wire_body(seed):
+        import base64
+        return base64.b64encode(bytes([1]) + bytes([seed]) * 64 + bytes([seed]) * 32).decode()
+
+    def _sol_send(self, seed, host="hongkong.solana.blockrazor.io", respond=True):
+        body = self._wire_body(seed)
+        tx = A._sol_wire_first_sig(body)
+        f = FakeFlow(host, "/v2/sendTransaction", req_body=body, resp_body=tx)
+        f.request.headers = {"origin": "https://web3.okx.com"}
+        f.response.status_code = 200
+        A.addons[0].request(f)
+        if respond:
+            A.addons[0].response(f)
+        return f, tx
+
+    def _platform_order(self, tx, oid):
+        f = FakeFlow("web3.okx.com", "/priapi/v6/dx/trade/multi/broadcast",
+            req_body=json.dumps({"chainId": 501, "signedInfoList": [{"txHash": tx}], "orderId": oid}),
+            resp_body=json.dumps({"code": "0", "data": {"transactionHash": tx, "orderId": oid}}))
+        f.request.headers = {"origin": "https://web3.okx.com"}
+        f.response.status_code = 200
+        A.addons[0].request(f); A.addons[0].response(f)
+        return f
+
+    def _success(self, tx, oid):
+        A.addons[0].websocket_message(ws_frame("wsdexpri.okx.com", json.dumps(
+            {"arg": {"channel": "dex-across-order-info"},
+             "data": {"dexData": {"status": "1", "orderId": oid, "transactionHash": tx}}})))
+
+    def _sol_round(self, seed, oid):
+        """一轮 1g7ms 实证形：首条扇出响应晋升绑槽 → 第二条响应确认归并（dup）→
+        第三条页中止（响应永不到达，保持 anchorRole=send 的 dup）→ 平台单归并 →
+        成功帧 → receipt 落定。"""
+        f1, tx = self._sol_send(seed)
+        bound = f1.metadata["speedex_leg"][0]
+        self.assertEqual(bound["anchorRole"], "order", "首条扇出响应晋升")
+        self.clock += 200
+        f2, _ = self._sol_send(seed, host="tokyo.solana.blockrazor.io")
+        f3, _ = self._sol_send(seed, host="frankfurt.solana.blockrazor.io", respond=False)
+        aborted = f3.metadata["speedex_leg"][0]
+        self.assertEqual(f2.metadata["speedex_leg"][0]["anchorRole"], "order", "响应确认归并")
+        self.assertEqual(aborted["anchorRole"], "send", "页中止流永不获响应——不晋升")
+        self.assertTrue(aborted["dup"], "请求侧身份正向同单归并——身份已解决")
+        self._platform_order(tx, oid)
+        self.clock += 10
+        self._success(tx, oid)
+        self.clock += 100
+        A._settle_receipt(bound, {"rpc": "stub", "chain": "solana",
+            "pollIntervalMs": 800, "status": 1, "slot": 777})
+        return bound, tx
+
+    def test_merged_dup_sends_do_not_poison_later_rounds(self):
+        """1g7ms 回归：R1 合格 + R2/R3 不再被前轮已归并 dup send 毒化。"""
+        txs = []
+        for i in range(3):
+            _, tx = self._sol_round(0x11 + i, "sol-order-%d" % i)
+            txs.append(tx)
+            self.clock += 1000
+        A.STORE.mark_close(self.run)
+        tl = A.STORE.timeline(self.run, full=True)
+        formal = [x for x in tl["legs"] if x["anchorRole"] == "order" and not x["dup"]]
+        self.assertEqual(len(formal), 3)
+        for row in formal:
+            self.assertIsNone(row["incomplete"], "已归并 dup send 不毒化后续轮")
+            self.assertEqual(row["hkL1aMs"], 210)
+            self.assertEqual(row["hkL3Ms"], 310)
+        self.assertFalse(any(x["incomplete"] == "broadcast-anchor-unconfirmed"
+                             for x in tl["legs"]),
+                         "全批不再出现 broadcast-anchor-unconfirmed（含 dup 受害腿）")
+        aborted = [x for x in tl["legs"] if x["anchorRole"] == "send"]
+        self.assertEqual(len(aborted), 3)
+        for row in aborted:
+            self.assertTrue(row["dup"])
+            self.assertEqual(row["incomplete"], "broadcast-identity-unconfirmed",
+                             "页中止扇出流自身如实缺失（身份未确认）——但不作毒化源")
+        for row in tl["legs"]:
+            if row["dup"] and row["anchorRole"] == "order":
+                self.assertEqual(row["incomplete"], "duplicate-of-bound-leg")
+        self.assertEqual(tl["counts"]["attempted"], 3)
+        self.assertEqual(tl["counts"]["observed"], 3)
+
+    def test_unmerged_unresolved_send_still_poisons(self):
+        """负例（juk09/7ngeq 边界不动）：未归并、身份未明的更早同链 send
+        （无响应、无 receipt、无同单已绑槽腿可归并）仍毒化后续订单。"""
+        orphan_f, orphan_tx = self._sol_send(0x77, respond=False)
+        orphan = orphan_f.metadata["speedex_leg"][0]
+        self.assertEqual(orphan["anchorRole"], "send")
+        self.assertFalse(orphan["dup"], "无同单已绑槽腿——不归并，身份未解决")
+        self.clock += 1000
+        self._sol_round(0x22, "sol-order-x")
+        A.STORE.mark_close(self.run)
+        tl = A.STORE.timeline(self.run, full=True)
+        row = next(x for x in tl["legs"] if x["anchorRole"] == "order" and not x["dup"])
+        self.assertEqual(row["incomplete"], "broadcast-anchor-unconfirmed")
+        self.assertIsNone(row["hkL1aMs"])
+        self.assertIsNone(row["hkL3Ms"])
+        orow = next(x for x in tl["legs"] if x["txHash"] == orphan_tx)
+        self.assertEqual(orow["incomplete"], "broadcast-identity-unconfirmed")
+
+    def test_evm_merged_send_does_not_poison_either(self):
+        """EVM 同律：已确认扇出 + 页中止 dup send 的轮次不毒化下一轮平台单。"""
+        run2 = "evm-fanout-window"
+        A.STORE.mark_open(run2, manifest={"version": 1, "runId": run2, "legs": [
+            {"platform": "okx", "chain": "bsc", "rounds": 2}]})
+        self.clock += 100
+
+        def platform(tx, oid):
+            f = FakeFlow("web3.okx.com", "/priapi/v6/dx/trade/multi/broadcast",
+                req_body=json.dumps({"chainId": 56, "signedInfoList": [{"txHash": tx}], "orderId": oid}),
+                resp_body=json.dumps({"code": "0", "data": {"transactionHash": tx, "orderId": oid}}))
+            f.request.headers = {"origin": "https://web3.okx.com"}
+            f.response.status_code = 200
+            A.addons[0].request(f); A.addons[0].response(f)
+            return f.metadata["speedex_leg"][0]
+
+        def raw(body, host, rid, respond=True):
+            tx = A._evm_raw_tx_hash(body)
+            f = FakeFlow(host, "/", req_body=json.dumps({"jsonrpc": "2.0", "id": rid,
+                "method": "eth_sendRawTransaction", "params": [body]}),
+                resp_body=json.dumps({"jsonrpc": "2.0", "id": rid, "result": tx}))
+            f.request.headers = {"origin": "https://web3.okx.com"}
+            f.response.status_code = 200
+            A.addons[0].request(f)
+            if respond:
+                A.addons[0].response(f)
+            return f.metadata["speedex_leg"][0], tx
+
+        def success(tx, oid):
+            A.addons[0].websocket_message(ws_frame("wsdexpri.okx.com", json.dumps(
+                {"arg": {"channel": "dex-swap-order-info"},
+                 "data": {"dexData": {"status": "1", "orderId": oid, "transactionHash": tx}}})))
+
+        def settle(leg):
+            A._settle_receipt(leg, {"rpc": "stub", "chain": "bsc", "pollIntervalMs": 800,
+                "status": 1, "blockHash": "0x" + "ab" * 32, "blockNumber": "0x67"})
+
+        # R1：平台单先绑槽；扇出第一条响应确认归并，第二条页中止（无响应、保持 send）
+        body1 = "0x" + "12" * 100
+        tx1 = A._evm_raw_tx_hash(body1)
+        leg1 = platform(tx1, "evm-o1")
+        raw(body1, "okx.bscnetwork.blockrazor.io", 1)
+        aborted, _ = raw(body1, "okx.bsc.blockrazor.xyz", 2, respond=False)
+        self.assertEqual(aborted["anchorRole"], "send")
+        self.assertTrue(aborted["dup"])
+        self.clock += 10
+        success(tx1, "evm-o1")
+        settle(leg1)
+        # R2：下一轮平台单不被 R1 的已归并 dup send 毒化
+        self.clock += 1000
+        body2 = "0x" + "34" * 100
+        tx2 = A._evm_raw_tx_hash(body2)
+        leg2 = platform(tx2, "evm-o2")
+        self.clock += 10
+        success(tx2, "evm-o2")
+        settle(leg2)
+        A.STORE.mark_close(run2)
+        tl = A.STORE.timeline(run2, full=True)
+        row2 = next(x for x in tl["legs"] if x["txHash"] == tx2 and not x["dup"])
+        self.assertIsNone(row2["incomplete"])
+        self.assertEqual(row2["hkL1aMs"], 10)
+        arow = next(x for x in tl["legs"] if x["anchorRole"] == "send")
+        self.assertTrue(arow["dup"])
+        self.assertEqual(arow["incomplete"], "broadcast-identity-unconfirmed")
+        self.assertFalse(any(x["incomplete"] == "broadcast-anchor-unconfirmed"
+                             for x in tl["legs"]))
+
+
 class TestStrictProductStatus(unittest.TestCase):
     def test_exact_channel_and_status_without_envelope_splicing(self):
         h = "0x" + "ab" * 32
