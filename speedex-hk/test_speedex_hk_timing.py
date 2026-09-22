@@ -7098,5 +7098,50 @@ class TestChainChannelArrivals(unittest.TestCase):
         self.assertEqual(sol_rows[0]["channelArrivals"], [{"channel": "fullnode", "api": "signatureNotification", "ms": 450}])
 
 
+class TestMarketTap(unittest.TestCase):
+    """market-tap 支线：行情 WS 帧的 channel/首见地址记录，独立于开窗管线。"""
+
+    def setUp(self):
+        fresh()
+        A.MARKET_TAP.reset(False)
+
+    def test_records_channel_and_first_seen_addr(self):
+        addr = "0x" + "ab" * 20
+        A.MARKET_TAP.reset(True)
+        t0 = A._mono_ms()
+        flow = FakeFlow("ws.gmgn.ai", "/v2/ws", "GET")
+        A._market_tap_note(flow, json.dumps({"channel": "public_broadcast", "data": [{"token": addr}]}), t0)
+        A._market_tap_note(flow, json.dumps({"channel": "public_broadcast", "data": [{"token": addr}]}), t0 + 5)
+        self.assertEqual(A.MARKET_TAP.snapshot()["frames"], 2)
+        self.assertEqual(len(A.MARKET_TAP.snapshot()["addrFirst"]), 1)  # 同地址只记首见
+
+    def test_host_filter_and_binary_skip(self):
+        A.MARKET_TAP.reset(True)
+        t0 = A._mono_ms()
+        A._market_tap_note(FakeFlow("example.com", "/", "GET"), '{"channel":"x"}', t0)
+        A._market_tap_note(FakeFlow("ws.gmgn.ai.evil.example", "/", "GET"), '{"channel":"x"}', t0)
+        self.assertEqual(A.MARKET_TAP.snapshot()["frames"], 0)  # 点边界——后缀相似主机不匹配
+        # 二进制帧 utf8 归一：可解码则计入体量（无 channel/地址），不可解码只计体量
+        A._market_tap_note(FakeFlow("wsdexpri.okx.com", "/ws/v5/ipublic", "GET"), b"\x00\x01", t0)
+        s = A.MARKET_TAP.snapshot()
+        self.assertEqual(s["frames"], 1)
+        self.assertEqual(list(s["channels"].keys()), ["wsdexpri.okx.com|-"])
+        self.assertEqual(s["addrFirst"], {})
+        self.assertEqual(A.MARKET_TAP.snapshot()["addrFirst"], {})
+
+    def test_okx_nested_channel(self):
+        addr = "0x" + "cd" * 20
+        A.MARKET_TAP.reset(True)
+        t0 = A._mono_ms()
+        A._market_tap_note(
+            FakeFlow("wsdexpri.okx.com", "/ws/v5/ipublic", "GET"),
+            json.dumps({"arg": {"channel": "dex-market-new-token-logo-update"}, "data": [{"a": addr}]}),
+            t0,
+        )
+        s = A.MARKET_TAP.snapshot()
+        self.assertIn("wsdexpri.okx.com|dex-market-new-token-logo-update", s["channels"])
+        self.assertIn("wsdexpri.okx.com|" + addr, s["addrFirst"])
+
+
 if __name__ == "__main__":
     unittest.main()

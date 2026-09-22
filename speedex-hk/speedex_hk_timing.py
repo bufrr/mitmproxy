@@ -215,7 +215,7 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # 槽位必须衔接已接受头、同高异父=分叉；不连续即清空重锚，与 EVM hash/parentHash
 # 冲突清空同律；样本保留 parent 字段）。修订经过见 git 历史；行为由
 # deploy/hk-proxy/test_speedex_hk_timing.py 与 tests/hk-timing*.test.mjs 钉住。
-ADDON_VERSION = "2026.09.19-chain-arrivals-egress-warm-v10.1"
+ADDON_VERSION = "2026.09.22-chain-arrivals-egress-warm-v10.1-mkt-tap1"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -3550,6 +3550,97 @@ def _classify_ws(host):
     return None
 
 
+# ── market tap（行情观测支线，与订单锚管线完全分离；2026-09-22 v10.1-mkt-tap1）──
+# 只观测行情 WS host 的 server→client 文本帧：channel、帧长、首见 0x 地址（有界 FIFO）。
+# 不存完整 payload/query/auth header；t 为 websocket_message 入口 mono（observer time，
+# 同进程同钟，跨 host 直接可比）。不依赖开窗（mark），由控制面显式开关，默认关闭。
+_MARKET_TAP_HOSTS = ("ws.gmgn.ai", "wsdexpri.okx.com")
+_MARKET_ADDR_RE = re.compile(r"0x[0-9a-fA-F]{40}")
+_MARKET_CH_RE = re.compile(r'"channel"\s*:\s*"([^"]{1,80})"')
+_MARKET_TAP_MAX_ADDR = 60000
+
+
+class _MarketTap:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.enabled = False
+        self.since = None
+        self.frames = 0
+        self.bytes = 0
+        self.channels = {}
+        self.addr_first = {}
+        self._order = deque()
+
+    def reset(self, enabled):
+        with self.lock:
+            self.enabled = enabled
+            self.frames = 0
+            self.bytes = 0
+            self.channels = {}
+            self.addr_first = {}
+            self._order.clear()
+            self.since = _wall_iso()
+
+    def set_enabled(self, enabled):
+        with self.lock:
+            self.enabled = enabled
+
+    def note(self, host, content, t_obs):
+        # mitmproxy WS 消息 content 是 bytes——utf8 归一后抽取；无法解码则只计体量
+        n = len(content) if isinstance(content, (str, bytes, bytearray)) else 0
+        if isinstance(content, (bytes, bytearray)):
+            try:
+                content = bytes(content).decode("utf-8", "ignore")
+            except Exception:
+                content = None
+        head = content[:20000] if isinstance(content, str) else None
+        ch = None
+        if head:
+            m = _MARKET_CH_RE.search(head[:4000])
+            ch = m.group(1) if m else None
+        with self.lock:
+            self.frames += 1
+            self.bytes += n
+            ck = f"{host}|{ch or '-'}"
+            c = self.channels.get(ck)
+            if c is None:
+                self.channels[ck] = {"frames": 1, "bytes": n, "firstT": t_obs, "lastT": t_obs}
+            else:
+                c["frames"] += 1
+                c["bytes"] += n
+                c["lastT"] = t_obs
+            if not head:
+                return
+            for a in set(_MARKET_ADDR_RE.findall(head)):
+                key = f"{host}|{a.lower()}"
+                if key in self.addr_first:
+                    continue
+                while len(self._order) >= _MARKET_TAP_MAX_ADDR:
+                    self.addr_first.pop(self._order.popleft(), None)
+                self._order.append(key)
+                self.addr_first[key] = {"t": t_obs, "tw": _wall_iso(), "ch": ch}
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                "enabled": self.enabled,
+                "since": self.since,
+                "frames": self.frames,
+                "bytes": self.bytes,
+                "channels": self.channels,
+                "addrFirst": self.addr_first,
+            }
+
+
+MARKET_TAP = _MarketTap()
+
+
+def _market_tap_note(flow, content, t_obs):
+    host = flow.request.pretty_host
+    if any(host == h or host.endswith("." + h) for h in _MARKET_TAP_HOSTS):
+        MARKET_TAP.note(host, content, t_obs)
+
+
 _EGRESS_REFRESH_EPOCH = 0
 
 
@@ -3739,6 +3830,12 @@ class SpeedexHkTiming:
             msg = msgs[-1]
         except Exception:
             return
+        if not msg.from_client and MARKET_TAP.enabled:
+            # 行情支线：入口 mono 时刻即打戳，独立于订单开窗管线
+            try:
+                _market_tap_note(flow, msg.content, t_obs)
+            except Exception:
+                pass
         try:
             self._handle_ws_message(flow, msg, t_obs)
         finally:
@@ -4111,6 +4208,13 @@ class _Ctrl(BaseHTTPRequestHandler):
                     HEADS.close()
             _publish_known_runs()  # 同律
             return self._send(200, {"ok": True})
+        if self.path == "/market-tap":
+            b = self._body()
+            if bool(b.get("enabled")):
+                MARKET_TAP.reset(True)  # 开启即清零——窗口边界明确
+            else:
+                MARKET_TAP.set_enabled(False)  # 停止后数据仍可 GET
+            return self._send(200, {"ok": True, "enabled": MARKET_TAP.enabled, "since": MARKET_TAP.since})
         self._send(404, {"error": "not found"})
 
     def do_GET(self):
@@ -4161,6 +4265,8 @@ class _Ctrl(BaseHTTPRequestHandler):
                 body["error"] = "control/collection split: 热重载后旧控制面仍在服务"
                 return self._send(503, body)
             return self._send(200, body)
+        if self.path == "/market-tap":
+            return self._send(200, {"ok": True, "marketTap": MARKET_TAP.snapshot()})
         if self.path == "/egress":
             return self._send(200, {"ok": True, "egress": get_egress()})
         if self.path == "/latency":
