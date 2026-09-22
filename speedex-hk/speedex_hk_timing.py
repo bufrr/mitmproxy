@@ -215,7 +215,7 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # 槽位必须衔接已接受头、同高异父=分叉；不连续即清空重锚，与 EVM hash/parentHash
 # 冲突清空同律；样本保留 parent 字段）。修订经过见 git 历史；行为由
 # deploy/hk-proxy/test_speedex_hk_timing.py 与 tests/hk-timing*.test.mjs 钉住。
-ADDON_VERSION = "2026.09.22-chain-arrivals-egress-warm-v10.1-mkt-tap2-okxac"
+ADDON_VERSION = "2026.09.22-chain-arrivals-egress-warm-v10.1-mkt-tap2-okxac-fix-send-veto"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -3100,8 +3100,18 @@ class Store:
             # hkL3MsVetoed 诊断键；腿带 anchorVeto:true 不再以 bound/eligible 呈现
             # （消费者按 anchorVeto 排除）。内部腿的原始事件时间戳保留不动——证据不删。
             vetoed = bool(x.get("_anchorVeto"))
+            # 毒化源 = 身份未解决的更早同链 send（juk09/7ngeq 边界：它可能就是后续
+            # 订单的真实广播，锚起点不可信——不放宽）。dup（已归并）腿不是毒化源：
+            # 其广播身份已被正向同单匹配归并到已绑槽 formal 腿（成功/receipt/poller
+            # 闩锁同律归 formal），身份数学上已解决，不再是未知广播——solana 扇出
+            # 形态下页中止的重复扇出流永不获响应（dup 腿不起 poller、保持
+            # anchorRole=send），若仍计毒化源，R1 的已归并 send 会毒化全部后续轮
+            # （2026-09-22 批 1g7ms 实证：R2-R8 broadcast-anchor-unconfirmed 全灭）。
+            # 归并证明被推翻（身份冲突/formal 否决 → _reopen_dup_locked）的腿恢复
+            # 非 dup，重新参与毒化。
             unresolved_send = x.get("platform") == "okx" and x.get("anchorRole") == "order" and any(
                 prior.get("platform") == "okx" and prior.get("anchorRole") == "send"
+                and not prior.get("dup")
                 and prior.get("chain") == x.get("chain")
                 and prior.get("tOrderOutMs", float("inf")) < t0
                 for prior in legs
