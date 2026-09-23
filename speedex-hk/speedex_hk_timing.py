@@ -215,7 +215,7 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # 槽位必须衔接已接受头、同高异父=分叉；不连续即清空重锚，与 EVM hash/parentHash
 # 冲突清空同律；样本保留 parent 字段）。修订经过见 git 历史；行为由
 # deploy/hk-proxy/test_speedex_hk_timing.py 与 tests/hk-timing*.test.mjs 钉住。
-ADDON_VERSION = "2026.09.22-chain-arrivals-egress-warm-v10.1-mkt-tap2-okxac-fix-send-veto"
+ADDON_VERSION = "2026.09.23-chain-arrivals-egress-warm-v10.1-pending-receipt-dedup"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -2025,7 +2025,7 @@ class Store:
     降级 diagnostic：路由/晋升/成功/receipt 轮询关闭，incomplete=anchor-conflict，
     observed 不增加）；同单去重带 platform 维度（同 orderId 跨平台不合并）；
     响应揭示身份且存在更早同身份 order 腿时 formal 资格归最早请求
-    （_transfer_formal_locked，仅响应路径）；dup 腿身份与 formal 冲突（或 formal
+    （_transfer_formal_locked，响应/receipt 补链路径）；dup 腿身份与 formal 冲突（或 formal
     被否决）→ 重开为独立候选（_reopen_dup_locked，计 diag.orderDupReopened）。
     否决腿的合格指标在 timeline 序列化层统一撤销
     （hkL1aMs/hkL3Ms → null，撤销值入 *Vetoed 诊断键 + anchorVeto:true——内部原始
@@ -2280,7 +2280,7 @@ class Store:
         证据落地）三处调用。
         已判 dup 的腿收到冲突身份（与 formal 共同身份键两侧都有值
         且不等）= 同单证明被推翻 → 重开为独立候选（_reopen_dup_locked），不永远
-        扣在 dup 上吞掉后续帧；allow_transfer（仅响应路径）且本腿是
+        扣在 dup 上吞掉后续帧；allow_transfer（响应/receipt 补链路径）且本腿是
         更早的 order 腿时 formal 资格归最早请求（_transfer_formal_locked）——后请求
         先响应不独占 formal（成功起点按最早请求）。"""
         if leg.get("_anchorVeto"):
@@ -2294,17 +2294,21 @@ class Store:
             ):
                 self._reopen_dup_locked(leg)
                 return False
-            return True
+            # A pending request can already be an alias when its own receipt
+            # finally proves the chain. Reconsider ownership only with that
+            # independent chain proof; never borrow the formal leg's chain.
+            if not allow_transfer or not leg.get("chain"):
+                return True
         source = (leg.get("_anchor") or {}) if leg.get("platform") == "okx" else leg
         keys = _IDENTITY_KEYS if leg.get("platform") == "okx" else ("orderId", "clientOrderId")
         ident = {k: source.get(k) for k in keys if source.get(k) is not None}
         if not ident:
-            return False  # 身份缺失——不猜
+            return bool(leg.get("dup"))  # 身份缺失——不猜、不重开既有 alias
         formal = self._same_order_bound_leg_locked(
             leg.get("runId"), ident, leg, platform=leg.get("platform"), chain=leg.get("chain")
         )
         if formal is None:
-            return False
+            return bool(leg.get("dup"))
         if (
             allow_transfer
             and leg.get("anchorRole") == "order"
@@ -2317,6 +2321,8 @@ class Store:
             # 请求无身份、身份由响应揭示时，后请求可能先响应先成 formal；
             # 最早请求的身份揭示后 formal 资格归最早请求（成功时刻按最早请求）
             self._transfer_formal_locked(leg, formal)
+            return True
+        if leg.get("dup"):
             return True
         if leg.get("unbound"):
             # 建腿时容量耗尽/链未知可能已先标 unbound——正向同单证据到达后改判 dup，
@@ -2334,7 +2340,14 @@ class Store:
     def _dup_identity_conflict_locked(self, leg, formal):
         """（须持锁）dup 腿与其 formal 的同单证明是否被后续身份证据
         推翻——共同身份键（orderId/clientOrderId/txHash）两侧都有值且不等 = 冲突
-        （一侧缺失不算——缺失不是反证）。"""
+        （一侧缺失不算——缺失不是反证）；OKX 已知链冲突同样拒绝归并。"""
+        if (
+            leg.get("platform") == "okx"
+            and leg.get("chain")
+            and formal.get("chain")
+            and leg["chain"] != formal["chain"]
+        ):
+            return True
         la, fa = leg.get("_anchor") or {}, formal.get("_anchor") or {}
         for k in _IDENTITY_KEYS:
             if (
@@ -2386,8 +2399,12 @@ class Store:
         起点按最早请求（hkL1aMs = tSuccessPushMs − 最早 tOrderOutMs，与 docs/binance.md
         §90「平台重发含在 L1a′ 内」同口径）。formal 在飞的 receipt poller 经
         _settle_receipt 的 dup→formal 重定向落到新 formal（闩锁随之移交，不起第二
-        poller）。只在响应路径调用——preview/sign 晋升路径不做（fomo 同 relaySwapId
+        poller）。响应/receipt 补链路径调用——preview/sign 晋升路径不做（fomo 同 relaySwapId
         取最晚 preview 是既定口径，见 route_ws_frame）。"""
+        if leg.get("dup"):
+            leg["dup"] = False
+            leg["_dupOf"] = None
+            self.diag["orderReqDuplicate"] = max(0, self.diag["orderReqDuplicate"] - 1)
         if leg.get("slot") is None:
             leg["slot"] = formal.get("slot")
             if leg.get("unbound"):
@@ -2420,6 +2437,14 @@ class Store:
                 leg[k] = formal[k]
             if k != "txHash":
                 formal[k] = None
+        # Chain-channel diagnostics share the same request anchor. An alias was
+        # excluded from collection, so retain each channel's first observation
+        # when that earlier request becomes formal after receipt backfill.
+        for channel, arrival in formal.pop("_channelArrivals", {}).items():
+            arrivals = leg.setdefault("_channelArrivals", {})
+            first = arrivals.get(channel)
+            if first is None or arrival["tMs"] < first["tMs"]:
+                arrivals[channel] = arrival
         if formal.get("receiptPolling"):
             # 闩锁移交（不是复制）——在飞 poller 回写经 _settle_receipt/_settle_incomplete
             # 的 dup→formal 重定向落本腿；旧 formal 闩锁必须释放，否则其永挂
@@ -2485,21 +2510,29 @@ class Store:
             if not self._dedup_order_identity_locked(leg, allow_transfer=True):
                 self._promote_leg_locked(leg)
 
-    def _receipt_backfill_rebind_locked(self, leg):
-        """（须持锁，_settle_receipt 写入 receipt 后调用）receipt 实证链
+    def _receipt_backfill_rebind_locked(self, leg, receipt):
+        """（须持锁，_settle_receipt 写入 receipt 前调用）receipt 实证链
         （receipt 门已过——transactionHash≡腿 hash + status=1 + 块身份齐全的轮询胜出
         候选）回填 leg.chain——不猜链时的唯一合法来源；pendingBind 腿随即按 manifest
         槽补绑（DONE·receipt 两种事件顺序同计数同腿身份）。容量/槽位不匹配 →
         unbound 落定；链仍未实证 → 保持 pendingBind 至关窗。不取消既有关联/新鲜度门。"""
-        rchain = (leg.get("receipt") or {}).get("chain")
+        rchain = receipt.get("chain")
         if rchain and leg.get("chain") is None and CHAINS.get(rchain):
             leg["chain"] = rchain
+        if leg.get("dup"):
+            self._dedup_order_identity_locked(leg, allow_transfer=True)
         if not leg.get("pendingBind"):
             return
         chain = leg.get("chain")
         if not chain:
             return  # 链仍未实证——继续等（关窗 freeze 时 unbound 落定）
         leg["pendingBind"] = False
+        if leg.get("slot") is not None:
+            return  # A reopened alias may already have reclaimed its own slot.
+        # Receipt backfill is another binding path: use the same exact-order
+        # identity gate before consuming capacity, and retain the earliest anchor.
+        if self._dedup_order_identity_locked(leg, allow_transfer=True):
+            return
         b = self._bind_slot_locked(leg["runId"], leg["platform"], chain)
         if b is not None:
             leg["slot"] = b  # 槽位绑定不写 round（授权轮号不由到达序推导）
@@ -2973,17 +3006,40 @@ class Store:
     def claim_receipt_poll(self, leg):
         """receipt poller 原子闩锁（HTTP/WS 入口共用）——每腿至多一个 poller，
         轮询腿锁定的 hash；已 settle/已轮询/已冻结 → None。
-        被否决腿不起 poller（observed 不增加）。"""
+        被否决腿不起 poller（observed 不增加）。未知链的更早 OKX order alias
+        仍须独立核验自己的精确 tx，才能接回最早请求锚；其余 dup 不起 poller。"""
         with self.lock:
             if (
                 leg.get("windowClosed")
                 or leg.get("_anchorVeto")
                 or leg.get("tReceiptMs") is not None
-                or leg.get("dup")
                 or leg.get("receiptPolling")
             ):
                 return None
             h = leg.get("txHash")
+            if leg.get("dup"):
+                formal = leg.get("_dupOf") or {}
+                anchor_h = (leg.get("_anchor") or {}).get("txHash")
+                formal_h = (formal.get("_anchor") or {}).get("txHash")
+                if not (
+                    leg.get("platform") == "okx"
+                    and leg.get("anchorRole") == "order"
+                    and leg.get("chain") is None
+                    and formal.get("runId") == leg.get("runId")
+                    and formal.get("platform") == "okx"
+                    and formal.get("slot") is not None
+                    and not formal.get("dup")
+                    and not formal.get("windowClosed")
+                    and not formal.get("_anchorVeto")
+                    and h and anchor_h and formal_h
+                    and _ident_norm("txHash", h) == _ident_norm("txHash", anchor_h)
+                    and _ident_norm("txHash", anchor_h) == _ident_norm("txHash", formal_h)
+                    and not self._dup_identity_conflict_locked(leg, formal)
+                    and isinstance(leg.get("tOrderOutMs"), (int, float))
+                    and isinstance(formal.get("tOrderOutMs"), (int, float))
+                    and leg["tOrderOutMs"] < formal["tOrderOutMs"]
+                ):
+                    return None
             if not h or not _receipt_candidates(leg.get("chain"), h):
                 return None
             leg["receiptPolling"] = True
@@ -3481,6 +3537,13 @@ def _poll_receipt(run_id, leg_ref, chain, tx_hash, jsonrpc=None):
 def _settle_receipt(leg_ref, receipt):
     promote = None
     with STORE.lock:
+        if leg_ref.get("windowClosed") or leg_ref.get("_anchorVeto"):
+            leg_ref["receiptPolling"] = False
+            return
+        # Chain proof belongs to the poller's original request. Resolve pending
+        # binding/ownership before writing first receipt, including an earlier
+        # request that became an alias while waiting for its own chain proof.
+        STORE._receipt_backfill_rebind_locked(leg_ref, receipt)
         # formal 资格转移后，旧 formal 在飞 poller 的回写经
         # dup→formal 链重定向到新 formal——receipt 同成功一样永不留在 dup 腿
         leg = leg_ref
@@ -3506,9 +3569,6 @@ def _settle_receipt(leg_ref, receipt):
             return  # 首次成功时刻只写一次
         leg["tReceiptMs"] = _mono_ms()
         leg["receipt"] = receipt
-        # receipt 实证链回填 leg.chain，并给等实证链的 pendingBind 腿
-        # 按 manifest 槽补绑（DONE·receipt 两种事件顺序同计数同腿身份；不猜链）
-        STORE._receipt_backfill_rebind_locked(leg)
         if leg.get("anchorRole") == "send":
             promote = leg
     # v9（2026-09-19）：响应缺失的广播流（OKX 页扇出中止——tFirstRespMs 恒 null
@@ -3522,6 +3582,15 @@ def _settle_receipt(leg_ref, receipt):
 
 def _settle_incomplete(leg_ref, why):
     with STORE.lock:
+        if leg_ref.get("dup") and leg_ref.get("chain") is None:
+            # The earlier alias was polling to establish its own chain. A failed
+            # probe cannot establish that chain, so it cannot fail the formal
+            # request either. Keep its diagnostic and one-poller latch locally.
+            if leg_ref.get("windowClosed"):
+                leg_ref["receiptPolling"] = False
+            elif leg_ref.get("tReceiptMs") is None and not leg_ref.get("incomplete"):
+                leg_ref["incomplete"] = why
+            return
         # 与 _settle_receipt 同律——dup 腿/旧 formal 的在飞 poller
         # 失败回写经 dup→formal 链重定向（receipt 路径归落定腿）。闩锁纪律：
         # 落定腿闩锁保持（「每腿至多一个 poller」——incomplete 落定后不起
