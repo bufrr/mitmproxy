@@ -7355,5 +7355,380 @@ class TestMarketTap(unittest.TestCase):
         self.assertIn("wsdexpri.okx.com|dex-market-new-token-logo-update|" + addr, s["addrFirst"])
 
 
+class TestPendingReceiptDedup(unittest.TestCase):
+    """4ez2h: Solana platform POST and raw send share one exact transaction.
+    Solana chainId=501 is not a chain anchor here; only its receipt may backfill it.
+    Requests, responses and WS success use production hooks; no RPC is performed.
+    """
+
+    raw = TestExactBroadcastAnchors.raw
+    platform = TestExactBroadcastAnchors.platform
+    success = TestExactBroadcastAnchors.success
+    EVM_BODY = TestExactBroadcastAnchors.EVM_BODY
+    _wire_body = staticmethod(TestMergedSendNoPoison._wire_body)
+
+    def setUp(self):
+        self.real_poll_receipt = A._poll_receipt
+        TestExactBroadcastAnchors.setUp(self)
+        self.polls = []
+        self.workers = []
+        owner = self
+        from unittest.mock import patch
+
+        class DeferredPollThread:
+            def __init__(self, target, args=(), daemon=None):
+                self.target, self.args = target, args
+
+            def start(self):
+                owner.polls.append(self.args)
+                owner.workers.append((self.target, self.args))
+
+        # Capture production response -> claim -> real worker target/arguments.
+        # Selected tests execute that target with the RPC stub captured at spawn;
+        # the permutation tests assert scheduling before injecting timed callbacks.
+        p = patch.object(A, "_poll_receipt", self.real_poll_receipt)
+        p.start(); self.addCleanup(p.stop)
+        p = patch.object(A.threading, "Thread", DeferredPollThread)
+        p.start(); self.addCleanup(p.stop)
+
+    def pair(self, reverse_ack=False, seed=0x31, oid="order-one"):
+        body = self._wire_body(seed)
+        tx = A._sol_wire_first_sig(body)
+        early = self.platform("solana", tx, oid)
+        A.addons[0].request(early)
+        early_leg = early.metadata["speedex_leg"][0]
+        self.assertTrue(early_leg["pendingBind"])
+        self.clock += 7
+        late = self.raw("solana", tx, body=body)
+        A.addons[0].request(late)
+        late_leg = late.metadata["speedex_leg"][0]
+        for flow in ([late, early] if reverse_ack else [early, late]):
+            self.clock += 10
+            A.addons[0].response(flow)
+        return early_leg, late_leg, tx
+
+    def receipt(self, leg, slot=777):
+        self.clock += 100
+        A._settle_receipt(leg, {"rpc": "synthetic", "chain": "solana",
+            "pollIntervalMs": 800, "status": 1, "slot": slot})
+        return self.clock
+
+    def check_pair(self, reverse_ack, reverse_receipt):
+        early, late, tx = self.pair(reverse_ack)
+        self.assertEqual(len(self.polls), 2)
+        for leg in (early, late):
+            polls = [args for args in self.polls if args[1] is leg]
+            self.assertEqual(len(polls), 1, "each callback must have a real production poll claim")
+            self.assertEqual(polls[0][0], self.run)
+            self.assertEqual(polls[0][3], tx)
+            self.assertEqual(polls[0][2], leg["chain"])
+            self.assertIsNone(A.STORE.claim_receipt_poll(leg), "never start a second worker")
+        self.assertIsNone(early["chain"], "no chain borrowed from another request")
+        self.clock += 10
+        A.addons[0].websocket_message(self.success(tx))
+        success_t = self.clock
+        self.assertEqual(late["tSuccessPushMs"], success_t)
+        self.clock += 10
+        channel_t = self.clock
+        A.STORE.note_channel_arrival("solana", tx, "nodeone", "signatureNotification", channel_t)
+        receipt_legs = [late, early] if reverse_receipt else [early, late]
+        receipt_t = self.receipt(receipt_legs[0])
+        self.receipt(receipt_legs[1], slot=778)
+        self.clock += 50
+        A.addons[0].websocket_message(self.success(tx))
+        A.STORE.note_channel_arrival("solana", tx, "nodeone", "signatureNotification", self.clock)
+        self.assertFalse(early["dup"])
+        self.assertTrue(late["dup"])
+        self.assertIs(late["_dupOf"], early)
+        self.assertEqual(early["chain"], "solana")
+        self.assertFalse(early["pendingBind"])
+        self.assertEqual(early["tSuccessPushMs"], success_t)
+        self.assertEqual(early["tReceiptMs"], receipt_t)
+        self.assertEqual(early["receipt"]["slot"], 777, "first receipt frozen")
+        self.assertEqual(early["_channelArrivals"]["nodeone"]["tMs"], channel_t)
+        self.assertFalse(late.get("_channelArrivals"))
+        self.assertIsNone(late["tReceiptMs"], "receipt never stays on a dup")
+        self.assertIsNone(late["tSuccessPushMs"], "success never stays on a dup")
+        self.assertIsNone(late["slot"])
+        self.assertFalse(late["receiptPolling"])
+        self.assertEqual(A.STORE.diag["orderReqDuplicate"], 1)
+        tl = A.STORE.timeline(self.run, full=True)
+        self.assertEqual(tl["counts"]["attempted"], 1)
+        self.assertEqual(tl["counts"]["observed"], 1)
+        self.assertEqual(tl["counts"]["unbound"], 0)
+        row = next(x for x in tl["legs"] if x["orderRequestSource"] == "platform-order")
+        self.assertEqual(row["hkL1aMs"], round(success_t - early["tOrderOutMs"], 1))
+        self.assertEqual(row["hkL3Ms"], round(receipt_t - early["tOrderOutMs"], 1))
+        self.assertEqual(row["channelArrivals"], [{"channel": "nodeone", "api": "signatureNotification",
+            "ms": round(channel_t - early["tOrderOutMs"], 1)}])
+        self.assertEqual(early["_headSnapshots"]["solana"]["anchorTs"], early["tOrderOutMs"])
+        A.STORE.mark_close(self.run)
+        with A.STORE.lock:
+            self.assertFalse(A.STORE._run_pinned_locked(self.run))
+
+    def test_platform_ack_and_receipt_first(self):
+        self.check_pair(False, False)
+
+    def test_platform_ack_first_raw_receipt_first(self):
+        self.check_pair(False, True)
+
+    def test_raw_ack_first_platform_receipt_first(self):
+        self.check_pair(True, False)
+
+    def test_raw_ack_and_receipt_first(self):
+        self.check_pair(True, True)
+
+    def test_same_order_dedup_precedes_full_slot_capacity(self):
+        A.STORE.mark_open(self.run, manifest={"version": 1, "runId": self.run,
+            "legs": [{"platform": "okx", "chain": "solana", "rounds": 1}]})
+        early, late, _ = self.pair()
+        self.receipt(early)
+        self.receipt(late)
+        self.assertEqual(early["slot"], 0)
+        self.assertIsNone(late["slot"])
+        self.assertEqual(A.STORE.timeline(self.run)["counts"],
+            {"requested": 1, "attempted": 1, "observed": 1, "unbound": 0})
+
+    def test_known_chain_dup_and_later_unknown_chain_dup_do_not_poll(self):
+        body = self._wire_body(0x31)
+        tx = A._sol_wire_first_sig(body)
+        first = self.raw("solana", tx, body=body)
+        A.addons[0].request(first); A.addons[0].response(first)
+        self.clock += 10
+        duplicate = self.raw("solana", tx, body=body)
+        A.addons[0].request(duplicate); A.addons[0].response(duplicate)
+        self.clock += 10
+        later_unknown = self.platform("solana", tx)
+        A.addons[0].request(later_unknown); A.addons[0].response(later_unknown)
+        self.assertEqual(len(self.polls), 1)
+        self.assertTrue(duplicate.metadata["speedex_leg"][0]["dup"])
+        self.assertTrue(later_unknown.metadata["speedex_leg"][0]["dup"])
+        self.assertFalse(later_unknown.metadata["speedex_leg"][0]["receiptPolling"])
+
+    def test_closed_window_response_does_not_schedule_alias_poll(self):
+        body = self._wire_body(0x31)
+        tx = A._sol_wire_first_sig(body)
+        early = self.platform("solana", tx)
+        A.addons[0].request(early)
+        self.clock += 7
+        late = self.raw("solana", tx, body=body)
+        A.addons[0].request(late); A.addons[0].response(late)
+        A.STORE.mark_close(self.run)
+        A.addons[0].response(early)
+        self.assertEqual(len(self.polls), 1)
+        self.assertFalse(early.metadata["speedex_leg"][0]["receiptPolling"])
+
+    def test_alias_poll_requires_independent_equal_hash_and_same_run(self):
+        early, late, _ = self.pair(reverse_ack=True)
+        self.assertEqual(len(self.polls), 2)
+        early["receiptPolling"] = False
+        # Independent boundary checks, before a callback can qualify the alias.
+        original = early["_anchor"]["txHash"]
+        early["_anchor"]["txHash"] = None
+        self.assertIsNone(A.STORE.claim_receipt_poll(early))
+        early["_anchor"]["txHash"] = "4" * 88
+        self.assertIsNone(A.STORE.claim_receipt_poll(early))
+        early["_anchor"]["txHash"] = original
+        late["runId"] = "other-window"
+        self.assertIsNone(A.STORE.claim_receipt_poll(early))
+
+    def check_alias_poll_failure(self, formal_receipt_first):
+        early, late, tx = self.pair(reverse_ack=True)
+        self.assertEqual(len(self.polls), 2)
+        self.assertIsNone(early["chain"])
+        self.clock += 10
+        A.addons[0].websocket_message(self.success(tx))
+        if formal_receipt_first:
+            self.receipt(late)
+        A._settle_incomplete(early, "receipt poll timeout")
+        self.assertEqual(early["incomplete"], "receipt poll timeout")
+        self.assertIsNone(late["incomplete"], "an unproven-chain alias cannot fail the formal request")
+        self.assertIsNone(A.STORE.claim_receipt_poll(early), "failed probe is terminal")
+        if not formal_receipt_first:
+            self.receipt(late)
+        self.assertIsNotNone(late["tReceiptMs"])
+        self.assertIsNotNone(late["tSuccessPushMs"])
+        self.assertIsNone(late["incomplete"])
+        A.STORE.mark_close(self.run)
+        with A.STORE.lock:
+            self.assertFalse(A.STORE._run_pinned_locked(self.run))
+        tl = A.STORE.timeline(self.run, full=True)
+        row = next(x for x in tl["legs"] if not x["dup"] and x.get("txHash") == tx)
+        self.assertIsNone(row["incomplete"])
+        self.assertEqual(tl["counts"]["observed"], 1)
+
+    def test_unknown_alias_failure_before_formal_receipt_is_diagnostic_only(self):
+        self.check_alias_poll_failure(False)
+
+    def test_unknown_alias_failure_after_formal_receipt_is_diagnostic_only(self):
+        self.check_alias_poll_failure(True)
+
+    def run_captured_worker(self, leg, rpc):
+        target, args = next(x for x in self.workers if x[1][1] is leg)
+        self.assertIs(target, self.real_poll_receipt)
+        self.assertIs(args[4], rpc, "worker must use the captured synthetic RPC, never live RPC")
+        target(*args)
+
+    def test_real_poll_worker_success_rebinds_earlier_alias(self):
+        from unittest.mock import patch
+        calls = []
+
+        def rpc(url, method, params):
+            calls.append((method, params))
+            return {"value": [{"confirmationStatus": "confirmed", "err": None, "slot": 777}]}
+
+        with patch.object(A, "_jsonrpc", rpc):
+            early, late, tx = self.pair(reverse_ack=True)
+        self.clock += 10
+        A.addons[0].websocket_message(self.success(tx))
+        self.clock += 100
+        self.run_captured_worker(late, rpc)
+        first_receipt = late["tReceiptMs"]
+        self.clock += 100
+        self.run_captured_worker(early, rpc)
+        self.assertEqual(calls, [("getSignatureStatuses", [[tx], {"searchTransactionHistory": True}])] * 2)
+        self.assertFalse(early["dup"])
+        self.assertTrue(late["dup"])
+        self.assertEqual(early["chain"], "solana")
+        self.assertEqual(early["tReceiptMs"], first_receipt)
+        self.assertIsNone(late["tReceiptMs"])
+        self.assertEqual(A.STORE.timeline(self.run)["counts"]["observed"], 1)
+
+    def test_real_poll_worker_alias_err_cannot_fail_formal(self):
+        from unittest.mock import patch
+        calls = []
+
+        def rpc(url, method, params):
+            calls.append((method, params))
+            err = {"InstructionError": [0, "synthetic"]} if len(calls) == 1 else None
+            return {"value": [{"confirmationStatus": "confirmed", "err": err, "slot": 777}]}
+
+        with patch.object(A, "_jsonrpc", rpc):
+            early, late, tx = self.pair(reverse_ack=True)
+        self.run_captured_worker(early, rpc)
+        self.assertEqual(early["incomplete"], "signature err")
+        self.assertIsNone(late["incomplete"])
+        self.clock += 100
+        self.run_captured_worker(late, rpc)
+        self.assertEqual(calls, [("getSignatureStatuses", [[tx], {"searchTransactionHistory": True}])] * 2)
+        self.assertIsNotNone(late["tReceiptMs"])
+        self.assertIsNone(late["incomplete"])
+        self.assertTrue(early["dup"])
+        self.assertIsNone(early["tReceiptMs"])
+
+    def test_later_round_and_old_hash_repeat_do_not_consume_another_slot(self):
+        early1, late1, tx1 = self.pair()
+        self.receipt(early1)
+        self.receipt(late1)
+        first_t = early1["tReceiptMs"]
+        self.clock += 1000
+        early2, late2, tx2 = self.pair(seed=0x32, oid="order-two")
+        self.receipt(late2)
+        self.receipt(early2)
+        self.assertNotEqual(tx1, tx2)
+        self.clock += 1000
+        # A later fanout repeat of R1 remains R1's alias, never a new R3 slot.
+        body = self._wire_body(0x31)
+        repeat = self.raw("solana", tx1, body=body)
+        A.addons[0].request(repeat)
+        A.addons[0].response(repeat)
+        replay = repeat.metadata["speedex_leg"][0]
+        self.receipt(replay, slot=999)
+        self.assertIs(replay["_dupOf"], early1)
+        self.assertFalse(early1["dup"])
+        self.assertFalse(early2["dup"])
+        self.assertEqual(early1["tReceiptMs"], first_t)
+        self.assertEqual(A.STORE.timeline(self.run)["counts"],
+            {"requested": 8, "attempted": 2, "observed": 2, "unbound": 0})
+
+    def candidate(self, platform, chain, ident):
+        """Independent request anchors for strict identity boundary unit cases."""
+        self.clock += 10
+        leg = A.STORE.new_leg(self.run, platform, chain,
+            {"t": self.clock, "tw": "synthetic", **ident})
+        A.STORE.update_anchor(leg, ident)
+        return leg
+
+    def test_same_hash_conflicting_order_never_merges(self):
+        tx = A._sol_wire_first_sig(self._wire_body(0x31))
+        early = self.candidate("okx", None, {"txHash": tx, "orderId": "order-one"})
+        late = self.candidate("okx", "solana", {"txHash": tx, "orderId": "order-two"})
+        self.receipt(early)
+        self.receipt(late)
+        self.assertFalse(early["dup"])
+        self.assertFalse(late["dup"])
+        self.assertEqual(A.STORE.timeline(self.run)["counts"]["attempted"], 2)
+
+    def test_same_order_conflicting_hash_never_merges(self):
+        tx1 = A._sol_wire_first_sig(self._wire_body(0x31))
+        tx2 = A._sol_wire_first_sig(self._wire_body(0x32))
+        early = self.candidate("okx", None, {"txHash": tx1, "orderId": "order-one"})
+        late = self.candidate("okx", "solana", {"txHash": tx2, "orderId": "order-one"})
+        self.receipt(early)
+        self.receipt(late)
+        self.assertFalse(early["dup"])
+        self.assertFalse(late["dup"])
+
+    def test_no_shared_identity_chain_alone_does_not_merge(self):
+        early = self.candidate("okx", None, {})
+        late = self.candidate("okx", "solana", {"txHash": "3" * 88})
+        self.receipt(early)
+        self.assertFalse(early["dup"])
+        self.assertFalse(late["dup"])
+
+    def test_shared_identity_across_platforms_does_not_merge(self):
+        ident = {"txHash": "3" * 88, "orderId": "order-one"}
+        early = self.candidate("okx", None, ident)
+        late = self.candidate("gmgn", "solana", ident)
+        self.receipt(early)
+        self.assertFalse(early["dup"])
+        self.assertFalse(late["dup"])
+        self.assertIsNone(late["tReceiptMs"])
+
+    def test_receipt_chain_conflict_does_not_redirect_to_other_chain(self):
+        ident = {"txHash": self.H, "orderId": "order-one"}
+        early = self.candidate("okx", None, ident)
+        late = self.candidate("okx", "bsc", ident)
+        A.STORE.dedup_order_identity(early)
+        self.assertTrue(early["dup"])
+        self.clock += 100
+        A._settle_receipt(early, {"chain": "arc", "status": 1,
+            "blockHash": "0x" + "ab" * 32, "blockNumber": "0x123"})
+        self.assertFalse(early["dup"])
+        self.assertIsNone(late["tReceiptMs"])
+        self.assertEqual(early["receipt"]["chain"], "arc")
+        self.assertEqual(early["chain"], "arc")
+        self.assertEqual(late["chain"], "bsc")
+        self.assertNotEqual(early["slot"], late["slot"])
+        specs = A.STORE.marks[self.run]["manifestLegs"]
+        self.assertEqual(specs[early["slot"]]["chain"], "arc")
+        self.assertEqual(specs[late["slot"]]["chain"], "bsc")
+        self.assertEqual(sum(x["slot"] == early["slot"] for x in A.STORE.legs[self.run]), 1)
+        self.assertEqual(A.STORE.timeline(self.run)["counts"],
+            {"requested": 8, "attempted": 2, "observed": 1, "unbound": 0})
+
+    def test_closed_old_window_receipt_cannot_mutate_new_run(self):
+        early, late, _ = self.pair()
+        A.STORE.mark_close(self.run)
+        new_run = "next-window"
+        A.STORE.mark_open(new_run, manifest={"version": 1, "runId": new_run,
+            "legs": [{"platform": "okx", "chain": "solana", "rounds": 1}]})
+        self.clock += 100
+        self.receipt(early)
+        self.receipt(late)
+        self.assertIsNone(early["tReceiptMs"])
+        self.assertIsNone(late["tReceiptMs"])
+        self.assertEqual(A.STORE.timeline(new_run)["counts"]["attempted"], 0)
+
+    def test_vetoed_pending_leg_cannot_acquire_slot_on_receipt(self):
+        early, late, _ = self.pair()
+        A.STORE.update_anchor(early, {"txHash": A._sol_wire_first_sig(self._wire_body(0x34))})
+        self.receipt(early)
+        self.assertTrue(early["_anchorVeto"])
+        self.assertIsNone(early["slot"])
+        self.assertIsNone(early["tReceiptMs"])
+        self.assertFalse(late["dup"])
+
+
 if __name__ == "__main__":
     unittest.main()
