@@ -7309,6 +7309,113 @@ class TestChainChannelArrivals(unittest.TestCase):
         sol_rows = [x for x in tl["legs"] if x.get("txHash") == sig]
         self.assertEqual(sol_rows[0]["channelArrivals"], [{"channel": "fullnode", "api": "signatureNotification", "ms": 450}])
 
+    # ── v10.2：真实线形——signatureNotification 帧不含签名，身份走连接级订阅映射 ──
+    def sol_conn(self):
+        """同一条 fullnode 连接的持久 FakeFlow（订阅映射按连接存 flow.metadata）。"""
+        f = FakeFlow("www.okx.com", "/fullnode/sol/discover/ws")
+        f.websocket = types.SimpleNamespace(messages=[])
+        return f
+
+    def conn_send(self, f, payload, from_client=False):
+        f.websocket.messages = [FakeWSMsg(payload, from_client=from_client)]
+        A.addons[0].websocket_message(f)
+
+    def sol_leg(self):
+        sig_bytes = bytes((i * 7 + 3) & 0xFF for i in range(64))
+        sig = A._b58encode(sig_bytes)
+        wire = bytes([1]) + sig_bytes + bytes(32)
+        import base64 as _b64
+        leg = self.send_leg("solana", _b64.b64encode(wire).decode())
+        self.assertEqual(leg.get("txHash"), sig)
+        return sig
+
+    def sub_pair(self, f, sig, req_id=7, sub_id=284):
+        self.conn_send(f, json.dumps({"jsonrpc": "2.0", "id": req_id, "method": "signatureSubscribe",
+            "params": [sig, {"commitment": "processed"}]}), from_client=True)
+        self.conn_send(f, json.dumps({"jsonrpc": "2.0", "id": req_id, "result": sub_id}))
+
+    def sol_rows(self, sig):
+        tl = A.STORE.timeline(self.run, full=True)
+        return [x for x in tl["legs"] if x.get("txHash") == sig]
+
+    def test_solana_fullnode_subscription_mapped_notification(self):
+        sig = self.sol_leg()
+        f = self.sol_conn()
+        self.sub_pair(f, sig)
+        self.clock += 450
+        # 真实帧形（1a9cs 实证）：value 只有 err:null，无 signature 字段
+        self.conn_send(f, json.dumps({"jsonrpc": "2.0", "method": "signatureNotification",
+            "params": {"subscription": 284, "result": {"context": {"slot": 449737968}, "value": {"err": None}}}}))
+        self.assertEqual(self.sol_rows(sig)[0]["channelArrivals"],
+            [{"channel": "fullnode", "api": "signatureNotification", "ms": 450}],
+            "订阅映射还原签名 → 首到代理钟到达")
+        # 第二帧不覆盖首到
+        self.clock += 300
+        self.conn_send(f, json.dumps({"jsonrpc": "2.0", "method": "signatureNotification",
+            "params": {"subscription": 284, "result": {"context": {"slot": 449737970}, "value": {"err": None}}}}))
+        self.assertEqual(self.sol_rows(sig)[0]["channelArrivals"][0]["ms"], 450)
+
+    def test_solana_fullnode_rejects_unmapped_err_and_foreign(self):
+        sig = self.sol_leg()
+        f = self.sol_conn()
+        self.sub_pair(f, sig)
+        for frame in [
+            # err 非 null → 失败态不认
+            {"jsonrpc": "2.0", "method": "signatureNotification", "params": {"subscription": 284,
+                "result": {"context": {"slot": 9}, "value": {"err": {"Custom": 1}}}}},
+            # 未映射 subscription id → 不认
+            {"jsonrpc": "2.0", "method": "signatureNotification", "params": {"subscription": 999,
+                "result": {"context": {"slot": 9}, "value": {"err": None}}}},
+            # value 缺 err 键 → 非 schema 不认
+            {"jsonrpc": "2.0", "method": "signatureNotification", "params": {"subscription": 284,
+                "result": {"context": {"slot": 9}, "value": {}}}},
+        ]:
+            self.conn_send(f, json.dumps(frame))
+        self.assertIsNone(A.STORE.legs[self.run][-1].get("_channelArrivals"))
+
+    def test_solana_fullnode_no_subscribe_no_arrival(self):
+        sig = self.sol_leg()
+        f = self.sol_conn()
+        # 无订阅映射且帧内无签名 → 不记
+        self.conn_send(f, json.dumps({"jsonrpc": "2.0", "method": "signatureNotification",
+            "params": {"subscription": 284, "result": {"context": {"slot": 9}, "value": {"err": None}}}}))
+        self.assertIsNone(A.STORE.legs[self.run][-1].get("_channelArrivals"))
+
+    def test_solana_fullnode_unsubscribe_drops_mapping(self):
+        sig = self.sol_leg()
+        f = self.sol_conn()
+        self.sub_pair(f, sig)
+        self.conn_send(f, json.dumps({"jsonrpc": "2.0", "id": 8, "method": "signatureUnsubscribe",
+            "params": [284]}), from_client=True)
+        self.conn_send(f, json.dumps({"jsonrpc": "2.0", "method": "signatureNotification",
+            "params": {"subscription": 284, "result": {"context": {"slot": 9}, "value": {"err": None}}}}))
+        self.assertIsNone(A.STORE.legs[self.run][-1].get("_channelArrivals"), "退订后映射清除")
+
+    def test_solana_fullnode_transaction_notification_direct(self):
+        sig = self.sol_leg()
+        f = self.sol_conn()
+        self.clock += 200
+        self.conn_send(f, json.dumps({"jsonrpc": "2.0", "method": "transactionNotification",
+            "params": {"subscription": 12, "result": {"context": {"slot": 9},
+                "transaction": {"signatures": [sig]}, "meta": {"err": None}}}}))
+        self.assertEqual(self.sol_rows(sig)[0]["channelArrivals"],
+            [{"channel": "fullnode", "api": "transactionNotification", "ms": 200}])
+        # meta.err 失败态不认
+        g = self.sol_conn()
+        self.conn_send(g, json.dumps({"jsonrpc": "2.0", "method": "transactionNotification",
+            "params": {"subscription": 12, "result": {"context": {"slot": 9},
+                "transaction": {"signatures": [sig]}, "meta": {"err": {"InstructionError": [0, "Custom"]}}}}}))
+        self.assertEqual(len(self.sol_rows(sig)[0]["channelArrivals"]), 1, "失败帧不新增/不覆盖")
+
+    def test_solana_fullnode_subscription_state_cleared_on_close(self):
+        sig = self.sol_leg()
+        f = self.sol_conn()
+        self.sub_pair(f, sig)
+        A.addons[0].websocket_end(f)
+        self.conn_send(f, json.dumps({"jsonrpc": "2.0", "method": "signatureNotification",
+            "params": {"subscription": 284, "result": {"context": {"slot": 9}, "value": {"err": None}}}}))
+        self.assertIsNone(A.STORE.legs[self.run][-1].get("_channelArrivals"), "连接结束清理订阅映射")
+
 
 class TestMarketTap(unittest.TestCase):
     """market-tap 支线：行情 WS 帧的 channel/首见地址记录，独立于开窗管线。"""
