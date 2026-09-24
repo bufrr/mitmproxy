@@ -215,7 +215,7 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # 槽位必须衔接已接受头、同高异父=分叉；不连续即清空重锚，与 EVM hash/parentHash
 # 冲突清空同律；样本保留 parent 字段）。修订经过见 git 历史；行为由
 # deploy/hk-proxy/test_speedex_hk_timing.py 与 tests/hk-timing*.test.mjs 钉住。
-ADDON_VERSION = "2026.09.23-chain-arrivals-egress-warm-v10.1-pending-receipt-dedup"
+ADDON_VERSION = "2026.09.24-chain-arrivals-sol-submap-v10.2"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -376,11 +376,11 @@ _OKX_SUCCESS_STATUS = ("0x1", "0x01", "1", 1)
 
 def _okx_chain_frame_identity(payload, channel, chain):
     """返回帧内精确 tx 身份（schema-known 窄提取，成功形态才认）：
-    - solana fullnode：signatureNotification 的 params.result.value.signature 精确等值
-      且 err === null；
     - EVM nodeone/fullnode：eth_subscription 的 params.result 内 txHash/transactionHash/
       hash 精确 hex64 + 同 result 的 status ∈ {0x1,0x01,1,1}（同子树成功律，与 EU
       classify-ws 同口径）。
+    solana fullnode 不走本函数——真实 signatureNotification 帧不含签名（value 只有
+    err），身份靠 _sol_fullnode_* 的连接级订阅映射还原。
     不满足 → None（不猜、不部分采纳）。
     """
     obj = _decode_ws(payload)
@@ -388,16 +388,6 @@ def _okx_chain_frame_identity(payload, channel, chain):
         return None
     params = obj.get("params")
     result = params.get("result") if isinstance(params, dict) else None
-    if channel == "fullnode" and chain == "solana":
-        if not re.search(r"signatureNotification", str(obj.get("method") or "")):
-            return None
-        if not isinstance(result, dict):
-            return None
-        value = result.get("value")
-        if not isinstance(value, dict) or value.get("err") is not None:
-            return None
-        sig = value.get("signature")
-        return sig if isinstance(sig, str) and 64 <= len(sig) <= 96 else None
     # EVM：eth_subscription
     if not re.search(r"eth_subscription", str(obj.get("method") or "")):
         return None
@@ -410,6 +400,84 @@ def _okx_chain_frame_identity(payload, channel, chain):
         v = result.get(k)
         if isinstance(v, str) and re.fullmatch(r"0x[0-9a-fA-F]{64}", v):
             return v
+    return None
+
+
+# ── v10.2 solana fullnode 订阅映射 ─────────────────────────────────────────
+# 实证（1a9cs solana r4）：真实 signatureNotification 帧 value 只有 {"err": null}，
+# 不含签名；签名身份 = 同连接先前 signatureSubscribe 请求（params[0]=sig，reqId）
+# 经响应（{"id":reqId,"result":subId}）绑定 subId→sig 还原。逐连接存 flow.metadata，
+# 连接随 flow 销毁；跨 run 安全性由 note_channel_arrival 的腿锚精确等值门承担。
+_SOL_SIG_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{43,96}$")
+_SOL_SUBS_KEY = "speedex_sol_subs"
+
+
+def _sol_subs(flow):
+    return flow.metadata.setdefault(_SOL_SUBS_KEY, {"req": {}, "subs": {}})
+
+
+def _sol_fullnode_client_frame(flow, payload):
+    """solana fullnode 出站帧：signatureSubscribe 登记 reqId→sig；signatureUnsubscribe
+    清理 subId 映射（复用旧 subId 的通知不得落到新 sig）。"""
+    obj = _decode_ws(payload)
+    if not isinstance(obj, dict):
+        return
+    method = obj.get("method")
+    ident = obj.get("id")
+    params = obj.get("params")
+    subs = _sol_subs(flow)
+    if method == "signatureSubscribe":
+        sig = params[0] if isinstance(params, list) and params else None
+        if ident is not None and isinstance(sig, str) and _SOL_SIG_RE.fullmatch(sig):
+            subs["req"][str(ident)] = sig
+    elif method == "signatureUnsubscribe":
+        sid = params[0] if isinstance(params, list) and params else None
+        if sid is not None:
+            subs["subs"].pop(str(sid), None)
+
+
+def _sol_fullnode_server_identity(flow, payload):
+    """solana fullnode 入站帧 → 精确 tx 签名（schema-known，成功形态才认）：
+    - subscribe 响应（{"id":reqId,"result":subId}，无 method）→ 绑定 subId→sig
+      （副作用），返回 None；
+    - signatureNotification：params.result.value 内 err 键在场且为 null；签名取
+      value.signature（在场且形状合法时），否则订阅映射 params.subscription→sig；
+    - transactionNotification：params.result.meta 内 err 键在场且为 null，签名取
+      result.transaction.signatures[0]。
+    不满足 → None（不猜、不部分采纳）。命中返回 (sig, api)——api = 实际通知方法名。"""
+    obj = _decode_ws(payload)
+    if not isinstance(obj, dict):
+        return None
+    subs = _sol_subs(flow)
+    method = obj.get("method")
+    if method is None:
+        ident, result = obj.get("id"), obj.get("result")
+        sig = subs["req"].pop(str(ident), None) if ident is not None else None
+        if sig is not None and isinstance(result, (int, str)):
+            subs["subs"][str(result)] = sig
+        return None
+    params = obj.get("params")
+    result = params.get("result") if isinstance(params, dict) else None
+    if not isinstance(result, dict):
+        return None
+    if method == "signatureNotification":
+        value = result.get("value")
+        if not isinstance(value, dict) or "err" not in value or value.get("err") is not None:
+            return None
+        sig = value.get("signature")
+        if isinstance(sig, str) and _SOL_SIG_RE.fullmatch(sig):
+            return (sig, method)
+        sub = params.get("subscription")
+        mapped = subs["subs"].get(str(sub)) if sub is not None else None
+        return (mapped, method) if mapped else None
+    if method == "transactionNotification":
+        meta = result.get("meta")
+        if not isinstance(meta, dict) or "err" not in meta or meta.get("err") is not None:
+            return None
+        tx = result.get("transaction")
+        sigs = tx.get("signatures") if isinstance(tx, dict) else None
+        sig = sigs[0] if isinstance(sigs, list) and sigs else None
+        return (sig, method) if isinstance(sig, str) and _SOL_SIG_RE.fullmatch(sig) else None
     return None
 
 
@@ -3928,22 +3996,45 @@ class SpeedexHkTiming:
             except Exception:
                 pass
 
+    def websocket_end(self, flow):
+        # v10.2：连接关闭即清 solana 订阅映射（flow.metadata 随 flow 生命周期，
+        # 显式清理防止长驻连接表残留；订阅映射永不在连接间复用）。
+        try:
+            flow.metadata.pop(_SOL_SUBS_KEY, None)
+        except Exception:
+            pass
+
     def _handle_ws_message(self, flow, msg, t_obs):
         if not STORE.any_open():
             return
         host = flow.request.pretty_host
-        # v10：链域通道（www.okx.com /fullnode|/nodeone）——成功通知到达时刻（HK 钟）
+        # v10：链域通道（www.okx.com/.ac /fullnode|/nodeone）——成功通知到达时刻（HK 钟）
         # 窄提取，与平台成功判定管线完全分离（不进 ws_entries/ws_buffer/成功资格门）。
-        if host in _OKX_CHAIN_WS_HOSTS and not msg.from_client:
+        # v10.2：solana fullnode 双向——出站 signatureSubscribe 登记、入站响应绑定
+        # subId→sig、通知帧经映射还原签名（真实帧不含签名）。
+        if host in _OKX_CHAIN_WS_HOSTS:
             path = (flow.request.path or "").split("?")[0]
             m = _OKX_CHAIN_WS_PATH.match(path)
             if m:
                 channel = m.group(1).lower()
                 chain = {"sol": "solana"}.get(m.group(2).lower(), m.group(2).lower())
-                txv = _okx_chain_frame_identity(msg.content, channel, chain)
-                if txv:
-                    STORE.note_channel_arrival(chain, txv, channel,
-                        "signatureNotification" if chain == "solana" else "eth_subscription", t_obs)
+                if msg.from_client:
+                    if channel == "fullnode" and chain == "solana":
+                        _sol_fullnode_client_frame(flow, msg.content)
+                else:
+                    hit = (
+                        _sol_fullnode_server_identity(flow, msg.content)
+                        if channel == "fullnode" and chain == "solana"
+                        else None
+                    )
+                    txv = hit[0] if hit else None
+                    api = hit[1] if hit else None
+                    if txv is None and not (channel == "fullnode" and chain == "solana"):
+                        txv = _okx_chain_frame_identity(msg.content, channel, chain)
+                        api = "eth_subscription" if txv else None
+                    if txv:
+                        STORE.note_channel_arrival(chain, txv, channel,
+                            api or ("signatureNotification" if chain == "solana" else "eth_subscription"), t_obs)
             return
         platform = _classify_ws(host)
         if not platform:
