@@ -7,6 +7,8 @@
 
 ## Unreleased: mitmproxy next
 
+- mitmweb: Support `float` addon options in the Options editor.
+  ([#3144](https://github.com/mitmproxy/mitmproxy/issues/3144))
 - Add `launch_edge()` to the Browser addon, so `browser.start edge` can
   launch an isolated, proxy-configured instance of Microsoft Edge, matching
   the existing Chrome and Firefox support.
@@ -25,6 +27,8 @@
 - Remove the unused `msgpack` dependency. The msgpack contentview is
   implemented in Rust and shipped with `mitmproxy_rs` since mitmproxy 12.
   ([#8319](https://github.com/mitmproxy/mitmproxy/pull/8319), @lukehsiao)
+- Update Linux binary builder to Debian 12, bumping the minimum glibc version to 2.36.
+  ([#8458](https://github.com/mitmproxy/mitmproxy/pull/8458), @mhils)
 - Fix a crash on OpenSSL builds that reject a TLS protocol version at
   context-setup time (e.g. SSLv3): `is_supported_version` now treats such a
   version as unsupported instead of raising an unhandled `SSL.Error`.
