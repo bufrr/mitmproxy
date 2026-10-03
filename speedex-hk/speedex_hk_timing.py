@@ -3146,6 +3146,7 @@ class Store:
             if not h or not _receipt_candidates(leg.get("chain"), h):
                 return None
             leg["receiptPolling"] = True
+            _maybe_probe_fullnode(leg, h)
             return h
 
     def note_channel_arrival(self, chain, tx_value, channel, api, t_ms):
@@ -3539,6 +3540,117 @@ def _receipt_candidates(chain, tx_hash):
     if isinstance(tx_hash, str) and not tx_hash.startswith("0x") and len(tx_hash) >= 80:
         return ["solana"]
     return []
+
+
+# ── fullnode 按笔推送实证探针（默认关闭）─────────────────────────────────
+# 背景：2026-10-03 起 OKX 页面不再对本批订单发按笔链域订阅（前端把订阅门控到
+# 静默签名），channelArrivals 全空。本探针在腿首次锁到精确 tx（receipt 闩锁
+# 同一时机）时，由代理侧直连 fullnode 对该 tx 发同构订阅，把全部入站帧落
+# JSONL——回答「服务端对开窗期 tx 还推不推 eth_subscription/signatureNotification」。
+# 纯侧信道：不读不写 Store 状态、不参与成功/资格/锚判定、不持久化任何凭据
+# （帧内容是公开链上通知）。仅在 _PROBE_FLAG 文件存在时启用；删文件即失效，
+# 无需重启。日志 0600，键无 secret 形。
+_PROBE_FLAG = "/opt/speedex-mitm/fullnode-probe.enabled"
+_PROBE_LOG = "/opt/speedex-mitm/fullnode-probe.jsonl"
+_PROBE_WINDOW_S = 90
+_PROBE_PING_S = 10
+_PROBE_URLS = {
+    "bsc": ("evm", "wss://www.okx.com/fullnode/bsc/discover/ws"),
+    "robinhood": ("evm", "wss://www.okx.ac/fullnode/robinhood/discover/ws"),
+    "solana": ("sol", "wss://www.okx.com/fullnode/sol/discover/ws"),
+}
+
+
+def _probe_log(rec):
+    try:
+        line = json.dumps(rec, ensure_ascii=False)
+        fd = os.open(_PROBE_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _fullnode_probe_worker(chain, tx_hash, run_id, t_order_out_ms):
+    import asyncio
+
+    kind, url = _PROBE_URLS[chain]
+
+    async def _run():
+        try:
+            import websockets
+        except Exception as e:
+            _probe_log({"event": "no-websockets", "detail": repr(e)[:120]})
+            return
+        t0 = time.monotonic()
+
+        def rec(event, **kw):
+            _probe_log({"event": event, "atMs": round((time.monotonic() - t0) * 1000, 1),
+                        "wall": _wall_iso(), "runId": run_id, "chain": chain,
+                        "tx": tx_hash, "tOrderOutMs": t_order_out_ms, **kw})
+
+        try:
+            async with websockets.connect(
+                url, origin="https://web3.okx.com", ping_interval=None,
+                max_size=4 * 1024 * 1024, open_timeout=15,
+            ) as ws:
+                if kind == "evm":
+                    sub = {"jsonrpc": "2.0", "id": tx_hash, "method": "eth_subscribe",
+                           "params": ["newTransactionSubscribe", [{"hash": tx_hash, "status": "syncTxPush"}]]}
+                    ping = {"jsonrpc": "2.0", "method": "net_version", "id": 1, "params": []}
+                else:
+                    sub = {"jsonrpc": "2.0", "id": tx_hash, "method": "signatureSubscribe",
+                           "params": [tx_hash, {"commitment": "processed", "enableReceivedNotification": False}]}
+                    ping = {"jsonrpc": "2.0", "method": "ping", "id": 0}
+                await ws.send(json.dumps(sub))
+                rec("subscribed")
+                end = time.monotonic() + _PROBE_WINDOW_S
+                next_ping = time.monotonic() + _PROBE_PING_S
+                while time.monotonic() < end:
+                    try:
+                        frame = await asyncio.wait_for(
+                            ws.recv(), timeout=max(0.1, min(float(_PROBE_PING_S), end - time.monotonic())))
+                        rec("frame", payload=(frame if isinstance(frame, str) else frame.hex())[:1200])
+                    except asyncio.TimeoutError:
+                        pass
+                    except Exception as e:
+                        rec("closed", detail=repr(e)[:160])
+                        return
+                    if time.monotonic() >= next_ping:
+                        try:
+                            await ws.send(json.dumps(ping))
+                        except Exception:
+                            return
+                        next_ping = time.monotonic() + _PROBE_PING_S
+                rec("window-end")
+        except Exception as e:
+            rec("error", detail=repr(e)[:200])
+
+    try:
+        asyncio.run(_run())
+    except Exception:
+        pass
+
+
+def _probe_enabled():
+    return os.path.exists(_PROBE_FLAG)
+
+
+def _maybe_probe_fullnode(leg, tx_hash):
+    """receipt 闩锁同一时机点火——每腿至多一次（闩锁保证）。默认关闭。"""
+    try:
+        if leg.get("platform") != "okx":
+            return
+        chain = leg.get("chain")
+        if chain not in _PROBE_URLS or not tx_hash or not _probe_enabled():
+            return
+        threading.Thread(
+            target=_fullnode_probe_worker,
+            args=(chain, tx_hash, leg.get("runId"), leg.get("tOrderOutMs")),
+            daemon=True,
+        ).start()
+    except Exception:
+        pass
 
 
 def _poll_receipt(run_id, leg_ref, chain, tx_hash, jsonrpc=None):

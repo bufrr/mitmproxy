@@ -7883,5 +7883,142 @@ class TestTgFrameProbe(unittest.TestCase):
         self.assertEqual(A.STORE.run_diag[run]["tgProbeFrames"], 2)
 
 
+class TestFullnodeTxProbe(unittest.TestCase):
+    """fullnode 按笔推送实证探针：默认关闭；okx+已登记链+开关 → 每腿一次点火。"""
+
+    def setUp(self):
+        from unittest.mock import patch
+        fresh()
+        self.threads = []
+        owner = self
+
+        class RecThread:
+            def __init__(self, target, args=(), daemon=None):
+                self.target, self.args = target, args
+
+            def start(self):
+                owner.threads.append((self.target, self.args))
+
+        p = patch.object(A.threading, "Thread", RecThread)
+        p.start()
+        self.addCleanup(p.stop)
+        p = patch.object(A, "_probe_enabled", lambda: True)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def leg(self, platform="okx", chain="bsc"):
+        return {"platform": platform, "chain": chain, "runId": "probe-run",
+                "tOrderOutMs": 12345.0}
+
+    def test_okx_registered_chain_fires_once(self):
+        tx = "0x" + "cd" * 32
+        A._maybe_probe_fullnode(self.leg(), tx)
+        self.assertEqual(len(self.threads), 1)
+        target, args = self.threads[0]
+        self.assertIs(target, A._fullnode_probe_worker)
+        self.assertEqual(args, ("bsc", tx, "probe-run", 12345.0))
+
+    def test_gates(self):
+        from unittest.mock import patch
+        tx = "0x" + "cd" * 32
+        A._maybe_probe_fullnode(self.leg(platform="gmgn"), tx)
+        A._maybe_probe_fullnode(self.leg(chain="arc"), tx)  # 未登记（上游无订阅）
+        A._maybe_probe_fullnode(self.leg(chain=None), tx)
+        A._maybe_probe_fullnode(self.leg(), None)
+        self.assertEqual(len(self.threads), 0)
+        with patch.object(A, "_probe_enabled", lambda: False):
+            A._maybe_probe_fullnode(self.leg(), tx)
+        self.assertEqual(len(self.threads), 0)
+
+    def test_claim_receipt_poll_integration(self):
+        """生产路径：okx 广播响应锁 hash → receipt 闩锁 → 探针同机点火（每腿一次）。"""
+        run = "probe-claim-run"
+        A.STORE.mark_open(run)
+        h1 = "0x" + "ef" * 32
+        f = FakeFlow(
+            "web3.okx.com",
+            "/priapi/v6/dx/trade/multi/broadcast",
+            "POST",
+            req_body=json.dumps({"chainId": 56, "signedTx": "0xdeadbeef"}),
+            resp_body=json.dumps({"code": "0", "data": {"transactionHash": h1, "orderId": "o1"}}),
+        )
+        A.addons[0].request(f)
+        A.addons[0].response(f)
+        time.sleep(0.05)
+        probes = [a for t, a in self.threads if t is A._fullnode_probe_worker]
+        self.assertEqual(len(probes), 1, "receipt 闩锁同一时机点燃探针")
+        self.assertEqual(probes[0][0], "bsc")
+        self.assertEqual(probes[0][1], h1)
+        leg = f.metadata["speedex_leg"][0]
+        self.assertIsNone(A.STORE.claim_receipt_poll(leg), "闩锁幂等——探针不重复点火")
+        self.assertEqual(len(probes), 1)
+
+    def test_worker_subscribe_and_log(self):
+        """worker：发送与页面同构的按笔订阅，入站帧落 JSONL，窗口结束收尾。"""
+        from unittest.mock import patch
+        import collections
+
+        tx = "0x" + "ab" * 32
+        sent = []
+        logged = []
+
+        class FakeWS:
+            def __init__(self):
+                self.queue = collections.deque()
+
+            async def send(self, msg):
+                sent.append(msg)
+
+            async def recv(self):
+                if self.queue:
+                    return self.queue.popleft()
+                raise asyncio.TimeoutError
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        import asyncio
+
+        holder = {}
+
+        class StubWSS:
+            def connect(self, url, **kw):
+                holder["url"] = url
+                holder["kw"] = kw
+                ws = FakeWS()
+                ws.queue.append(json.dumps({"jsonrpc": "2.0", "id": tx, "result": "0xsub1"}))
+                ws.queue.append(json.dumps({"jsonrpc": "2.0", "method": "eth_subscription",
+                                            "params": {"subscription": "0xsub1", "result": {"hash": tx, "status": 1}}}))
+                return ws
+
+        with patch.object(A, "_PROBE_WINDOW_S", 0.4), \
+             patch.object(A, "_PROBE_PING_S", 0.2), \
+             patch.object(A, "_probe_log", lambda rec: logged.append(rec)), \
+             patch.dict(sys.modules, {"websockets": StubWSS()}):
+            A._fullnode_probe_worker("bsc", tx, "probe-run", 999.0)
+
+        sub = json.loads(sent[0])
+        self.assertEqual(sub["id"], tx)
+        self.assertEqual(sub["method"], "eth_subscribe")
+        self.assertEqual(sub["params"][0], "newTransactionSubscribe")
+        self.assertEqual(sub["params"][1][0]["hash"], tx)
+        self.assertEqual(sub["params"][1][0]["status"], "syncTxPush")
+        self.assertEqual(holder["url"], A._PROBE_URLS["bsc"][1])
+        events = [r["event"] for r in logged]
+        self.assertEqual(events[0], "subscribed")
+        frames = [r for r in logged if r["event"] == "frame"]
+        self.assertEqual(len(frames), 2, "ACK + 通知帧都落日志")
+        self.assertIn('"status":1', frames[1]["payload"].replace(" ", ""))
+        self.assertEqual(frames[0]["tx"], tx)
+        self.assertEqual(frames[0]["tOrderOutMs"], 999.0)
+        self.assertEqual(events[-1], "window-end")
+        # 记录无 secret 形键/值（公开链上数据）
+        for r in logged:
+            self.assertNotIn("authorization", json.dumps(r).lower())
+
+
 if __name__ == "__main__":
     unittest.main()
