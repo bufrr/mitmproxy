@@ -11,6 +11,10 @@ Inherit [root rules](../../AGENTS.md). Read [proxy](../../docs/proxy.md) and
   enabling any GMGN/OKX decryption requires the SOP in `docs/plans/hk-selective-mitm.md` plus explicit
   per-run authorization. The experiment unit stays loopback-only with diagnostics-minimal logging
   (no auth headers, tokens, full query strings, signed bodies or full captures).
+  **生产实例（speedex-mitm.service）自 2026-10-03 转正是选择性 MITM**（allow_hosts 含
+  gmgn/okx/链 RPC 主机，owner 决定，speedex `configs/hk-nodes.json` r5）——本目录的
+  speedex-mitm.service 必须与生产实际范围一致；用默认小 allowlist 覆盖生产 = 测量全盲
+  （speedex `docs/hk-operations.md` 2026-09-16 教训，2026-10-03 复发过一次）。
 - Verify actual allow_hosts/interception support. A passthrough platform has no HK transaction observation;
   a separate RTT probe is not HK-L1a'/L3'. Keep host matching exact or dot-delimited subdomain matching.
 - Bind each leg to an immutable active window and independent request/response anchor. Success IDs cannot

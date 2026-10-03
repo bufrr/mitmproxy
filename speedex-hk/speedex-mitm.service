@@ -10,7 +10,8 @@ Type=simple
 # 本机可读）。轮换口令：改 proxy.env 后重跑 install.sh——htpasswd 内容变更会
 # 自动纳入受控 restart（运行中 mitmproxy 的 verifier 内存凭据需重启才刷新）。
 WorkingDirectory=/opt/speedex-mitm
-# 只拦截测量所需主机，其余全部透传（小内存 VM 减负；okx/gmgn 拦截会断扩展后端，刻意不拦）
+# 生产实例 = 选择性 MITM（2026-10-03 转正，hk-nodes r5）：只解密测量所需主机，
+# 其余全部透传（小内存 VM 减负）。allow_hosts 回退=测量全盲（hk-operations.md:81 陷阱）。
 ExecStart=/opt/speedex-mitm/venv/bin/mitmdump \
   --mode regular \
   --listen-host 0.0.0.0 \
@@ -22,7 +23,7 @@ ExecStart=/opt/speedex-mitm/venv/bin/mitmdump \
   --set body_size_limit=2m \
   --set keep_host_header=false \
   --set block_global=false \
-  --set "allow_hosts=^(.*\\.)?(turnkey\\.com|padre\\.gg|binance\\.com|fomo\\.family|relay\\.link)(:\\d+)?$" \
+  --set "allow_hosts=(?:^(.*\\.)?(gmgn\\.ai|ws\\.gmgn\\.ai|web3\\.okx\\.com|wsdexpri\\.okx\\.com|www\\.okx\\.(?:com|ac)|turnkey\\.com|padre\\.gg|binance\\.com|fomo\\.family|relay\\.link)(:\\d+)?$)|(?:^(?:okx\\.(?:bsc-rpc\\.com|(?:rpc|builder)\\.48\\.club|bsc\\.blockrazor\\.xyz|bscnetwork\\.blockrazor\\.io)|(?:frankfurt|hongkong|newyork|tokyo)2?\\.solana\\.blockrazor\\.io|rpc\\.mainnet\\.(?:arc\\.io|chain\\.robinhood\\.com))(:\\d+)?$)" \
   -s /opt/speedex-mitm/speedex_hk_timing.py \
   --quiet
 Restart=always
