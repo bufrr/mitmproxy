@@ -370,6 +370,7 @@ _OKX_CHAIN_WS_PATH = re.compile(r"^/(fullnode|nodeone)/([a-z0-9-]+)/", re.I)
 # 2026-09-22：OKX 链域通道 host 扩展——robinhood 链通知实证迁至 www.okx.ac
 # （/fullnode/robinhood/discover/ws；路径正则同形命中）。okx.ac 为 OKX 同运营域。
 _OKX_CHAIN_WS_HOSTS = frozenset(("www.okx.com", "www.okx.ac"))
+_TG_DEBUG = os.environ.get("SPEEDEX_TG_DEBUG") == "1"
 _OKX_EVM_TX_KEYS = ("txHash", "transactionHash", "hash")
 _OKX_SUCCESS_STATUS = ("0x1", "0x01", "1", 1)
 
@@ -1044,6 +1045,40 @@ def _okx_ws_entries(payload):
                 ids["chain"] = c
         out.append({"ids": ids, "success": type(dd.get("status")) is str and dd.get("status") == "1"})
     return out
+
+
+def _tg_frame_probe(payload):
+    """gmgn 入站帧探针（2026-10-03 LA 排查：bsc/sol tg 推送 0/5——帧到没到代理
+    一锤定音）。诊断最小化：频道名（有界截断）/data 形状/条数/身份键名/状态与
+    方向枚举/链值——无帧体、无 query、无认证。返回 dict | None（非 dict 帧）。"""
+    obj = _decode_ws(payload)
+    if not isinstance(obj, dict):
+        return None
+    ch = obj.get("channel")
+    data = obj.get("data")
+    info = {
+        "channel": str(ch)[:32] if ch is not None else None,
+        "dataShape": "list" if isinstance(data, list) else ("dict" if isinstance(data, dict) else "none"),
+        "n": len(data) if isinstance(data, list) else 0,
+        "idKeys": set(),
+        "st": set(),
+        "si": set(),
+        "chains": set(),
+    }
+    if isinstance(data, list):
+        for d0 in data[:8]:
+            if not isinstance(d0, dict):
+                continue
+            for k in ("h", "oi"):
+                if d0.get(k):
+                    info["idKeys"].add(k)
+            if d0.get("st") is not None:
+                info["st"].add(str(d0["st"])[:16])
+            if d0.get("si") is not None:
+                info["si"].add(str(d0["si"])[:8])
+            if d0.get("ch") is not None:
+                info["chains"].add(str(d0["ch"])[:16])
+    return info
 
 
 def _gmgn_ws_entries(payload):
@@ -4054,6 +4089,27 @@ class SpeedexHkTiming:
                             # subscribe 也是锚源——建立后重审早到缓冲帧
                             self._drain_ws_buffer(leg.get("runId"), "fomo")
             return
+        # TG 帧探针（2026-10-03 LA 排查：bsc/sol tg 推送 0/5——帧到没到代理一锤
+        # 定音）。计数恒开（/health diag 可查）；SPEEDEX_TG_DEBUG=1 时逐帧一行。
+        if platform == "gmgn":
+            info = _tg_frame_probe(payload)
+            with STORE.lock:
+                if info is None:
+                    STORE.diag["tgProbeNonDict"] += 1
+                else:
+                    STORE.diag["tgProbeFrames"] += 1
+                    STORE.diag[f"tgProbeChan.{info['channel'] or '(none)'}"] += 1
+                    if info["dataShape"] != "list":
+                        STORE.diag["tgProbeDataNotList"] += 1
+                    if not info["idKeys"]:
+                        STORE.diag["tgProbeNoIds"] += 1
+                for rid0 in STORE._open_run_ids_locked(time.monotonic())[:1]:
+                    STORE.run_diag[rid0]["tgProbeNonDict" if info is None else "tgProbeFrames"] += 1
+            if _TG_DEBUG and info is not None:
+                print(
+                    f"TG-FRAME ch={info['channel']} shape={info['dataShape']} n={info['n']} "
+                    f"ids={sorted(info['idKeys'])} st={sorted(info['st'])} si={sorted(info['si'])} chains={sorted(info['chains'])}"
+                )
         # WS 帧可先见 hash（OKX sol / Binance PENDING / GMGN hash-ack）——先解析再判成功。
         # 逐单元处理——okx/gmgn 一帧多 entry 逐 entry 独立（身份/状态/
         # 链只取同一 entry；目标在第二 entry 也照常关联），其余平台整帧一单元。
