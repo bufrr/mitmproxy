@@ -7837,5 +7837,51 @@ class TestPendingReceiptDedup(unittest.TestCase):
         self.assertFalse(late["dup"])
 
 
+
+
+class TestTgFrameProbe(unittest.TestCase):
+    """TG 帧探针（2026-10-03 LA bsc/sol 0/5 排查）——形状提取有界、无帧体。"""
+
+    def test_order_channel_list_shape(self):
+        info = A._tg_frame_probe(json.dumps({"channel": "tg_processed_order_info", "data": [
+            {"h": "0x" + "ab" * 32, "oi": "od1", "st": "successful", "si": "buy", "ch": "bsc"},
+            {"h": "0x" + "cd" * 32, "st": "failed", "si": "sell", "ch": "solana"},
+        ]}))
+        self.assertEqual(info["channel"], "tg_processed_order_info")
+        self.assertEqual(info["dataShape"], "list")
+        self.assertEqual(info["n"], 2)
+        self.assertEqual(info["idKeys"], {"h", "oi"})
+        self.assertEqual(info["st"], {"successful", "failed"})
+        self.assertEqual(info["si"], {"buy", "sell"})
+        self.assertEqual(info["chains"], {"bsc", "solana"})
+
+    def test_channel_miss_data_not_list_no_ids(self):
+        mkt = A._tg_frame_probe(json.dumps({"channel": "market-ticker", "data": {"price": 1}}))
+        self.assertEqual(mkt["channel"], "market-ticker")
+        self.assertEqual(mkt["dataShape"], "dict")
+        self.assertEqual(mkt["n"], 0)
+        self.assertEqual(mkt["idKeys"], set())
+        nochan = A._tg_frame_probe(json.dumps({"data": []}))
+        self.assertIsNone(nochan["channel"])
+        nodict = A._tg_frame_probe("not-json{")
+        self.assertIsNone(nodict)
+
+    def test_probe_counters_bump_in_handler(self):
+        fresh()
+        run = "tg-probe-window"
+        A.STORE.mark_open(run, manifest={"version": 1, "runId": run, "legs": [{"platform": "gmgn", "chain": "bsc", "rounds": 1}]})
+        f = FakeFlow("ws.gmgn.ai", "/v2/ws")
+        f.websocket = types.SimpleNamespace(messages=[FakeWSMsg(json.dumps({"channel": "tg_order_info", "data": [{"h": "0x" + "ab" * 32, "st": "successful", "si": "buy", "ch": "bsc"}]}))])
+        A.addons[0].websocket_message(f)
+        f.websocket.messages = [FakeWSMsg(json.dumps({"channel": "market-ticker", "data": {"p": 1}}))]
+        A.addons[0].websocket_message(f)
+        self.assertEqual(A.STORE.diag["tgProbeFrames"], 2)
+        self.assertEqual(A.STORE.diag["tgProbeChan.tg_order_info"], 1)
+        self.assertEqual(A.STORE.diag["tgProbeChan.market-ticker"], 1)
+        self.assertEqual(A.STORE.diag["tgProbeDataNotList"], 1)
+        self.assertEqual(A.STORE.diag["tgProbeNoIds"], 1)
+        self.assertEqual(A.STORE.run_diag[run]["tgProbeFrames"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()
