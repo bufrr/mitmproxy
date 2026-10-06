@@ -1809,6 +1809,77 @@ class TestR23ChainNotDeduped(unittest.TestCase):
 # ── R24：receipt 证据核对交易/块身份 ──
 
 
+class TestReceiptRpcFallback(unittest.TestCase):
+    """2026-10-06：公共 RPC 出错即换端点 + 退避；连续未见也换端点；超时文案不变。"""
+
+    def setUp(self):
+        fresh()
+
+    def _run(self, rpc_fn, run_id, timeout=0.8):
+        import urllib.error
+
+        A.STORE.mark_open(run_id)
+        orig = A._jsonrpc
+        saved = (A.RECEIPT_POLL_TIMEOUT_S, A.RECEIPT_POLL_INTERVAL_S, A.RECEIPT_POLL_BACKOFF_MAX_S, A.RECEIPT_ROTATE_AFTER_MISSES)
+        A.RECEIPT_POLL_TIMEOUT_S, A.RECEIPT_POLL_INTERVAL_S, A.RECEIPT_POLL_BACKOFF_MAX_S, A.RECEIPT_ROTATE_AFTER_MISSES = timeout, 0.02, 0.05, 3
+        A._jsonrpc = rpc_fn
+        try:
+            f = FakeFlow("web3.okx.com", "/priapi/v6/dx/trade/multi/broadcast", "POST",
+                         resp_body=json.dumps({"code": "0", "data": {"transactionHash": "0x" + "ab" * 32, "orderId": "o1"}}))
+            A.addons[0].request(f)
+            A.addons[0].response(f)
+            time.sleep(timeout + 0.4)
+        finally:
+            A._jsonrpc = orig
+            A.RECEIPT_POLL_TIMEOUT_S, A.RECEIPT_POLL_INTERVAL_S, A.RECEIPT_POLL_BACKOFF_MAX_S, A.RECEIPT_ROTATE_AFTER_MISSES = saved
+        return A.STORE.timeline(run_id)["legs"][0], urllib.error
+
+    def _ok(self):
+        return {"status": "0x1", "blockNumber": "0x10", "blockHash": "0x" + "cd" * 32, "transactionHash": "0x" + "ab" * 32}
+
+    def test_primary_error_rotates_to_fallback(self):
+        import urllib.error
+
+        calls = []
+
+        def rpc(url, m, p, timeout=10):
+            calls.append(url)
+            if url == A.CHAINS["bsc"]["rpc"]:
+                raise urllib.error.HTTPError(url, 429, "Too Many Requests", None, None)
+            return self._ok() if url == A.CHAINS["bsc"]["rpcFallbacks"][0] else None
+
+        leg, _ = self._run(rpc, "run-fb1")
+        self.assertIsNotNone(leg["hkL3Ms"], "备用端点拿到的回执必须落定")
+        self.assertIn(A.CHAINS["bsc"]["rpcFallbacks"][0], calls)
+        self.assertEqual(leg["evidence"]["receipt"]["rpc"], A.CHAINS["bsc"]["rpcFallbacks"][0], "回执记录实际端点")
+
+    def test_primary_misses_rotate_after_n(self):
+        calls = []
+
+        def rpc(url, m, p, timeout=10):
+            calls.append(url)
+            return self._ok() if url == A.CHAINS["bsc"]["rpcFallbacks"][0] else None
+
+        leg, _ = self._run(rpc, "run-fb2")
+        self.assertIsNotNone(leg["hkL3Ms"])
+        bsc = [u for u in calls if u in A._receipt_rpcs(A.CHAINS["bsc"])]
+        self.assertEqual(bsc[:3], [A.CHAINS["bsc"]["rpc"]] * 3, "连续 N 次未见后才换端点")
+        self.assertEqual(bsc[3], A.CHAINS["bsc"]["rpcFallbacks"][0])
+
+    def test_all_endpoints_fail_keeps_timeout_reason(self):
+        import io, contextlib, urllib.error
+
+        def rpc(url, m, p, timeout=10):
+            raise urllib.error.URLError("down")
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            leg, _ = self._run(rpc, "run-fb3", timeout=0.4)
+        self.assertIsNone(leg["hkL3Ms"])
+        self.assertEqual(leg["incomplete"], "receipt poll timeout")
+        self.assertIn("errors=", err.getvalue())
+
+
 class TestR24ReceiptIdentity(unittest.TestCase):
     def setUp(self):
         fresh()
