@@ -164,21 +164,25 @@ CHAINS = {
     "bsc": {
         "family": "evm",
         "rpc": "https://bsc-dataseed1.binance.org",
+        "rpcFallbacks": ["https://bsc-rpc.publicnode.com", "https://rpc-bsc.48.club", "https://bsc-dataseed.bnbchain.org"],
         "chainIds": {56, "56", "0x38"},
     },
     "robinhood": {
         "family": "evm",
         "rpc": "https://rpc.mainnet.chain.robinhood.com",
+        "rpcFallbacks": ["https://robinhood-rpc.publicnode.com", "https://robinhood.api.pocket.network", "https://robinhood.rpc.blxrbdn.com"],
         "chainIds": {4663, "4663", "0x1237"},
     },
     "solana": {
         "family": "solana",
         "rpc": "https://api.mainnet-beta.solana.com",
+        "rpcFallbacks": ["https://solana.publicnode.com", "https://solana-rpc.publicnode.com"],
         "chainIds": set(),
     },
     "arc": {
         "family": "evm",
         "rpc": "https://rpc.mainnet.arc.io",
+        "rpcFallbacks": ["https://rpc.arc-scan.org", "https://rpc.blockdaemon.mainnet.arc.io"],
         "chainIds": {5042, "5042", "0x13b2"},
     },
 }
@@ -198,6 +202,16 @@ CHAIN_NAME_STR = {
 
 RECEIPT_POLL_INTERVAL_S = 0.8
 RECEIPT_POLL_TIMEOUT_S = 90.0
+# 2026-10-06：公共 RPC 偶发拿不到（2026-10 Solana ~5% 腿 no-receipt-observed，speedex 439oj r4/r5
+# 47s 无回执；异常曾被静默吞掉）。出错即换下一个端点（rpc + rpcFallbacks 轮转，与 speedex
+# configs/chains 对齐）并指数退避（≤ RECEIPT_POLL_BACKOFF_MAX_S）；同一端点连续
+# RECEIPT_ROTATE_AFTER_MISSES 次「未见」也换端点（节点滞后）。超时原因文案不变，错误计数进 stderr。
+RECEIPT_POLL_BACKOFF_MAX_S = 3.2
+RECEIPT_ROTATE_AFTER_MISSES = 6
+
+
+def _receipt_rpcs(spec):
+    return [spec["rpc"]] + [u for u in spec.get("rpcFallbacks", []) if u != spec["rpc"]]
 MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流量误入 + 内存有界）
 
 # build manifest（/health 透出；install.sh 锁 mitmproxy 版本；观测语义变化即升版本）。
@@ -215,7 +229,7 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # 槽位必须衔接已接受头、同高异父=分叉；不连续即清空重锚，与 EVM hash/parentHash
 # 冲突清空同律；样本保留 parent 字段）。修订经过见 git 历史；行为由
 # deploy/hk-proxy/test_speedex_hk_timing.py 与 tests/hk-timing*.test.mjs 钉住。
-ADDON_VERSION = "2026.10.03-fullnode-tx-probe-v10.3"
+ADDON_VERSION = "2026.10.06-receipt-rpc-fallback-v10.4"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -3669,12 +3683,17 @@ def _poll_receipt(run_id, leg_ref, chain, tx_hash, jsonrpc=None):
         return
     t0 = time.monotonic()
     deadline = t0 + RECEIPT_POLL_TIMEOUT_S
+    state = {c: {"rpcs": _receipt_rpcs(CHAINS[c]), "idx": 0, "misses": 0} for c in candidates}
+    errors, consecutive_errors, last_error = 0, 0, None
     while time.monotonic() < deadline:
+        round_error = False
         for cand in candidates:
             spec = CHAINS[cand]
+            st = state[cand]
+            url = st["rpcs"][st["idx"] % len(st["rpcs"])]
             try:
                 if spec["family"] == "evm":
-                    r = _rpc(spec["rpc"], "eth_getTransactionReceipt", [tx_hash])
+                    r = _rpc(url, "eth_getTransactionReceipt", [tx_hash])
                     if (
                         r
                         and str(r.get("transactionHash") or "").lower()
@@ -3692,7 +3711,7 @@ def _poll_receipt(run_id, leg_ref, chain, tx_hash, jsonrpc=None):
                         _settle_receipt(
                             leg_ref,
                             {
-                                "rpc": spec["rpc"],
+                                "rpc": url,
                                 "chain": cand,
                                 "pollIntervalMs": int(RECEIPT_POLL_INTERVAL_S * 1000),
                                 "status": 1,
@@ -3710,7 +3729,7 @@ def _poll_receipt(run_id, leg_ref, chain, tx_hash, jsonrpc=None):
                         return
                 else:
                     r = _rpc(
-                        spec["rpc"],
+                        url,
                         "getSignatureStatuses",
                         [[tx_hash], {"searchTransactionHistory": True}],
                     )
@@ -3730,7 +3749,7 @@ def _poll_receipt(run_id, leg_ref, chain, tx_hash, jsonrpc=None):
                         _settle_receipt(
                             leg_ref,
                             {
-                                "rpc": spec["rpc"],
+                                "rpc": url,
                                 "chain": cand,
                                 "pollIntervalMs": int(RECEIPT_POLL_INTERVAL_S * 1000),
                                 "status": 1,
@@ -3741,11 +3760,26 @@ def _poll_receipt(run_id, leg_ref, chain, tx_hash, jsonrpc=None):
                     if st0 and st0.get("err") is not None:
                         _settle_incomplete(leg_ref, "signature err")
                         return
-            except Exception:
-                pass
+                # 本端点本轮「未见」——连续 N 次换端点（节点滞后/索引延迟）
+                st["misses"] += 1
+                if st["misses"] >= RECEIPT_ROTATE_AFTER_MISSES:
+                    st["idx"] += 1
+                    st["misses"] = 0
+            except Exception as e:
+                errors += 1
+                round_error = True
+                last_error = type(e).__name__ + (f" {e.code}" if hasattr(e, "code") else "")
+                st["idx"] += 1  # 出错即换下一个端点
+                st["misses"] = 0
             if time.monotonic() >= deadline:
                 break
-        time.sleep(RECEIPT_POLL_INTERVAL_S)
+        consecutive_errors = consecutive_errors + 1 if round_error else 0
+        time.sleep(min(RECEIPT_POLL_INTERVAL_S * (2 ** consecutive_errors), RECEIPT_POLL_BACKOFF_MAX_S))
+    if errors:
+        print(
+            f"[speedex_hk_timing] receipt poll timeout chain={','.join(candidates)} errors={errors} last={last_error}",
+            file=sys.stderr,
+        )
     _settle_incomplete(leg_ref, "receipt poll timeout")
 
 
