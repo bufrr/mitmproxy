@@ -6752,6 +6752,30 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertEqual(d["backoffMs"]["robinhood"], 0)
         self.assertEqual(d["pollFail"], {})
 
+    def test_backoff_resets_when_poll_skipped_for_fresh_ws(self):
+        """Kimi v10.5 审查：失败后若因 WS 头新鲜而跳过轮询（未发请求），退避清零，
+        WS 再断时首轮按链节拍而非旧退避。"""
+        seq = [(False, 429), (False, 429), (None, None), (None, None)]
+        c = A.ChainHeadWindow(rpc_call=lambda *a, **k: None, connect=None)
+        c.run_id = "skip"
+        seen = []
+
+        def fake_once(chain):
+            r = seq.pop(0) if seq else (None, None)
+            with c.lock:
+                seen.append(c.diag["backoffMs"].get(chain, 0))
+            if not seq:
+                c.stop.set()
+            return r
+
+        c._poll_once = fake_once
+        waits = []
+        c.stop.wait = lambda w=None: waits.append(w) or c.stop.is_set()
+        c._poll("robinhood")
+        self.assertGreaterEqual(waits[1], 1.0, "连续 429 时退避")
+        self.assertLessEqual(waits[2], 0.2 + 1e-9, "跳过后退避清零，恢复 200ms 节拍")
+        self.assertEqual(c.diag_snapshot()["backoffMs"]["robinhood"], 0)
+
     def test_backoff_on_429_and_errors(self):
         self.assertEqual(A._head_poll_delay_s("robinhood", 0), 0.2)
         self.assertEqual(A._head_poll_delay_s("robinhood", 1), 0.4)

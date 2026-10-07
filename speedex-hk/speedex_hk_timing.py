@@ -1876,7 +1876,9 @@ class ChainHeadWindow:
             ok, status = self._poll_once(chain)
             if ok is False:
                 fails += 1
-            elif ok is True:
+            else:
+                # 成功或因 WS 头新鲜而跳过（未发请求、无限速压力）均清零退避——否则 WS 恢复后
+                # 再断时首轮轮询会被旧退避拖到 ≤5s，样本龄可能越过 EU 2000ms 门（Kimi v10.5 审查）。
                 fails = 0
             delay = _head_poll_delay_s(chain, fails, status)
             with self.lock:
