@@ -229,7 +229,9 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # 槽位必须衔接已接受头、同高异父=分叉；不连续即清空重锚，与 EVM hash/parentHash
 # 冲突清空同律；样本保留 parent 字段）。修订经过见 git 历史；行为由
 # deploy/hk-proxy/test_speedex_hk_timing.py 与 tests/hk-timing*.test.mjs 钉住。
-ADDON_VERSION = "2026.10.06-receipt-rpc-fallback-v10.4"
+# v10.5（2026-10-07）：链头轮询按链节拍（RH/Arc 200ms、BSC/Sol 500ms，快照 intervalMs 按链
+# 如实）、429/错误退避、WS newHeads 主端点失败后试已知 WSS fallback、/health.diag.headWs 可见。
+ADDON_VERSION = "2026.10.07-head-poll-200ms-v10.5"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -1470,6 +1472,102 @@ def _jsonrpc(url, method, params, timeout=10):
         return json.loads(r.read().decode()).get("result")
 
 
+class RpcHttpError(RuntimeError):
+    """非 200 HTTP 应答（保留 status 供链头轮询识别 429 退避）；文案同旧版 `rpc http N`。"""
+
+    def __init__(self, status):
+        super().__init__(f"rpc http {status}")
+        self.status = status
+
+
+def _http_status(exc):
+    """异常携带的 HTTP 状态码（RpcHttpError.status / urllib HTTPError.code）；无则 None。"""
+    for attr in ("status", "code"):
+        v = getattr(exc, attr, None)
+        if type(v) is int:
+            return v
+    return None
+
+
+# ── 链头采样节拍（2026-10-07 v10.5，batch 1791324021620-3y0e1 审计）──
+# EVM 链头 WS newHeads 在主 RPC 静默失败 → 实际全靠 500ms 轮询，样本龄达 ~670ms；
+# Robinhood 出块 ~45–100ms，t+N 被抬高至多 ~10 块。轮询改为按链节拍（固定频率，扣除
+# 本轮 rtt），RH/Arc 200ms、BSC 保持 500ms；快照 intervalMs 按链如实上报。
+# 5 req/s/chain 公共 RPC 限额：200ms 恰为上限，出错/429 指数退避（429 起步更高）。
+HEAD_POLL_INTERVAL_S = {"bsc": 0.5, "robinhood": 0.2, "arc": 0.2, "solana": 0.5}
+HEAD_POLL_DEFAULT_INTERVAL_S = 0.5
+HEAD_POLL_BACKOFF_MAX_S = 5.0
+HEAD_POLL_429_FLOOR_S = 1.0
+# WS newHeads 端点：主 RPC 先试，再试 rpcFallbacks 中「同 host/path 已知说 WSS」的提供方
+# （数据驱动、保守：只认下列 host 后缀；其余 HTTP-only 端点不臆造 wss）。端点混用安全——
+# add() 的 hash/parentHash（Solana parent slot）连续性检查跨端点同样生效。
+HEAD_WS_PROVIDER_SUFFIXES = ("publicnode.com", "blxrbdn.com")
+HEAD_WS_RETRY_S = 0.5  # 同一轮内换下一个端点前的间隔
+HEAD_WS_CYCLE_BACKOFF_S = (2.0, 30.0)  # 整轮端点都失败后的退避（起步, 上限）
+HEAD_WS_STALL_S = 10.0  # 已订阅却无通知超过此值 → 视为失效换端点
+
+
+def _head_poll_interval_s(chain):
+    return HEAD_POLL_INTERVAL_S.get(chain, HEAD_POLL_DEFAULT_INTERVAL_S)
+
+
+def _head_poll_delay_s(chain, fails, status=None):
+    """下一轮轮询前的等待：无失败 = 节拍；连续失败 = 节拍×2^n（429 起步 ≥1s），封顶。"""
+    base = _head_poll_interval_s(chain)
+    if fails <= 0:
+        return base
+    delay = base * (2 ** min(fails, 8))
+    if status == 429:
+        delay = max(delay, HEAD_POLL_429_FLOOR_S * (2 ** min(fails - 1, 8)))
+    return min(delay, HEAD_POLL_BACKOFF_MAX_S)
+
+
+def _ws_url(http_url):
+    if http_url.startswith("https://"):
+        return "wss://" + http_url[len("https://"):]
+    if http_url.startswith("http://"):
+        return "ws://" + http_url[len("http://"):]
+    return None
+
+
+def _host_of(url):
+    from urllib.parse import urlsplit
+
+    try:
+        return urlsplit(url).hostname or "?"
+    except Exception:
+        return "?"
+
+
+def _head_ws_urls(chain):
+    """主 RPC 的 ws 形（旧行为）+ 已知 WSS 提供方的 fallback；去重、保序。"""
+    spec = CHAINS[chain]
+    out = []
+    primary = _ws_url(spec["rpc"])
+    if primary:
+        out.append(primary)
+    for u in spec.get("rpcFallbacks", []):
+        host = _host_of(u)
+        if not any(
+            host == sfx or host.endswith("." + sfx) for sfx in HEAD_WS_PROVIDER_SUFFIXES
+        ):
+            continue
+        w = _ws_url(u)
+        if w and w not in out:
+            out.append(w)
+    return out
+
+
+def _ws_err_class(exc):
+    """有界、无 secret 的错误摘要：异常类名 + 可得的 HTTP 状态码（不带消息体/头）。"""
+    name = type(exc).__name__
+    status = _http_status(exc)
+    if status is None:
+        resp = getattr(exc, "response", None)
+        status = getattr(resp, "status_code", None) if resp is not None else None
+    return f"{name}:{status}" if type(status) is int else name
+
+
 class KeepAliveJsonRpc:
     """Keep-alive JSON-RPC client for the head poller.
 
@@ -1510,8 +1608,11 @@ class KeepAliveJsonRpc:
                 r = self._conn.getresponse()
                 data = r.read()
                 if r.status != 200:
-                    raise RuntimeError(f"rpc http {r.status}")
+                    raise RpcHttpError(r.status)
                 return json.loads(data.decode()).get("result")
+            except RpcHttpError:
+                # HTTP 层拒绝（含 429）不立即重试——重试只会加倍打限流端点；由调用方退避
+                raise
             except Exception:
                 try:
                     if self._conn is not None:
@@ -1549,6 +1650,19 @@ class ChainHeadWindow:
             "pollOk": defaultdict(int),
             "pollFail": defaultdict(int),
             "lastErr": {},
+            # v10.5：节拍/退避/限流可观测
+            "intervalMs": {},
+            "backoffMs": {},
+            "rateLimited": defaultdict(int),
+        }
+        # v10.5：WS newHeads 可观测（原先失败静默吞掉）。只记 host + 异常类名/状态码，
+        # 计数有界（每链固定键），无 URL query/消息体/头。
+        self.ws_diag = {
+            "attempts": defaultdict(int),
+            "subscribed": defaultdict(int),
+            "fail": defaultdict(int),
+            "lastErr": {},
+            "active": {},
         }
 
     def diag_snapshot(self):
@@ -1557,7 +1671,26 @@ class ChainHeadWindow:
                 "pollOk": dict(self.diag["pollOk"]),
                 "pollFail": dict(self.diag["pollFail"]),
                 "lastErr": dict(self.diag["lastErr"]),
+                "intervalMs": dict(self.diag["intervalMs"]),
+                "backoffMs": dict(self.diag["backoffMs"]),
+                "rateLimited": dict(self.diag["rateLimited"]),
             }
+
+    def ws_diag_snapshot(self):
+        with self.lock:
+            return {
+                "attempts": dict(self.ws_diag["attempts"]),
+                "subscribed": dict(self.ws_diag["subscribed"]),
+                "fail": dict(self.ws_diag["fail"]),
+                "lastErr": dict(self.ws_diag["lastErr"]),
+                "active": dict(self.ws_diag["active"]),
+            }
+
+    def _ws_fail(self, chain, host, reason):
+        with self.lock:
+            self.ws_diag["fail"][chain] += 1
+            self.ws_diag["lastErr"][chain] = f"{host}: {reason}"[:120]
+            self.ws_diag["active"][chain] = None
 
     def _poll_call(self, chain, method, params):
         """单次轮询调用：默认走 keep-alive 客户端；测试注入 rpc_call 时走注入。"""
@@ -1685,7 +1818,7 @@ class ChainHeadWindow:
                     "commitment": "processed" if chain == "solana" else "latest",
                     "anchorTs": at,
                     "clockErrorMs": 0,
-                    "intervalMs": 500,
+                    "intervalMs": int(round(_head_poll_interval_s(chain) * 1000)),
                     "maxAgeMs": 2000,
                 }
                 if sample:
@@ -1700,92 +1833,164 @@ class ChainHeadWindow:
                     out[chain] = {**base, "status": "no-pre-anchor-head"}
             return out
 
-    def _poll(self, chain):
-        cfg = CHAINS[chain]
-        while not self.stop.is_set():
+    def _poll_once(self, chain):
+        """一轮轮询（ws-head 新鲜时跳过）。返回 (ok, http_status)；ok=None 表示跳过。"""
+        with self.lock:
+            buf = self.samples[chain]
+            fresh = bool(
+                buf
+                and buf[-1]["source"] == "ws-head"
+                and self.clock() - buf[-1]["observedTs"] < 1000
+            )
+        if fresh:
+            return None, None
+        sent = self.clock()
+        try:
+            sol = chain == "solana"
+            result = self._poll_call(
+                chain,
+                "getSlot" if sol else "eth_getBlockByNumber",
+                [{"commitment": "processed"}] if sol else ["latest", False],
+            )
+            self.add(chain, result, "rpc-poll", sent)
             with self.lock:
-                buf = self.samples[chain]
-                fresh = bool(
-                    buf
-                    and buf[-1]["source"] == "ws-head"
-                    and self.clock() - buf[-1]["observedTs"] < 1000
+                self.diag["pollOk"][chain] += 1
+            return True, None
+        except Exception as e:
+            status = _http_status(e)
+            with self.lock:
+                self.diag["pollFail"][chain] += 1
+                if status == 429:
+                    self.diag["rateLimited"][chain] += 1
+                self.diag["lastErr"][chain] = f"{type(e).__name__}: {str(e)[:80]}"
+            return False, status
+
+    def _poll(self, chain):
+        interval = _head_poll_interval_s(chain)
+        with self.lock:
+            self.diag["intervalMs"][chain] = int(round(interval * 1000))
+            self.diag["backoffMs"][chain] = 0
+        fails = 0
+        while not self.stop.is_set():
+            began = time.monotonic()
+            ok, status = self._poll_once(chain)
+            if ok is False:
+                fails += 1
+            elif ok is True:
+                fails = 0
+            delay = _head_poll_delay_s(chain, fails, status)
+            with self.lock:
+                self.diag["backoffMs"][chain] = (
+                    int(round(delay * 1000)) if fails else 0
                 )
-            if not fresh:
-                sent = self.clock()
-                try:
-                    sol = chain == "solana"
-                    result = self._poll_call(
-                        chain,
-                        "getSlot" if sol else "eth_getBlockByNumber",
-                        [{"commitment": "processed"}] if sol else ["latest", False],
-                    )
-                    self.add(chain, result, "rpc-poll", sent)
-                    with self.lock:
-                        self.diag["pollOk"][chain] += 1
-                except Exception as e:
-                    with self.lock:
-                        self.diag["pollFail"][chain] += 1
-                        self.diag["lastErr"][chain] = (
-                            f"{type(e).__name__}: {str(e)[:80]}"
-                        )
-            self.stop.wait(0.5)
+            # 固定频率：节拍扣除本轮耗时（rtt 超节拍则立即下一轮——串行，速率 ≤ 1/rtt）；
+            # 退避期不扣除，完整等待。
+            wait = max(0.0, delay - (time.monotonic() - began)) if not fails else delay
+            self.stop.wait(wait)
 
     def _ws(self, chain):
         if self.connect is None:
             return
-        url = (
-            CHAINS[chain]["rpc"]
-            .replace("https://", "wss://")
-            .replace("http://", "ws://")
-        )
-        sol = chain == "solana"
+        urls = _head_ws_urls(chain)
+        if not urls:
+            return
+        idx = 0
+        cycle_fails = 0
         while not self.stop.is_set():
-            try:
-                with self.connect(url, open_timeout=2, close_timeout=1) as ws:
-                    with self.lock:
-                        self.sockets.append(ws)
-                    try:
-                        ws.send(
-                            json.dumps(
-                                {
-                                    "jsonrpc": "2.0",
-                                    "id": 1,
-                                    "method": "slotSubscribe"
-                                    if sol
-                                    else "eth_subscribe",
-                                    "params": [] if sol else ["newHeads"],
-                                }
-                            )
+            url = urls[idx]
+            host = _host_of(url)
+            got_frame = self._ws_session(chain, url, host)
+            if self.stop.is_set():
+                break
+            if got_frame:
+                # 曾正常出头后断开：从主端点重新开始，退避清零
+                idx, cycle_fails = 0, 0
+                self.stop.wait(HEAD_WS_RETRY_S)
+                continue
+            idx = (idx + 1) % len(urls)
+            if idx == 0:
+                cycle_fails += 1
+                lo, hi = HEAD_WS_CYCLE_BACKOFF_S
+                self.stop.wait(min(hi, lo * (2 ** min(cycle_fails - 1, 8))))
+            else:
+                self.stop.wait(HEAD_WS_RETRY_S)
+
+    def _ws_session(self, chain, url, host):
+        """单个端点的一次订阅会话。返回是否收到过有效通知；失败/静默一律记 headWs 诊断。"""
+        sol = chain == "solana"
+        got_frame = False
+        with self.lock:
+            self.ws_diag["attempts"][chain] += 1
+        try:
+            with self.connect(url, open_timeout=2, close_timeout=1) as ws:
+                with self.lock:
+                    self.sockets.append(ws)
+                try:
+                    ws.send(
+                        json.dumps(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "method": "slotSubscribe" if sol else "eth_subscribe",
+                                "params": [] if sol else ["newHeads"],
+                            }
                         )
-                        subscription = None
-                        while not self.stop.is_set():
-                            try:
-                                msg = json.loads(ws.recv(timeout=1))
-                            except TimeoutError:
-                                continue
-                            if msg.get("id") == 1:
-                                if msg.get("error"):
-                                    break
-                                subscription = msg.get("result")
-                            elif (
-                                subscription is not None
-                                and msg.get("params", {}).get("subscription")
-                                == subscription
-                                and msg.get("method")
-                                == ("slotNotification" if sol else "eth_subscription")
-                            ):
-                                self.add(chain, msg["params"]["result"], "ws-head")
-                    finally:
-                        with self.lock:
+                    )
+                    subscription = None
+                    last_progress = time.monotonic()
+                    reason = None
+                    while not self.stop.is_set():
+                        if time.monotonic() - last_progress > HEAD_WS_STALL_S:
+                            reason = "stall" if subscription is not None else "no-subscribe-ack"
+                            break
+                        try:
+                            msg = json.loads(ws.recv(timeout=1))
+                        except TimeoutError:
+                            continue
+                        if not isinstance(msg, dict):
+                            continue
+                        if msg.get("id") == 1:
+                            if msg.get("error"):
+                                err = msg.get("error")
+                                code = err.get("code") if isinstance(err, dict) else None
+                                reason = (
+                                    f"subscribe-error:{code}"
+                                    if type(code) is int
+                                    else "subscribe-error"
+                                )
+                                break
+                            subscription = msg.get("result")
+                            last_progress = time.monotonic()
+                            with self.lock:
+                                self.ws_diag["subscribed"][chain] += 1
+                                self.ws_diag["active"][chain] = host
+                        elif (
+                            subscription is not None
+                            and (msg.get("params") or {}).get("subscription")
+                            == subscription
+                            and msg.get("method")
+                            == ("slotNotification" if sol else "eth_subscription")
+                        ):
+                            self.add(chain, msg["params"]["result"], "ws-head")
+                            got_frame = True
+                            last_progress = time.monotonic()
+                    if reason is None and not self.stop.is_set():
+                        reason = "closed"
+                    if reason is not None:
+                        self._ws_fail(chain, host, reason)
+                finally:
+                    with self.lock:
+                        if ws in self.sockets:
                             self.sockets.remove(ws)
-                            if (
-                                self.samples[chain]
-                                and self.samples[chain][-1]["source"] == "ws-head"
-                            ):
-                                self.samples[chain].clear()
-            except Exception:
-                pass
-            self.stop.wait(2)
+                        if (
+                            self.samples.get(chain)
+                            and self.samples[chain][-1]["source"] == "ws-head"
+                        ):
+                            self.samples[chain].clear()
+        except Exception as e:
+            if not self.stop.is_set():
+                self._ws_fail(chain, host, _ws_err_class(e))
+        return got_frame
 
 
 HEADS = ChainHeadWindow()
@@ -4610,6 +4815,7 @@ class _Ctrl(BaseHTTPRequestHandler):
                 "diag": {
                     **diag,
                     "headPoll": HEADS.diag_snapshot(),
+                    "headWs": HEADS.ws_diag_snapshot(),
                 },  # 关窗后拒绝的下单请求计数等诊断 + 链头轮询可观测（head-v4）
                 # build manifest
                 "addonVersion": ADDON_VERSION,

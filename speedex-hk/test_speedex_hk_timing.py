@@ -14,11 +14,13 @@ import os
 import re
 import sys
 import time
+import threading
 import types
 import unittest
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from unittest.mock import patch
 
 _REAL_HTTP_SERVER = http.server.ThreadingHTTPServer
 _TEST_SERVERS = {}
@@ -6686,6 +6688,327 @@ class TestChainHeadFreshnessAtAnchors(unittest.TestCase):
             c2.close()
         finally:
             c.close()
+
+
+class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
+    """v10.5（2026-10-07，batch 1791324021620-3y0e1 审计）：按链轮询节拍（RH/Arc 200ms、
+    BSC 500ms）且快照/health 如实上报 intervalMs；WS newHeads 主端点失败后按序试
+    已知 WSS 的 fallback；WS 失败可见（headWs 诊断，无 secret）；429/错误退避。全程零网络。"""
+
+    def _evm_rpc(self):
+        chain = {"h": 100, "hash": "0x" + "aa" * 32}
+
+        def rpc(url, method, params, timeout=None):
+            chain["h"] += 1
+            parent = chain["hash"]
+            chain["hash"] = "0x" + f"{chain['h']:064x}"[-64:]
+            return {"number": hex(chain["h"]), "hash": chain["hash"], "parentHash": parent}
+
+        return rpc
+
+    def test_per_chain_cadence_and_snapshot_interval_metadata(self):
+        from collections import deque
+
+        self.assertEqual(A._head_poll_interval_s("robinhood"), 0.2)
+        self.assertEqual(A._head_poll_interval_s("arc"), 0.2)
+        self.assertEqual(A._head_poll_interval_s("bsc"), 0.5)
+        self.assertEqual(A._head_poll_interval_s("unknown-chain"), 0.5)
+        c = A.ChainHeadWindow(rpc_call=self._evm_rpc(), connect=None, clock=lambda: 1000)
+        c.run_id = "cadence"
+        c.samples = {k: deque(maxlen=512) for k in ("robinhood", "arc", "bsc", "solana")}
+        try:
+            snap = c.snapshot("cadence", 1100)
+            self.assertEqual(snap["robinhood"]["intervalMs"], 200)
+            self.assertEqual(snap["arc"]["intervalMs"], 200)
+            self.assertEqual(snap["bsc"]["intervalMs"], 500)
+            self.assertEqual(snap["solana"]["intervalMs"], 500)
+            self.assertEqual(snap["robinhood"]["status"], "no-pre-anchor-head", "其余语义不变")
+        finally:
+            c.close()
+
+    def test_poll_loop_runs_at_chain_cadence_and_reports_health(self):
+        calls = []
+        rpc = self._evm_rpc()
+
+        def counting(url, method, params, timeout=None):
+            calls.append(time.monotonic())
+            return rpc(url, method, params, timeout)
+
+        c = A.ChainHeadWindow(rpc_call=counting, connect=None)
+        c.run_id = "loop"
+        from collections import deque
+
+        c.samples = {"robinhood": deque(maxlen=512)}
+        t = threading.Thread(target=c._poll, args=("robinhood",), daemon=True)
+        t.start()
+        time.sleep(1.05)
+        c.stop.set()
+        t.join(timeout=2)
+        n = len(calls)
+        self.assertGreaterEqual(n, 4, f"200ms 节拍 1s 内应 ≥4 次（实得 {n}）")
+        self.assertLessEqual(n, 7, f"不超过 ~5 req/s（实得 {n}）")
+        d = c.diag_snapshot()
+        self.assertEqual(d["intervalMs"]["robinhood"], 200)
+        self.assertEqual(d["backoffMs"]["robinhood"], 0)
+        self.assertEqual(d["pollFail"], {})
+
+    def test_backoff_on_429_and_errors(self):
+        self.assertEqual(A._head_poll_delay_s("robinhood", 0), 0.2)
+        self.assertEqual(A._head_poll_delay_s("robinhood", 1), 0.4)
+        self.assertEqual(A._head_poll_delay_s("robinhood", 2), 0.8)
+        self.assertGreaterEqual(A._head_poll_delay_s("robinhood", 1, 429), 1.0, "429 起步 ≥1s")
+        self.assertGreater(
+            A._head_poll_delay_s("robinhood", 2, 429), A._head_poll_delay_s("robinhood", 1, 429)
+        )
+        for n in (6, 20, 100):
+            self.assertLessEqual(A._head_poll_delay_s("bsc", n, 429), A.HEAD_POLL_BACKOFF_MAX_S)
+        # 轮询一轮：429 计 rateLimited，并给出退避延迟
+        from collections import deque
+
+        def limited(url, method, params, timeout=None):
+            raise A.RpcHttpError(429)
+
+        c = A.ChainHeadWindow(rpc_call=limited, connect=None, clock=lambda: 1000)
+        c.run_id = "rl"
+        c.samples = {"arc": deque(maxlen=512)}
+        try:
+            ok, status = c._poll_once("arc")
+            self.assertIs(ok, False)
+            self.assertEqual(status, 429)
+            d = c.diag_snapshot()
+            self.assertEqual(d["rateLimited"]["arc"], 1)
+            self.assertEqual(d["pollFail"]["arc"], 1)
+            self.assertIn("rpc http 429", d["lastErr"]["arc"], "旧文案保留")
+        finally:
+            c.close()
+        # 真实轮询循环：持续 429 时 1s 内调用次数受退避约束（不打满 5 req/s）
+        hits = []
+
+        def limited2(url, method, params, timeout=None):
+            hits.append(1)
+            raise A.RpcHttpError(429)
+
+        c2 = A.ChainHeadWindow(rpc_call=limited2, connect=None)
+        c2.run_id = "rl2"
+        c2.samples = {"robinhood": deque(maxlen=512)}
+        t = threading.Thread(target=c2._poll, args=("robinhood",), daemon=True)
+        t.start()
+        time.sleep(1.2)
+        snap = c2.diag_snapshot()
+        c2.stop.set()
+        t.join(timeout=6)
+        self.assertLessEqual(len(hits), 2, f"429 退避：1.2s 内 ≤2 次（实得 {len(hits)}）")
+        self.assertGreaterEqual(snap["backoffMs"]["robinhood"], 1000)
+
+    def test_keepalive_does_not_retry_http_429(self):
+        calls = []
+
+        class C:
+            def request(self, *a, **k):
+                calls.append(1)
+
+            def getresponse(self):
+                class R:
+                    status = 429
+
+                    def read(self):
+                        return b"{}"
+
+                return R()
+
+            def close(self):
+                pass
+
+        ka = A.KeepAliveJsonRpc("https://rpc.example/")
+        ka._connect = lambda: setattr(ka, "_conn", C())
+        with self.assertRaises(A.RpcHttpError) as cm:
+            ka("eth_getBlockByNumber", ["latest", False])
+        self.assertEqual(cm.exception.status, 429)
+        self.assertEqual(len(calls), 1, "HTTP 拒绝不立即重试（不加倍打限流端点）")
+
+    def test_ws_url_order_is_primary_then_known_wss_fallbacks(self):
+        rh = A._head_ws_urls("robinhood")
+        self.assertEqual(rh[0], "wss://rpc.mainnet.chain.robinhood.com", "主端点先试（旧行为）")
+        self.assertEqual(
+            rh[1:],
+            ["wss://robinhood-rpc.publicnode.com", "wss://robinhood.rpc.blxrbdn.com"],
+            "只派生已知 WSS 提供方；pocket.network 不臆造 wss",
+        )
+        bsc = A._head_ws_urls("bsc")
+        self.assertEqual(bsc, ["wss://bsc-dataseed1.binance.org", "wss://bsc-rpc.publicnode.com"])
+        self.assertEqual(A._head_ws_urls("arc"), ["wss://rpc.mainnet.arc.io"], "arc 无已知 WSS fallback")
+        for u in rh + bsc:
+            self.assertTrue(u.startswith("wss://"))
+        # 点边界：同后缀异主机不误判
+        orig = A.CHAINS["robinhood"]["rpcFallbacks"]
+        try:
+            A.CHAINS["robinhood"]["rpcFallbacks"] = ["https://evilpublicnode.com", "https://x.publicnode.com"]
+            self.assertEqual(
+                A._head_ws_urls("robinhood")[1:], ["wss://x.publicnode.com"]
+            )
+        finally:
+            A.CHAINS["robinhood"]["rpcFallbacks"] = orig
+
+    def test_ws_failure_diag_and_fallback_attempt_order(self):
+        from collections import deque
+
+        tried = []
+        head = {"h": 0x64, "hash": "0x" + "aa" * 32}
+
+        class InvalidStatus(Exception):
+            def __init__(self, code):
+                super().__init__(f"server rejected WebSocket connection: HTTP {code}")
+
+                class Resp:
+                    status_code = code
+
+                self.response = Resp()
+
+        class FakeWS:
+            def __init__(self, owner):
+                self.owner = owner
+                self.queue = [json.dumps({"jsonrpc": "2.0", "id": 1, "result": "0xsub"})]
+                for i in range(3):
+                    head["h"] += 1
+                    parent = head["hash"]
+                    head["hash"] = "0x" + f"{head['h']:064x}"[-64:]
+                    self.queue.append(json.dumps({
+                        "jsonrpc": "2.0", "method": "eth_subscription",
+                        "params": {"subscription": "0xsub", "result": {
+                            "number": hex(head["h"]), "hash": head["hash"], "parentHash": parent}},
+                    }))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def send(self, data):
+                sub = json.loads(data)
+                assert sub["method"] == "eth_subscribe" and sub["params"] == ["newHeads"]
+
+            def recv(self, timeout=None):
+                if self.queue:
+                    return self.queue.pop(0)
+                self.owner.stop.set()
+                raise TimeoutError()
+
+            def close(self):
+                pass
+
+        holder = {}
+
+        def connect(url, **kw):
+            tried.append(url)
+            if "chain.robinhood.com" in url:
+                raise InvalidStatus(403)
+            if "publicnode" in url:
+                raise ConnectionRefusedError("refused")
+            return FakeWS(holder["c"])
+
+        c = A.ChainHeadWindow(rpc_call=lambda *a, **k: None, connect=connect)
+        holder["c"] = c
+        c.run_id = "wsfb"
+        c.samples = {"robinhood": deque(maxlen=512)}
+        with patch.object(A, "HEAD_WS_RETRY_S", 0.01):
+            t = threading.Thread(target=c._ws, args=("robinhood",), daemon=True)
+            t.start()
+            t.join(timeout=5)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(
+            tried,
+            [
+                "wss://rpc.mainnet.chain.robinhood.com",
+                "wss://robinhood-rpc.publicnode.com",
+                "wss://robinhood.rpc.blxrbdn.com",
+            ],
+            "主端点 → publicnode → blxrbdn 顺序",
+        )
+        d = c.ws_diag_snapshot()
+        self.assertEqual(d["attempts"]["robinhood"], 3)
+        self.assertEqual(d["fail"]["robinhood"], 2, "两次失败均可见（不再静默）")
+        self.assertEqual(d["subscribed"]["robinhood"], 1)
+        self.assertEqual(d["active"]["robinhood"], "robinhood.rpc.blxrbdn.com")
+        self.assertEqual(
+            d["lastErr"]["robinhood"], "robinhood-rpc.publicnode.com: ConnectionRefusedError"
+        )
+        blob = json.dumps(d)
+        self.assertNotIn("wss://", blob, "诊断只记 host，不记 URL")
+        self.assertNotIn("refused", blob, "不记异常消息体")
+
+    def test_ws_primary_403_diag_class_and_status(self):
+        from collections import deque
+
+        class InvalidStatus(Exception):
+            pass
+
+        e = InvalidStatus("HTTP 403 body token=secret")
+
+        class Resp:
+            status_code = 403
+
+        e.response = Resp()
+        self.assertEqual(A._ws_err_class(e), "InvalidStatus:403")
+        c = A.ChainHeadWindow(rpc_call=lambda *a, **k: None, connect=None)
+        c.samples = {"arc": deque(maxlen=512)}
+        c._ws_fail("arc", "rpc.mainnet.arc.io", A._ws_err_class(e))
+        snap = c.ws_diag_snapshot()
+        self.assertEqual(snap["lastErr"]["arc"], "rpc.mainnet.arc.io: InvalidStatus:403")
+        self.assertNotIn("secret", json.dumps(snap))
+        self.assertIsNone(snap["active"]["arc"])
+
+    def test_ws_subscribe_error_rotates_with_diag(self):
+        from collections import deque
+
+        tried = []
+
+        class ErrWS:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def send(self, data):
+                pass
+
+            def recv(self, timeout=None):
+                return json.dumps({"jsonrpc": "2.0", "id": 1, "error": {"code": -32601, "message": "x"}})
+
+            def close(self):
+                pass
+
+        holder = {}
+
+        def connect(url, **kw):
+            tried.append(url)
+            if len(tried) >= 3:
+                holder["c"].stop.set()
+            return ErrWS()
+
+        c = A.ChainHeadWindow(rpc_call=lambda *a, **k: None, connect=connect)
+        holder["c"] = c
+        c.samples = {"bsc": deque(maxlen=512)}
+        with patch.object(A, "HEAD_WS_RETRY_S", 0.01), patch.object(
+            A, "HEAD_WS_CYCLE_BACKOFF_S", (0.01, 0.02)
+        ):
+            t = threading.Thread(target=c._ws, args=("bsc",), daemon=True)
+            t.start()
+            t.join(timeout=5)
+        self.assertEqual(
+            tried[:3],
+            ["wss://bsc-dataseed1.binance.org", "wss://bsc-rpc.publicnode.com", "wss://bsc-dataseed1.binance.org"],
+            "整轮失败后回到主端点（循环退避）",
+        )
+        d = c.ws_diag_snapshot()
+        self.assertGreaterEqual(d["fail"]["bsc"], 2)
+        self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
+
+    def test_health_exposes_head_ws_and_version(self):
+        self.assertEqual(A.ADDON_VERSION, "2026.10.07-head-poll-200ms-v10.5")
+        src = Path(A.__file__).read_text(encoding="utf-8")
+        self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 
 
 class TestArcSupport(unittest.TestCase):
