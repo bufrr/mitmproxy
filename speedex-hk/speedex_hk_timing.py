@@ -231,7 +231,7 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # deploy/hk-proxy/test_speedex_hk_timing.py 与 tests/hk-timing*.test.mjs 钉住。
 # v10.5（2026-10-07）：链头轮询按链节拍（RH/Arc 200ms、BSC/Sol 500ms，快照 intervalMs 按链
 # 如实）、429/错误退避、WS newHeads 主端点失败后试已知 WSS fallback、/health.diag.headWs 可见。
-ADDON_VERSION = "2026.10.07-head-poll-200ms-v10.5"
+ADDON_VERSION = "2026.10.07-ws-raw-relay-v10.6"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -4096,6 +4096,11 @@ _MARKET_TAP_HOSTS = ("ws.gmgn.ai", "wsdexpri.okx.com")
 _MARKET_ADDR_RE = re.compile(r"0x[0-9a-fA-F]{40}")
 _MARKET_CH_RE = re.compile(r'"channel"\s*:\s*"([^"]{1,80})"')
 _MARKET_TAP_MAX_ADDR = 60000
+# Solana mint 首见（2026-10-07 新币发现 profiling）：base58 只在新币频道抽取，且须为完整
+# JSON 字符串值（引号定界）——行情/指标频道地址密集，全量抽取会冲刷有界 FIFO；
+# 引号定界排除 base64 logo 子串与 87-88 位签名。
+_MARKET_B58_RE = re.compile(r'"([1-9A-HJ-NP-Za-km-z]{32,44})"')
+_MARKET_B58_CHANNELS = frozenset(("trenches_delta", "dex-market-memepump-new-token"))
 
 
 class _MarketTap:
@@ -4149,10 +4154,13 @@ class _MarketTap:
                 c["lastT"] = t_obs
             if not head:
                 return
-            for a in set(_MARKET_ADDR_RE.findall(head)):
+            addrs = set(_MARKET_ADDR_RE.findall(head))
+            if ch in _MARKET_B58_CHANNELS:
+                addrs.update(_MARKET_B58_RE.findall(head))
+            for a in addrs:
                 # 按 host|channel|addr 记首见——同一地址可能先后到达多个频道，
                 # host 级首见由消费端取 min 归并（同订阅面竞速需要频道级粒度）
-                key = f"{host}|{ch or '-'}|{a.lower()}"
+                key = f"{host}|{ch or '-'}|{a.lower() if a.startswith('0x') else a}"  # base58 区分大小写
                 if key in self.addr_first:
                     continue
                 while len(self._order) >= _MARKET_TAP_MAX_ADDR:
@@ -4179,6 +4187,37 @@ def _market_tap_note(flow, content, t_obs):
     host = flow.request.pretty_host
     if any(host == h or host.endswith("." + h) for h in _MARKET_TAP_HOSTS):
         MARKET_TAP.note(host, content, t_obs)
+
+
+# ── 行情 WS 原样中继（2026-10-07 v10.6）──
+# py-spy（hk-vmiss-1，6 个 Trenches/Meme Pump 标签）：mitmdump 99.9% CPU 中 mitmproxy 自身逐帧
+# 处理占绝大部分（hook 派发 ~30%、层机制 ~28%、permessage-deflate 解压+重压 ~15%、wsproto
+# 帧 ~6%），TLS 加解密 ~4%、本 addon ~1%。高流量连接在代理内积压 60-120s，会拖慢同进程
+# 所有在途腿。下列 (host, path) 只承载行情、不承载任何成功判据（OKX 成功帧在
+# /ws/v5/iprivate(+/dex)，GMGN 在 /v2/ws；见 speedex docs/okx.md、docs/gmgn.md），
+# 101 升级时清 flow.websocket → mitmproxy 走 rawtcp TCPLayer：TLS 照常终结，帧不解析、
+# 不重压缩、无逐帧 hook（扩展协商头原样透传，deflate 端到端）。market-tap 开启时不中继
+# （tap 需逐帧观测；对开启前已建立的连接无效——研究采集须在开 tap 后再开页面）。
+_WS_RAW_RELAY = (
+    ("wsdexpri.okx.com", "/ws/v5/ipublic"),
+    ("ws.gmgn.ai", "/trs_ws"),
+)
+_WS_RAW_RELAY_KEY = "speedex_ws_raw_relay"
+
+
+def _ws_raw_relay_host(flow):
+    """101 WS 升级且 (host, path) 精确命中行情中继表 → 返回 host，否则 None。"""
+    if getattr(flow, "websocket", None) is None:
+        return None
+    try:
+        host = flow.request.pretty_host
+        path = (flow.request.path or "").split("?", 1)[0].rstrip("/")
+    except Exception:
+        return None
+    for h, p in _WS_RAW_RELAY:
+        if host == h and path == p:
+            return h
+    return None
 
 
 _EGRESS_REFRESH_EPOCH = 0
@@ -4307,6 +4346,13 @@ class SpeedexHkTiming:
 
     def response(self, flow):
         t_obs = _mono_ms()  # hook 入口冻结（同 request 侧）
+        if not MARKET_TAP.enabled:
+            relay_host = _ws_raw_relay_host(flow)
+            if relay_host:
+                flow.websocket = None  # → rawtcp 原样中继（见 _WS_RAW_RELAY）
+                flow.metadata[_WS_RAW_RELAY_KEY] = relay_host
+                STORE.note_frame_diag(f"wsRawRelay.{relay_host}")
+                return
         meta = flow.metadata.get("speedex_leg")
         if not meta:
             return
@@ -4383,6 +4429,16 @@ class SpeedexHkTiming:
                 del msgs[:-1]
             except Exception:
                 pass
+
+    def tcp_message(self, flow):
+        # 原样中继的行情 WS 走 TCPLayer，mitmproxy 把每个 chunk 追加到 flow.messages——
+        # 与 websocket_message 同律只留最新一条（TCPLayer 转发用局部变量，不读该列表）。
+        try:
+            msgs = flow.messages
+            if len(msgs) > 1:
+                del msgs[:-1]
+        except Exception:
+            pass
 
     def websocket_end(self, flow):
         # v10.2：连接关闭即清 solana 订阅映射（flow.metadata 随 flow 生命周期，

@@ -7030,7 +7030,7 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.10.07-head-poll-200ms-v10.5")
+        self.assertEqual(A.ADDON_VERSION, "2026.10.07-ws-raw-relay-v10.6")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 
@@ -7835,6 +7835,55 @@ class TestChainChannelArrivals(unittest.TestCase):
         self.assertIsNone(A.STORE.legs[self.run][-1].get("_channelArrivals"), "连接结束清理订阅映射")
 
 
+class TestWsRawRelay(unittest.TestCase):
+    """v10.6：只承载行情的 WS（OKX ipublic、GMGN trs_ws）101 升级时转 rawtcp 原样中继。"""
+
+    def setUp(self):
+        fresh()
+        A.MARKET_TAP.reset(False)
+
+    def _upgrade(self, host, path):
+        f = FakeFlow(host, path, "GET")
+        f.websocket = object()  # mitmproxy 在 response hook 前为 101 WS 置 WebSocketData
+        A.SpeedexHkTiming().response(f)
+        return f
+
+    def test_market_only_paths_relay_raw(self):
+        for host, path in (("wsdexpri.okx.com", "/ws/v5/ipublic"), ("ws.gmgn.ai", "/trs_ws?rg=hk"), ("ws.gmgn.ai", "/trs_ws/")):
+            f = self._upgrade(host, path)
+            self.assertIsNone(f.websocket, (host, path))
+            self.assertEqual(f.metadata[A._WS_RAW_RELAY_KEY], host)
+        self.assertEqual(A.STORE.diag["wsRawRelay.wsdexpri.okx.com"], 1)
+        self.assertEqual(A.STORE.diag["wsRawRelay.ws.gmgn.ai"], 2)
+
+    def test_success_bearing_paths_keep_websocket(self):
+        # 成功判据所在连接必须继续逐帧解析
+        for host, path in (
+            ("wsdexpri.okx.com", "/ws/v5/iprivate"),
+            ("wsdexpri.okx.com", "/ws/v5/iprivate/dex"),
+            ("ws.gmgn.ai", "/v2/ws"),
+            ("ws.gmgn.ai.evil.example", "/trs_ws"),
+            ("wsdexpri.okx.com", "/ws/v5/ipublicx"),
+        ):
+            f = self._upgrade(host, path)
+            self.assertIsNotNone(f.websocket, (host, path))
+            self.assertNotIn(A._WS_RAW_RELAY_KEY, f.metadata)
+
+    def test_plain_http_and_tap_enabled_untouched(self):
+        f = FakeFlow("wsdexpri.okx.com", "/ws/v5/ipublic", "GET")  # 非 WS 升级（websocket=None）
+        A.SpeedexHkTiming().response(f)
+        self.assertNotIn(A._WS_RAW_RELAY_KEY, f.metadata)
+        A.MARKET_TAP.reset(True)
+        f = self._upgrade("wsdexpri.okx.com", "/ws/v5/ipublic")
+        self.assertIsNotNone(f.websocket)  # tap 开启时保留逐帧观测
+
+    def test_tcp_message_keeps_only_latest(self):
+        f = types.SimpleNamespace(messages=[1, 2, 3])
+        A.SpeedexHkTiming().tcp_message(f)
+        self.assertEqual(f.messages, [3])
+        A.SpeedexHkTiming().tcp_message(types.SimpleNamespace())  # 无 messages 不抛
+
+
 class TestMarketTap(unittest.TestCase):
     """market-tap 支线：行情 WS 帧的 channel/首见地址记录，独立于开窗管线。"""
 
@@ -7851,6 +7900,20 @@ class TestMarketTap(unittest.TestCase):
         A._market_tap_note(flow, json.dumps({"channel": "public_broadcast", "data": [{"token": addr}]}), t0 + 5)
         self.assertEqual(A.MARKET_TAP.snapshot()["frames"], 2)
         self.assertEqual(len(A.MARKET_TAP.snapshot()["addrFirst"]), 1)  # 同地址只记首见
+
+    def test_solana_mint_only_on_new_token_channels(self):
+        mint = "So1anaMint" + "A" * 30 + "pump"  # 44 位 base58
+        A.MARKET_TAP.reset(True)
+        t0 = A._mono_ms()
+        g = FakeFlow("ws.gmgn.ai", "/trs_ws", "GET")
+        o = FakeFlow("wsdexpri.okx.com", "/ws/v5/ipublic", "GET")
+        logo = "data:image/png;base64," + "iVBORw0KGgo" + "B" * 40 + "/" + "C" * 40
+        A._market_tap_note(g, json.dumps({"channel": "trenches_delta", "data": {"t": [{"a": mint, "f": {"ls_b64": logo}}]}}), t0)
+        A._market_tap_note(o, json.dumps({"channel": "dex-market-memepump-new-token", "data": [{"ca": mint}]}), t0 + 3)
+        A._market_tap_note(o, json.dumps({"channel": "dex-market-memepump-update-metrics", "data": [{"ca": "Other" + "B" * 39}]}), t0 + 4)
+        af = A.MARKET_TAP.snapshot()["addrFirst"]
+        self.assertEqual(set(af), {f"ws.gmgn.ai|trenches_delta|{mint}", f"wsdexpri.okx.com|dex-market-memepump-new-token|{mint}"})
+        self.assertEqual(af[f"ws.gmgn.ai|trenches_delta|{mint}"]["t"], t0)  # 大小写保留、logo 子串不入
 
     def test_host_filter_and_binary_skip(self):
         A.MARKET_TAP.reset(True)
