@@ -7030,7 +7030,7 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.10.07-ws-raw-relay-v10.6")
+        self.assertEqual(A.ADDON_VERSION, "2026.10.08-tap-proc-v10.7")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 
@@ -7882,6 +7882,25 @@ class TestWsRawRelay(unittest.TestCase):
         A.SpeedexHkTiming().tcp_message(f)
         self.assertEqual(f.messages, [3])
         A.SpeedexHkTiming().tcp_message(types.SimpleNamespace())  # 无 messages 不抛
+
+
+class TestProcSampler(unittest.TestCase):
+    """v10.7：market-tap 观测期负载守卫——进程 CPU% / 节点 steal% 区间均值。"""
+
+    def test_first_sample_is_none_then_interval_values(self):
+        sp = A._ProcSampler()
+        first = sp.sample()
+        self.assertEqual(first["cpuPct"], None)
+        sp.last = (sp.last[0] - 2.0, sp.last[1] - 0.5, sp.last[2], sp.last[3])  # 合成：2s 内耗 0.5s CPU
+        second = sp.sample()
+        self.assertIsNotNone(second["cpuPct"])
+        self.assertGreaterEqual(second["cpuPct"], 20.0)
+        self.assertTrue(second["stealPct"] is None or 0.0 <= second["stealPct"] <= 100.0)
+
+    def test_too_short_interval_reports_none(self):
+        sp = A._ProcSampler()
+        sp.sample()
+        self.assertEqual(sp.sample()["cpuPct"], None)
 
 
 class TestMarketTap(unittest.TestCase):

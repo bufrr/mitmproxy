@@ -231,7 +231,7 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # deploy/hk-proxy/test_speedex_hk_timing.py 与 tests/hk-timing*.test.mjs 钉住。
 # v10.5（2026-10-07）：链头轮询按链节拍（RH/Arc 200ms、BSC/Sol 500ms，快照 intervalMs 按链
 # 如实）、429/错误退避、WS newHeads 主端点失败后试已知 WSS fallback、/health.diag.headWs 可见。
-ADDON_VERSION = "2026.10.07-ws-raw-relay-v10.6"
+ADDON_VERSION = "2026.10.08-tap-proc-v10.7"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -4183,6 +4183,45 @@ class _MarketTap:
 MARKET_TAP = _MarketTap()
 
 
+class _ProcSampler:
+    """进程 CPU% 与节点 steal%（自上次采样以来的区间均值）——market-tap 观测期的负载守卫用（v10.7）。
+    只读 time.process_time() 与 /proc/stat，不派生任何业务数据。"""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.last = None  # (mono, cpu, stat_total, stat_steal)
+
+    @staticmethod
+    def _stat():
+        try:
+            with open("/proc/stat") as f:
+                parts = f.readline().split()
+            vals = [int(x) for x in parts[1:]]
+            steal = vals[7] if len(vals) > 7 else 0
+            return sum(vals[:8]), steal
+        except Exception:
+            return None, None
+
+    def sample(self):
+        now = time.monotonic()
+        cpu = time.process_time()
+        total, steal = self._stat()
+        with self.lock:
+            prev = self.last
+            self.last = (now, cpu, total, steal)
+        if not prev or now - prev[0] < 0.5:
+            return {"cpuPct": None, "stealPct": None, "intervalS": None}
+        dt = now - prev[0]
+        cpu_pct = round(max(0.0, (cpu - prev[1]) / dt * 100.0), 1)
+        steal_pct = None
+        if total is not None and prev[2] is not None and total > prev[2]:
+            steal_pct = round(max(0.0, (steal - prev[3]) / (total - prev[2]) * 100.0), 1)
+        return {"cpuPct": cpu_pct, "stealPct": steal_pct, "intervalS": round(dt, 1)}
+
+
+PROC_SAMPLER = _ProcSampler()
+
+
 def _market_tap_note(flow, content, t_obs):
     host = flow.request.pretty_host
     if any(host == h or host.endswith("." + h) for h in _MARKET_TAP_HOSTS):
@@ -4906,8 +4945,13 @@ class _Ctrl(BaseHTTPRequestHandler):
                 body["error"] = "control/collection split: 热重载后旧控制面仍在服务"
                 return self._send(503, body)
             return self._send(200, body)
-        if self.path == "/market-tap":
-            return self._send(200, {"ok": True, "marketTap": MARKET_TAP.snapshot()})
+        if self.path in ("/market-tap", "/market-tap?light=1"):
+            # v10.7：附进程 CPU / 节点 steal（区间均值）；light=1 不带 addrFirst（高频负载轮询用）
+            snap = MARKET_TAP.snapshot()
+            if self.path.endswith("light=1"):
+                snap = {k: v for k, v in snap.items() if k != "addrFirst"}
+                snap["addrCount"] = len(MARKET_TAP.addr_first)
+            return self._send(200, {"ok": True, "marketTap": snap, "proc": PROC_SAMPLER.sample()})
         if self.path == "/egress":
             return self._send(200, {"ok": True, "egress": get_egress()})
         if self.path == "/latency":
