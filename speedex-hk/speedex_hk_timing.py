@@ -232,7 +232,7 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # deploy/hk-proxy/test_speedex_hk_timing.py 与 tests/hk-timing*.test.mjs 钉住。
 # v10.5（2026-10-07）：链头轮询按链节拍（RH/Arc 200ms、BSC/Sol 500ms，快照 intervalMs 按链
 # 如实）、429/错误退避、WS newHeads 主端点失败后试已知 WSS fallback、/health.diag.headWs 可见。
-ADDON_VERSION = "2026.10.08-tap-sniff-v10.8"
+ADDON_VERSION = "2026.10.08-tap-sniff-v10.9"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -4253,6 +4253,8 @@ _WS_SNIFF_MAX_BUF = 16 * 1024 * 1024
 # 登记嗅探器，tcp_start 领取挂到 TCPFlow.metadata；有界 FIFO 防未领取残留。
 _WS_SNIFF_PENDING = {}
 _WS_SNIFF_PENDING_MAX = 256
+# 中继/嗅探计数（market-tap 快照 `sniff` 键；/health diag 不含帧诊断）
+_WS_SNIFF_STATS = defaultdict(int)
 
 
 def _conn_id(flow):
@@ -4503,6 +4505,7 @@ class SpeedexHkTiming:
             flow.websocket = None  # → rawtcp 原样中继（见 _WS_RAW_RELAY）
             flow.metadata[_WS_RAW_RELAY_KEY] = relay_host
             STORE.note_frame_diag(f"wsRawRelay.{relay_host}")
+            _WS_SNIFF_STATS[f"relay.{relay_host}"] += 1
             if MARKET_TAP.enabled:
                 # v10.8：tap 开启时对中继流被动嗅探（升级即建，解压上下文从连接起点同步）
                 try:
@@ -4515,6 +4518,7 @@ class SpeedexHkTiming:
                         _WS_SNIFF_PENDING.pop(next(iter(_WS_SNIFF_PENDING)))
                     _WS_SNIFF_PENDING[cid] = _WsSniff(relay_host, ext)
                     STORE.note_frame_diag(f"wsSniff.{relay_host}")
+                    _WS_SNIFF_STATS[f"registered.{relay_host}"] += 1
             return
         meta = flow.metadata.get("speedex_leg")
         if not meta:
@@ -4599,6 +4603,7 @@ class SpeedexHkTiming:
             sn = _WS_SNIFF_PENDING.pop(_conn_id(flow), None)
             if sn is not None:
                 flow.metadata[_WS_SNIFF_KEY] = sn
+                _WS_SNIFF_STATS[f"attached.{sn.host}"] += 1
         except Exception:
             pass
 
@@ -4623,9 +4628,13 @@ class SpeedexHkTiming:
             msg = msgs[-1] if msgs else None
             if msg is None or getattr(msg, "from_client", True):
                 return
+            m0, h0 = sn.msgs, sn.hits
             sn.feed(msg.content, t_obs)
+            _WS_SNIFF_STATS[f"msgs.{sn.host}"] += sn.msgs - m0
+            _WS_SNIFF_STATS[f"hits.{sn.host}"] += sn.hits - h0
             if sn.dead:
                 STORE.note_frame_diag(f"wsSniffDead.{sn.dead}")
+                _WS_SNIFF_STATS[f"dead.{sn.dead}"] += 1
         except Exception:
             pass
 
@@ -5101,6 +5110,7 @@ class _Ctrl(BaseHTTPRequestHandler):
             if self.path.endswith("light=1"):
                 snap = {k: v for k, v in snap.items() if k != "addrFirst"}
                 snap["addrCount"] = len(MARKET_TAP.addr_first)
+            snap["sniff"] = dict(_WS_SNIFF_STATS)
             return self._send(200, {"ok": True, "marketTap": snap, "proc": PROC_SAMPLER.sample()})
         if self.path == "/egress":
             return self._send(200, {"ok": True, "egress": get_egress()})
