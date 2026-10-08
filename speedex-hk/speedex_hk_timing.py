@@ -232,7 +232,7 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # deploy/hk-proxy/test_speedex_hk_timing.py 与 tests/hk-timing*.test.mjs 钉住。
 # v10.5（2026-10-07）：链头轮询按链节拍（RH/Arc 200ms、BSC/Sol 500ms，快照 intervalMs 按链
 # 如实）、429/错误退避、WS newHeads 主端点失败后试已知 WSS fallback、/health.diag.headWs 可见。
-ADDON_VERSION = "2026.10.08-tap-sniff-v10.9"
+ADDON_VERSION = "2026.10.08-tap-sniff-v10.10"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -4353,8 +4353,8 @@ class _WsSniff:
                 except zlib.error:
                     return self._kill("inflate-error")
             self.msgs += 1
-            head = msg[:4000]
-            if any(nd in head for nd in _WS_SNIFF_NEEDLES):
+            # 全消息字节查找（memchr 级，C 实现）——频道名不在头部的消息也不漏
+            if any(nd in msg for nd in _WS_SNIFF_NEEDLES):
                 self.hits += 1
                 MARKET_TAP.note(self.host, msg, t_obs)
 
