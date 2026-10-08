@@ -10,6 +10,7 @@ fomo-runner.test.mjs、binance-ws.test.mjs、runner-core.mjs 引用的生产样�
 import atexit
 import http.server
 import json
+import zlib
 import os
 import re
 import sys
@@ -7030,7 +7031,7 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.10.08-tap-proc-v10.7")
+        self.assertEqual(A.ADDON_VERSION, "2026.10.08-tap-sniff-v10.8")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 
@@ -7869,19 +7870,137 @@ class TestWsRawRelay(unittest.TestCase):
             self.assertIsNotNone(f.websocket, (host, path))
             self.assertNotIn(A._WS_RAW_RELAY_KEY, f.metadata)
 
-    def test_plain_http_and_tap_enabled_untouched(self):
+    def test_plain_http_untouched_and_tap_enabled_relays_with_sniffer(self):
         f = FakeFlow("wsdexpri.okx.com", "/ws/v5/ipublic", "GET")  # 非 WS 升级（websocket=None）
         A.SpeedexHkTiming().response(f)
         self.assertNotIn(A._WS_RAW_RELAY_KEY, f.metadata)
-        A.MARKET_TAP.reset(True)
         f = self._upgrade("wsdexpri.okx.com", "/ws/v5/ipublic")
-        self.assertIsNotNone(f.websocket)  # tap 开启时保留逐帧观测
+        self.assertNotIn(A._WS_SNIFF_KEY, f.metadata)  # tap 关：只中继不嗅探
+        A.MARKET_TAP.reset(True)
+        f = FakeFlow("wsdexpri.okx.com", "/ws/v5/ipublic", "GET")
+        f.websocket = object()
+        f.client_conn = types.SimpleNamespace(id="conn-1")
+        A.SpeedexHkTiming().response(f)
+        self.assertIsNone(f.websocket)  # v10.8：tap 开启也原样中继
+        self.assertEqual(A.STORE.diag["wsSniff.wsdexpri.okx.com"], 1)
+        # rawtcp 新建 TCPFlow（无 HTTPFlow.metadata）：tcp_start 按客户端连接 id 领取
+        tf = types.SimpleNamespace(client_conn=types.SimpleNamespace(id="conn-1"), metadata={})
+        A.SpeedexHkTiming().tcp_start(tf)
+        self.assertIsInstance(tf.metadata[A._WS_SNIFF_KEY], A._WsSniff)
+        self.assertNotIn("conn-1", A._WS_SNIFF_PENDING)
+        other = types.SimpleNamespace(client_conn=types.SimpleNamespace(id="conn-2"), metadata={})
+        A.SpeedexHkTiming().tcp_start(other)
+        self.assertNotIn(A._WS_SNIFF_KEY, other.metadata)
 
     def test_tcp_message_keeps_only_latest(self):
         f = types.SimpleNamespace(messages=[1, 2, 3])
         A.SpeedexHkTiming().tcp_message(f)
         self.assertEqual(f.messages, [3])
         A.SpeedexHkTiming().tcp_message(types.SimpleNamespace())  # 无 messages 不抛
+
+
+def _ws_server_frame(payload, opcode=1, fin=True, rsv1=False, masked=False):
+    b0 = (0x80 if fin else 0) | (0x40 if rsv1 else 0) | opcode
+    n = len(payload)
+    if n < 126:
+        head = bytes([b0, (0x80 if masked else 0) | n])
+    elif n < 65536:
+        head = bytes([b0, (0x80 if masked else 0) | 126]) + n.to_bytes(2, "big")
+    else:
+        head = bytes([b0, (0x80 if masked else 0) | 127]) + n.to_bytes(8, "big")
+    return head + (b"\x00\x00\x00\x00" if masked else b"") + payload
+
+
+def _deflate_msgs(msgs, ctx=True):
+    """permessage-deflate 服务端压缩（上下文接管：同一压缩器；去尾 00 00 ff ff）。"""
+    out = []
+    c = zlib.compressobj(wbits=-15)
+    for m in msgs:
+        if not ctx:
+            c = zlib.compressobj(wbits=-15)
+        d = c.compress(m) + c.flush(zlib.Z_SYNC_FLUSH)
+        out.append(d[:-4])
+    return out
+
+
+class TestWsSniff(unittest.TestCase):
+    """v10.8：原样中继流被动嗅探——只把含发现频道名的消息交给 market-tap，字节不改、坏流判死。"""
+
+    MINT = "So1anaMint" + "A" * 30 + "pump"
+    EVM = "0x" + "cd" * 20
+
+    def setUp(self):
+        fresh()
+        A.MARKET_TAP.reset(True)
+
+    def _msgs(self):
+        noise = json.dumps({"arg": {"channel": "dex-market-memepump-update-metrics"}, "data": [{"ca": "Other" + "B" * 39, "pad": "x" * 3000}]}).encode()
+        key = json.dumps({"arg": {"channel": "dex-market-memepump-new-token", "chainIndex": "501"}, "data": [{"ca": self.MINT, "chain": "501"}]}).encode()
+        key2 = json.dumps({"arg": {"channel": "dex-market-memepump-new-token", "chainIndex": "56"}, "data": [{"ca": self.EVM, "chain": "56"}]}).encode()
+        return [noise, key, noise, key2]
+
+    def _feed_chunked(self, sn, stream, sizes=(1, 7, 300, 2, 4096)):
+        i = k = 0
+        while i < len(stream):
+            n = sizes[k % len(sizes)]
+            sn.feed(stream[i:i + n], 1000.0 + k)
+            i += n
+            k += 1
+
+    def test_deflate_context_takeover_chunked_with_control_and_fragments(self):
+        msgs = self._msgs()
+        comp = _deflate_msgs(msgs)
+        stream = _ws_server_frame(b"", opcode=9)  # ping
+        stream += _ws_server_frame(comp[0], rsv1=True)
+        half = len(comp[1]) // 2  # 分片消息：首帧 RSV1，续帧 opcode 0
+        stream += _ws_server_frame(comp[1][:half], fin=False, rsv1=True) + _ws_server_frame(b"", opcode=10) + _ws_server_frame(comp[1][half:], opcode=0)
+        stream += _ws_server_frame(comp[2], rsv1=True) + _ws_server_frame(comp[3], rsv1=True)
+        sn = A._WsSniff("wsdexpri.okx.com", "permessage-deflate; client_max_window_bits")
+        self._feed_chunked(sn, stream)
+        self.assertIsNone(sn.dead)
+        self.assertEqual((sn.msgs, sn.hits), (4, 2))  # 噪声消息只解压不入 tap
+        af = A.MARKET_TAP.snapshot()["addrFirst"]
+        self.assertEqual(set(af), {f"wsdexpri.okx.com|dex-market-memepump-new-token|{self.MINT}", f"wsdexpri.okx.com|dex-market-memepump-new-token|{self.EVM}"})
+
+    def test_no_context_takeover_and_uncompressed(self):
+        msgs = self._msgs()
+        sn = A._WsSniff("wsdexpri.okx.com", "permessage-deflate; server_no_context_takeover")
+        sn.feed(b"".join(_ws_server_frame(c, rsv1=True) for c in _deflate_msgs(msgs, ctx=False)), 5.0)
+        self.assertEqual((sn.dead, sn.hits), (None, 2))
+        A.MARKET_TAP.reset(True)
+        g = json.dumps({"channel": "trenches_delta", "data": {"fid": "sol_nc_x", "a": [self.MINT], "t": [{"a": self.MINT}]}}).encode()
+        sn = A._WsSniff("ws.gmgn.ai", "")
+        sn.feed(_ws_server_frame(g) + _ws_server_frame(b'{"channel":"heartbeat"}'), 7.0)
+        self.assertEqual(A.MARKET_TAP.snapshot()["addrFirst"][f"ws.gmgn.ai|trenches_delta|{self.MINT}"]["t"], 7.0)
+
+    def test_corrupt_streams_go_dead_without_raising(self):
+        for why, data, ext in (
+            ("masked-server-frame", _ws_server_frame(b"x", masked=True), ""),
+            ("orphan-continuation", _ws_server_frame(b"x", opcode=0), ""),
+            ("unknown-opcode", _ws_server_frame(b"x", opcode=3), ""),
+            ("rsv1-without-deflate", _ws_server_frame(b"x", rsv1=True), ""),
+            ("inflate-error", _ws_server_frame(b"\xff\xff\xff\xff", rsv1=True), "permessage-deflate"),
+        ):
+            sn = A._WsSniff("ws.gmgn.ai", ext)
+            sn.feed(data, 1.0)
+            self.assertEqual(sn.dead, why)
+            sn.feed(_ws_server_frame(b'{"channel":"trenches_delta"}'), 2.0)  # 死后不再处理
+        self.assertEqual(A.MARKET_TAP.snapshot()["frames"], 0)
+
+    def test_tcp_message_hook_direction_and_tap_off(self):
+        f = FakeFlow("ws.gmgn.ai", "/trs_ws", "GET")
+        sn = A._WsSniff("ws.gmgn.ai", "")
+        f.metadata[A._WS_SNIFF_KEY] = sn
+        frame = _ws_server_frame(json.dumps({"channel": "trenches_delta", "data": {"a": [self.MINT]}}).encode())
+        f.messages = [types.SimpleNamespace(content=frame, from_client=True)]
+        A.SpeedexHkTiming().tcp_message(f)
+        self.assertEqual(sn.msgs, 0)  # 客户端方向不嗅
+        f.messages = [types.SimpleNamespace(content=frame, from_client=False)]
+        A.SpeedexHkTiming().tcp_message(f)
+        self.assertEqual(sn.hits, 1)
+        A.MARKET_TAP.set_enabled(False)
+        A.SpeedexHkTiming().tcp_message(f)
+        self.assertEqual(sn.dead, "tap-disabled")  # 关 tap 即永久停嗅（解压上下文已断）
 
 
 class TestProcSampler(unittest.TestCase):

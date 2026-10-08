@@ -142,6 +142,7 @@ import threading
 import time
 import urllib.request
 import uuid
+import zlib
 from collections import defaultdict
 from collections import deque
 from http.server import BaseHTTPRequestHandler
@@ -231,7 +232,7 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # deploy/hk-proxy/test_speedex_hk_timing.py 与 tests/hk-timing*.test.mjs 钉住。
 # v10.5（2026-10-07）：链头轮询按链节拍（RH/Arc 200ms、BSC/Sol 500ms，快照 intervalMs 按链
 # 如实）、429/错误退避、WS newHeads 主端点失败后试已知 WSS fallback、/health.diag.headWs 可见。
-ADDON_VERSION = "2026.10.08-tap-proc-v10.7"
+ADDON_VERSION = "2026.10.08-tap-sniff-v10.8"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -4235,13 +4236,125 @@ def _market_tap_note(flow, content, t_obs):
 # 所有在途腿。下列 (host, path) 只承载行情、不承载任何成功判据（OKX 成功帧在
 # /ws/v5/iprivate(+/dex)，GMGN 在 /v2/ws；见 speedex docs/okx.md、docs/gmgn.md），
 # 101 升级时清 flow.websocket → mitmproxy 走 rawtcp TCPLayer：TLS 照常终结，帧不解析、
-# 不重压缩、无逐帧 hook（扩展协商头原样透传，deflate 端到端）。market-tap 开启时不中继
-# （tap 需逐帧观测；对开启前已建立的连接无效——研究采集须在开 tap 后再开页面）。
+# 不重压缩、无逐帧 hook（扩展协商头原样透传，deflate 端到端）。v10.8：market-tap 开启时仍中继，
+# tap 改为对中继字节流被动嗅探（_WsSniff：服务端→客户端帧头解析 + 同步解压，只把含发现频道名的
+# 消息交给 MARKET_TAP.note；字节原样转发、从不修改）。嗅探只对 tap 开启后升级的连接建立（解压上下文
+# 需从连接起点同步）——研究采集须在开 tap 后再开页面。
 _WS_RAW_RELAY = (
     ("wsdexpri.okx.com", "/ws/v5/ipublic"),
     ("ws.gmgn.ai", "/trs_ws"),
 )
 _WS_RAW_RELAY_KEY = "speedex_ws_raw_relay"
+_WS_SNIFF_KEY = "speedex_ws_sniff"
+# 只有这些频道名出现的消息才进 tap（Trenches 新币 / Meme Pump 新币）；其余行情消息只解压不解析
+_WS_SNIFF_NEEDLES = (b"trenches_delta", b"dex-market-memepump-new-token")
+_WS_SNIFF_MAX_BUF = 16 * 1024 * 1024
+# 101 升级后 mitmproxy 为 rawtcp 新建 TCPFlow（HTTPFlow.metadata 不随行）——response 按客户端连接 id
+# 登记嗅探器，tcp_start 领取挂到 TCPFlow.metadata；有界 FIFO 防未领取残留。
+_WS_SNIFF_PENDING = {}
+_WS_SNIFF_PENDING_MAX = 256
+
+
+def _conn_id(flow):
+    try:
+        return flow.client_conn.id
+    except Exception:
+        return None
+
+
+class _WsSniff:
+    """原样中继流的被动 WS 嗅探（v10.8，只读服务端→客户端方向）。
+
+    RFC 6455 帧头解析（服务端帧不带掩码；带掩码/未知操作码/超限即判死，停止嗅探但不影响转发）；
+    permessage-deflate（RSV1）：上下文接管时整条连接共用一个解压器——必须解压每条压缩消息才能保持
+    滑动窗口同步；server_no_context_takeover 时每条消息新建。解压在 zlib C 实现内完成，
+    含发现频道名的消息才走 Python 侧 JSON/地址提取。"""
+
+    __slots__ = ("host", "buf", "deflate", "no_ctx", "inflater", "frag", "frag_rsv1", "dead", "msgs", "hits")
+
+    def __init__(self, host, extensions=""):
+        ext = (extensions or "").lower()
+        self.host = host
+        self.buf = bytearray()
+        self.deflate = "permessage-deflate" in ext
+        self.no_ctx = "server_no_context_takeover" in ext
+        self.inflater = zlib.decompressobj(-15) if self.deflate else None
+        self.frag = None
+        self.frag_rsv1 = False
+        self.dead = None
+        self.msgs = 0
+        self.hits = 0
+
+    def _kill(self, why):
+        self.dead = why
+        self.buf = bytearray()
+        self.frag = None
+
+    def feed(self, data, t_obs):
+        """喂一段服务端→客户端明文字节；完整消息含发现频道名 → MARKET_TAP.note(host, 消息, t_obs)。"""
+        if self.dead or not data:
+            return
+        self.buf += data
+        if len(self.buf) > _WS_SNIFF_MAX_BUF:
+            return self._kill("buffer-overflow")
+        while True:
+            b = self.buf
+            if len(b) < 2:
+                return
+            b0, b1 = b[0], b[1]
+            if b1 & 0x80:
+                return self._kill("masked-server-frame")
+            n = b1 & 0x7F
+            off = 2
+            if n == 126:
+                if len(b) < 4:
+                    return
+                n = int.from_bytes(b[2:4], "big")
+                off = 4
+            elif n == 127:
+                if len(b) < 10:
+                    return
+                n = int.from_bytes(b[2:10], "big")
+                off = 10
+            if n > _WS_SNIFF_MAX_BUF:
+                return self._kill("frame-too-large")
+            if len(b) < off + n:
+                return
+            payload = bytes(b[off:off + n])
+            del b[:off + n]
+            op = b0 & 0x0F
+            if op >= 8:
+                continue  # 控制帧（ping/pong/close）不参与消息与解压上下文
+            if op in (1, 2):
+                if self.frag is not None:
+                    return self._kill("interleaved-message")
+                self.frag = [payload]
+                self.frag_rsv1 = bool(b0 & 0x40)
+            elif op == 0:
+                if self.frag is None:
+                    return self._kill("orphan-continuation")
+                self.frag.append(payload)
+            else:
+                return self._kill("unknown-opcode")
+            if not (b0 & 0x80):
+                continue
+            msg = b"".join(self.frag)
+            comp = self.frag_rsv1
+            self.frag = None
+            if comp:
+                if not self.deflate:
+                    return self._kill("rsv1-without-deflate")
+                try:
+                    if self.no_ctx:
+                        self.inflater = zlib.decompressobj(-15)
+                    msg = self.inflater.decompress(msg + b"\x00\x00\xff\xff")
+                except zlib.error:
+                    return self._kill("inflate-error")
+            self.msgs += 1
+            head = msg[:4000]
+            if any(nd in head for nd in _WS_SNIFF_NEEDLES):
+                self.hits += 1
+                MARKET_TAP.note(self.host, msg, t_obs)
 
 
 def _ws_raw_relay_host(flow):
@@ -4385,13 +4498,24 @@ class SpeedexHkTiming:
 
     def response(self, flow):
         t_obs = _mono_ms()  # hook 入口冻结（同 request 侧）
-        if not MARKET_TAP.enabled:
-            relay_host = _ws_raw_relay_host(flow)
-            if relay_host:
-                flow.websocket = None  # → rawtcp 原样中继（见 _WS_RAW_RELAY）
-                flow.metadata[_WS_RAW_RELAY_KEY] = relay_host
-                STORE.note_frame_diag(f"wsRawRelay.{relay_host}")
-                return
+        relay_host = _ws_raw_relay_host(flow)
+        if relay_host:
+            flow.websocket = None  # → rawtcp 原样中继（见 _WS_RAW_RELAY）
+            flow.metadata[_WS_RAW_RELAY_KEY] = relay_host
+            STORE.note_frame_diag(f"wsRawRelay.{relay_host}")
+            if MARKET_TAP.enabled:
+                # v10.8：tap 开启时对中继流被动嗅探（升级即建，解压上下文从连接起点同步）
+                try:
+                    ext = flow.response.headers.get("sec-websocket-extensions", "")
+                except Exception:
+                    ext = ""
+                cid = _conn_id(flow)
+                if cid is not None:
+                    while len(_WS_SNIFF_PENDING) >= _WS_SNIFF_PENDING_MAX:
+                        _WS_SNIFF_PENDING.pop(next(iter(_WS_SNIFF_PENDING)))
+                    _WS_SNIFF_PENDING[cid] = _WsSniff(relay_host, ext)
+                    STORE.note_frame_diag(f"wsSniff.{relay_host}")
+            return
         meta = flow.metadata.get("speedex_leg")
         if not meta:
             return
@@ -4469,13 +4593,39 @@ class SpeedexHkTiming:
             except Exception:
                 pass
 
+    def tcp_start(self, flow):
+        # v10.8：领取 response 登记的嗅探器（同一客户端连接的 rawtcp 新 TCPFlow）
+        try:
+            sn = _WS_SNIFF_PENDING.pop(_conn_id(flow), None)
+            if sn is not None:
+                flow.metadata[_WS_SNIFF_KEY] = sn
+        except Exception:
+            pass
+
     def tcp_message(self, flow):
         # 原样中继的行情 WS 走 TCPLayer，mitmproxy 把每个 chunk 追加到 flow.messages——
         # 与 websocket_message 同律只留最新一条（TCPLayer 转发用局部变量，不读该列表）。
+        t_obs = _mono_ms()  # hook 入口冻结（与 websocket_message 同口径）
         try:
             msgs = flow.messages
             if len(msgs) > 1:
                 del msgs[:-1]
+        except Exception:
+            return
+        # v10.8 market-tap 被动嗅探：只读服务端方向、只在 tap 开启时；tap 关闭即永久停嗅（解压上下文已断）
+        try:
+            sn = flow.metadata.get(_WS_SNIFF_KEY)
+            if sn is None or sn.dead:
+                return
+            if not MARKET_TAP.enabled:
+                sn._kill("tap-disabled")
+                return
+            msg = msgs[-1] if msgs else None
+            if msg is None or getattr(msg, "from_client", True):
+                return
+            sn.feed(msg.content, t_obs)
+            if sn.dead:
+                STORE.note_frame_diag(f"wsSniffDead.{sn.dead}")
         except Exception:
             pass
 
