@@ -6617,6 +6617,37 @@ class TestChainHeadPollDiagAndKeepaliveRouting(unittest.TestCase):
             c.close()
 
 
+class TestChainHeadPollBehindDropped(unittest.TestCase):
+    """v10.11（9u757 RH r4）：rpc-poll 读数低于已缓冲最新高度 = 节点 latest 滞后，丢弃（不清缓冲、不作链头）；
+    ws-head 回退仍按分叉规则清缓冲。"""
+
+    def _hdr(self, h, parent=None):
+        return {"number": hex(h), "hash": "0x" + f"{h:064x}", "parentHash": "0x" + f"{(parent if parent is not None else h - 1):064x}"}
+
+    def test_lagging_poll_is_dropped_and_head_stays_fresh(self):
+        from collections import deque
+
+        now = [1000]
+        c = A.ChainHeadWindow(clock=lambda: now[0])
+        c.run_id = "lag"
+        c.samples = {"robinhood": deque(maxlen=512)}
+        try:
+            c.add("robinhood", self._hdr(82974628), "ws-head")
+            now[0] = 1300
+            c.add("robinhood", self._hdr(82974620), "rpc-poll", 1290)  # 公共节点落后 8 块
+            snap = c.snapshot("lag", 1310)["robinhood"]
+            self.assertEqual((snap["height"], snap["source"]), (82974628, "ws-head"))
+            self.assertEqual(c.diag_snapshot()["pollBehind"], {"robinhood": 1})
+            now[0] = 1400
+            c.add("robinhood", self._hdr(82974629), "rpc-poll", 1390)  # 追上后的轮询照常接受
+            self.assertEqual(c.snapshot("lag", 1410)["robinhood"]["height"], 82974629)
+            now[0] = 1500
+            c.add("robinhood", self._hdr(82974600), "ws-head")  # ws 回退：分叉规则不变（清缓冲后采用）
+            self.assertEqual(c.snapshot("lag", 1510)["robinhood"]["height"], 82974600)
+        finally:
+            c.close()
+
+
 class TestChainHeadFreshnessAtAnchors(unittest.TestCase):
     """iyqzt 回归（2026-09-12 head-v4）：锚点节拍 ~15s 下，健康轮询（rtt 远小于
     maxAgeMs）的链头样本在每个锚点必须 ≤2000ms 新鲜——快照恒 ok，绝不出
@@ -7031,7 +7062,7 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.10.08-tap-sniff-v10.10")
+        self.assertEqual(A.ADDON_VERSION, "2026.10.08-head-poll-lag-v10.11")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 

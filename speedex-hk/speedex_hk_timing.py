@@ -232,7 +232,7 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # deploy/hk-proxy/test_speedex_hk_timing.py 与 tests/hk-timing*.test.mjs 钉住。
 # v10.5（2026-10-07）：链头轮询按链节拍（RH/Arc 200ms、BSC/Sol 500ms，快照 intervalMs 按链
 # 如实）、429/错误退避、WS newHeads 主端点失败后试已知 WSS fallback、/health.diag.headWs 可见。
-ADDON_VERSION = "2026.10.08-tap-sniff-v10.10"
+ADDON_VERSION = "2026.10.08-head-poll-lag-v10.11"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -1655,6 +1655,7 @@ class ChainHeadWindow:
             "intervalMs": {},
             "backoffMs": {},
             "rateLimited": defaultdict(int),
+            "pollBehind": defaultdict(int),
         }
         # v10.5：WS newHeads 可观测（原先失败静默吞掉）。只记 host + 异常类名/状态码，
         # 计数有界（每链固定键），无 URL query/消息体/头。
@@ -1675,6 +1676,7 @@ class ChainHeadWindow:
                 "intervalMs": dict(self.diag["intervalMs"]),
                 "backoffMs": dict(self.diag["backoffMs"]),
                 "rateLimited": dict(self.diag["rateLimited"]),
+                "pollBehind": dict(self.diag["pollBehind"]),
             }
 
     def ws_diag_snapshot(self):
@@ -1764,6 +1766,11 @@ class ChainHeadWindow:
                 return
             buf = self.samples[chain]
             previous = buf[-1] if buf else None
+            # v10.11（2026-10-08 9u757 RH 实证）：轮询读数低于已缓冲最新高度 = 该 RPC 节点 latest 滞后
+            # （Robinhood 公共节点系统性落后 7–9 块），不是分叉——丢弃，绝不清缓冲后以旧高度作链头。
+            if source == "rpc-poll" and previous and height < previous["height"]:
+                self.diag["pollBehind"][chain] += 1
+                return
             # A regression/conflicting head breaks continuity; never select a
             # pre-fork buffered head for a later hook. Solana heads carry no hash —
             # the parent slot is the continuity link: a new head must extend the
