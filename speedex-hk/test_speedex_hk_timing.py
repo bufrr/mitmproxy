@@ -7031,7 +7031,7 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.10.08-tap-sniff-v10.8")
+        self.assertEqual(A.ADDON_VERSION, "2026.10.08-tap-sniff-v10.9")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 
@@ -7998,6 +7998,7 @@ class TestWsSniff(unittest.TestCase):
         f.messages = [types.SimpleNamespace(content=frame, from_client=False)]
         A.SpeedexHkTiming().tcp_message(f)
         self.assertEqual(sn.hits, 1)
+        self.assertEqual(A._WS_SNIFF_STATS["hits.ws.gmgn.ai"] >= 1, True)  # v10.9 计数进 market-tap 快照
         A.MARKET_TAP.set_enabled(False)
         A.SpeedexHkTiming().tcp_message(f)
         self.assertEqual(sn.dead, "tap-disabled")  # 关 tap 即永久停嗅（解压上下文已断）
