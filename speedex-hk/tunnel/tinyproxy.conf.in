@@ -1,0 +1,22 @@
+# speedex 扫链测速透传隧道（tinyproxy，2026-10-10）——Trenches 浏览器经此出口，节点**不解密**。
+# 生产 speedex-mitm（:8443，选择性 MITM，资金批计时）不变；本服务只做 CONNECT 透传：
+# 仅 EU 服务器 IP 可用（Allow）、仅 443 端口（ConnectPort）、拒本地/私网目标（filter + systemd IPAddressDeny）。
+# install-tunnel.sh 把 __EU_IP__ 替换为 EU 服务器出口 IPv4。
+User tinyproxy
+Group tinyproxy
+Port 8444
+Listen 0.0.0.0
+Timeout 3600
+DefaultErrorFile "/usr/share/tinyproxy/default.html"
+Syslog On
+LogLevel Warning
+PidFile "/run/tinyproxy/tinyproxy.pid"
+MaxClients 300
+Allow __EU_IP__
+DisableViaHeader Yes
+XTinyproxy No
+Filter "/etc/tinyproxy/speedex-filter"
+FilterType ere
+FilterURLs Off
+FilterDefaultDeny No
+ConnectPort 443

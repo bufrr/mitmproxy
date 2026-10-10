@@ -1,0 +1,8 @@
+# systemd drop-in（/etc/systemd/system/tinyproxy.service.d/speedex.conf）：
+# 内核级出站拦截——透传隧道不得触达节点本机服务（8072 控制面、8443 MITM 等）或私网，
+# 主机名解析到回环（DNS 重绑定）亦拦截。__RESOLVER_ALLOW__ 放行本机解析器（systemd-resolved 127.0.0.53）。
+[Service]
+IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
+__RESOLVER_ALLOW__
+MemoryMax=128M
+TasksMax=512
