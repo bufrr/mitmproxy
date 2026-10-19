@@ -232,7 +232,12 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # deploy/hk-proxy/test_speedex_hk_timing.py 与 tests/hk-timing*.test.mjs 钉住。
 # v10.5（2026-10-07）：链头轮询按链节拍（RH/Arc 200ms、BSC/Sol 500ms，快照 intervalMs 按链
 # 如实）、429/错误退避、WS newHeads 主端点失败后试已知 WSS fallback、/health.diag.headWs 可见。
-ADDON_VERSION = "2026.10.08-head-poll-lag-v10.11"
+# v10.13（2026-10-19）：OKX approve+swap 走 /priapi/v6/dx/trade/multi/batchBroadcast 时，请求体
+# transactions[].signedTx 推导 tx 身份——keccak256(signed) 须等于行内 transactionHash，按签名交易
+# 自身的 calldata 选择器区分 approve(0x095ea7b3)/swap，恰一笔非 approve 才入锚（txHash+orderId），
+# 否则不入锚（fail-closed）。此前该形状无身份 → 腿 tx=None，EU 精确身份回配不到授权轮（Arc 授权轮推送缺失）。
+# （v10.12 号留给 2026-10-08 未合并的 WS 连接诊断 WIP。）
+ADDON_VERSION = "2026.10.19-okx-batch-broadcast-identity-v10.13"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -874,13 +879,112 @@ OKX_SOL_SEND_HOSTS = {
 }
 
 
+def _rlp_decode(b, i=0):
+    """Minimal RLP decoder → (item, next_index); item = bytes or list. Raises ValueError on malformed input."""
+    if i >= len(b):
+        raise ValueError("rlp: truncated")
+    p = b[i]
+    if p < 0x80:
+        return b[i:i + 1], i + 1
+    if p < 0xB8:
+        n = p - 0x80
+        if i + 1 + n > len(b):
+            raise ValueError("rlp: truncated string")
+        return b[i + 1:i + 1 + n], i + 1 + n
+    if p < 0xC0:
+        ln = p - 0xB7
+        n = int.from_bytes(b[i + 1:i + 1 + ln], "big")
+        start = i + 1 + ln
+        if start + n > len(b):
+            raise ValueError("rlp: truncated long string")
+        return b[start:start + n], start + n
+    if p < 0xF8:
+        n, start = p - 0xC0, i + 1
+    else:
+        ln = p - 0xF7
+        n = int.from_bytes(b[i + 1:i + 1 + ln], "big")
+        start = i + 1 + ln
+    end = start + n
+    if end > len(b):
+        raise ValueError("rlp: truncated list")
+    out, j = [], start
+    while j < end:
+        item, j = _rlp_decode(b, j)
+        out.append(item)
+    if j != end:
+        raise ValueError("rlp: list length mismatch")
+    return out, end
+
+
+def _evm_signed_tx_call(raw_hex):
+    """Signed EVM tx (legacy / EIP-2930 / EIP-1559) → {"to": 0x-hex|None, "selector": 0x-8hex|"0x"}; None if not decodable."""
+    try:
+        raw = bytes.fromhex(raw_hex[2:]) if isinstance(raw_hex, str) and raw_hex.startswith("0x") else None
+        if not raw:
+            return None
+        if raw[0] in (0x01, 0x02):
+            fields, end = _rlp_decode(raw, 1)
+            idx = (4, 6) if raw[0] == 0x01 else (5, 7)
+        elif raw[0] >= 0xC0:
+            fields, end = _rlp_decode(raw, 0)
+            idx = (3, 5)
+        else:
+            return None
+        if end != len(raw) or not isinstance(fields, list) or len(fields) <= idx[1]:
+            return None
+        to, data = fields[idx[0]], fields[idx[1]]
+        if not isinstance(to, bytes) or not isinstance(data, bytes) or len(to) not in (0, 20):
+            return None
+        return {"to": ("0x" + to.hex()) if to else None, "selector": "0x" + data[:4].hex()}
+    except (ValueError, IndexError):
+        return None
+
+
+_ERC20_APPROVE_SELECTOR = "0x095ea7b3"
+
+
+def _okx_batch_broadcast_ids(rows):
+    """OKX approve+swap batchBroadcast (transactions[].signedTx): the single non-approve signed tx is the order.
+    Each row: keccak256(signedTx) must equal its transactionHash; classification from the SIGNED calldata only.
+    Zero or >1 non-approve rows, undecodable/mismatched rows → {} (no anchor; fail-closed)."""
+    if not isinstance(rows, list) or not 1 <= len(rows) <= 4:
+        return {}
+    swaps = []
+    for row in rows:
+        if not isinstance(row, dict):
+            return {}
+        raw = row.get("signedTx")
+        if not isinstance(raw, str) or not re.fullmatch(r"0x(?:[0-9a-fA-F]{2}){16,131000}", raw):
+            return {}
+        h = _evm_raw_tx_hash(raw)
+        claimed = _transaction_id_value(row.get("transactionHash"))
+        if not h or (claimed is not None and claimed != h):
+            return {}
+        call = _evm_signed_tx_call(raw)
+        if call is None:
+            return {}
+        if call["selector"] != _ERC20_APPROVE_SELECTOR:
+            swaps.append((h, row))
+    if len(swaps) != 1:
+        return {}
+    h, row = swaps[0]
+    out = {"txHash": h}
+    oid = _id_value(row.get("orderId"))
+    if oid:
+        out["orderId"] = oid
+    return out
+
+
 def _okx_broadcast_request_ids(body):
-    """Only the observed single-transaction signedInfoList envelope, never signatures."""
+    """Only the observed single-transaction signedInfoList envelope (or the batchBroadcast transactions[]
+    envelope, v10.13), never signatures."""
     if len(body) > 262144:
         return {}
     obj = _j(body)
     if not isinstance(obj, dict):
         return {}
+    if "signedInfoList" not in obj and "transactions" in obj:
+        return _okx_batch_broadcast_ids(obj.get("transactions"))
     rows = obj.get("signedInfoList")
     if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
         return {}

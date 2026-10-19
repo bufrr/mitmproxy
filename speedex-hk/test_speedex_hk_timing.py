@@ -7062,7 +7062,7 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.10.08-head-poll-lag-v10.11")
+        self.assertEqual(A.ADDON_VERSION, "2026.10.19-okx-batch-broadcast-identity-v10.13")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 
@@ -7144,6 +7144,89 @@ class TestExactBroadcastAnchors(unittest.TestCase):
     def success(self, tx=None):
         return ws_frame("wsdexpri.okx.com", json.dumps({"arg": {"channel": "dex-swap-order-info"},
             "data": {"dexData": {"status": "1", "orderId": "order-one", "transactionHash": tx or self.H}}}))
+
+    # v10.13：approve+swap batchBroadcast 夹具——合成签名交易（RLP 编码，签名值为合成常量）
+    @staticmethod
+    def _rlp(x):
+        if isinstance(x, list):
+            body = b"".join(TestExactBroadcastAnchors._rlp(i) for i in x)
+            return (bytes([0xC0 + len(body)]) if len(body) < 56 else
+                    bytes([0xF7 + (len(len(body).to_bytes(8, "big").lstrip(b"\0")))]) + len(body).to_bytes(8, "big").lstrip(b"\0")) + body
+        if len(x) == 1 and x[0] < 0x80:
+            return x
+        return (bytes([0x80 + len(x)]) if len(x) < 56 else
+                bytes([0xB7 + len(len(x).to_bytes(8, "big").lstrip(b"\0"))]) + len(x).to_bytes(8, "big").lstrip(b"\0")) + x
+
+    @classmethod
+    def signed_tx(cls, data_hex, to="22" * 20, nonce=7, kind=2):
+        to_b, data = bytes.fromhex(to), bytes.fromhex(data_hex)
+        sig = [b"\x01", b"\x33" * 32, b"\x44" * 32]
+        if kind == 2:
+            body = [b"\x13\xb2", bytes([nonce]), b"\x01", b"\x02", b"\x52\x08", to_b, b"", data, []] + sig
+            return "0x02" + cls._rlp(body).hex()
+        if kind == 1:
+            body = [b"\x13\xb2", bytes([nonce]), b"\x02", b"\x52\x08", to_b, b"", data, []] + sig
+            return "0x01" + cls._rlp(body).hex()
+        body = [bytes([nonce]), b"\x02", b"\x52\x08", to_b, b"", data] + sig
+        return "0x" + cls._rlp(body).hex()
+
+    APPROVE_DATA = "095ea7b3" + "00" * 12 + "33" * 20 + "ff" * 32
+    SWAP_DATA = "0c307f76" + "ab" * 96
+
+    def batch_body(self, rows, simulate=True):
+        return json.dumps({"simulate": simulate, "chainId": 5042, "transactions": [
+            {"signedTx": r, "transactionHash": A._evm_raw_tx_hash(r), "orderId": f"order-{i}", "callDataOut": {}}
+            for i, r in enumerate(rows)]})
+
+    def batch(self, rows):
+        # 服务端广播：响应不含 tx hash（live 1792392759676-amyi4 arc/okx r4 形状）
+        return FakeFlow("web3.okx.com", "/priapi/v6/dx/trade/multi/batchBroadcast",
+            req_body=self.batch_body(rows), resp_body=json.dumps({"code": "0", "data": [{"orderId": "order-1"}]}))
+
+    def test_batch_broadcast_ids_pick_the_single_signed_swap(self):
+        approve, swap = self.signed_tx(self.APPROVE_DATA, nonce=7), self.signed_tx(self.SWAP_DATA, nonce=8)
+        ids = A._okx_broadcast_request_ids(self.batch_body([approve, swap]))
+        self.assertEqual(ids, {"txHash": A._evm_raw_tx_hash(swap), "orderId": "order-1"})
+        self.assertEqual(A._okx_broadcast_request_ids(self.batch_body([swap]))["txHash"], A._evm_raw_tx_hash(swap))
+        for kind in (0, 1):  # legacy / EIP-2930 envelopes decode too
+            sw = self.signed_tx(self.SWAP_DATA, kind=kind)
+            self.assertEqual(A._evm_signed_tx_call(sw)["selector"], "0x0c307f76", kind)
+            self.assertEqual(A._okx_broadcast_request_ids(self.batch_body([self.signed_tx(self.APPROVE_DATA, kind=kind), sw]))["txHash"],
+                             A._evm_raw_tx_hash(sw))
+
+    def test_batch_broadcast_ids_fail_closed(self):
+        approve, swap, swap2 = (self.signed_tx(self.APPROVE_DATA), self.signed_tx(self.SWAP_DATA, nonce=8),
+                                self.signed_tx(self.SWAP_DATA, nonce=9))
+        self.assertEqual(A._okx_broadcast_request_ids(self.batch_body([approve])), {}, "no swap")
+        self.assertEqual(A._okx_broadcast_request_ids(self.batch_body([swap, swap2])), {}, "two swaps")
+        lying = json.loads(self.batch_body([approve, swap]))
+        lying["transactions"][1]["transactionHash"] = "0x" + "9" * 64
+        self.assertEqual(A._okx_broadcast_request_ids(json.dumps(lying)), {}, "claimed hash != keccak(signed)")
+        bad = json.loads(self.batch_body([approve, swap]))
+        bad["transactions"][1]["signedTx"] = "0x02" + "ff" * 40
+        bad["transactions"][1]["transactionHash"] = A._evm_raw_tx_hash(bad["transactions"][1]["signedTx"])
+        self.assertEqual(A._okx_broadcast_request_ids(json.dumps(bad)), {}, "undecodable signed tx")
+        self.assertEqual(A._okx_broadcast_request_ids(json.dumps({"transactions": "x"})), {})
+
+    def test_batch_broadcast_leg_gets_swap_identity_and_success(self):
+        approve, swap = self.signed_tx(self.APPROVE_DATA, nonce=7), self.signed_tx(self.SWAP_DATA, nonce=8)
+        tx = A._evm_raw_tx_hash(swap)
+        f = self.batch([approve, swap]); t0 = self.clock
+        A.addons[0].request(f)
+        self.clock += 40
+        A.addons[0].response(f)
+        self.clock += 200
+        A.addons[0].websocket_message(ws_frame("wsdexpri.okx.com", json.dumps({"arg": {"channel": "dex-swap-order-info"},
+            "data": {"dexData": {"status": "1", "orderId": "order-1", "transactionHash": tx}}})))
+        formal = [x for x in A.STORE.legs[self.run] if not x["dup"]]
+        self.assertEqual(len(formal), 1)
+        leg = formal[0]
+        self.assertEqual(leg["tOrderOutMs"], t0)
+        tl = A.STORE.timeline(self.run, full=True)
+        row = next(x for x in tl["legs"] if x["anchorRole"] == "order" and not x["dup"])
+        self.assertEqual(row["txHash"], tx, "swap tx identity on the leg (EU exact-identity rebind works)")
+        self.assertEqual(row["hkL1aMs"], 240)
+        self.assertNotIn(swap[4:40], json.dumps(tl), "signed raw never persisted")
 
     def test_delayed_raw_ack_rehomes_success_and_original_head(self):
         early = self.raw(); t0 = self.clock
