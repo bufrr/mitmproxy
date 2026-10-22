@@ -241,7 +241,11 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # 跳号（漏通知 / Alpenglow 候选 slot 被跳过）视为跳过不清缓冲，同高异父与高度回退仍清；Alpenglow 后
 # 旧规则使约 4% 样本 stream-interrupted。② OKX Solana BlockRazor sendTransaction 体为 v1 交易
 # （首字节 129，签名在消息之后）时按 v1 布局取首签名（此前误当 compact-u16 签名数，身份必错 → 腿缺证据）。
-ADDON_VERSION = "2026.10.22-sol-slot-skip-v1-sig-v10.14"
+# v10.15（2026-10-22，speedex AG-3 选项 B）：Solana 链头对每个已登记 WSS 源（主 + publicnode 后备）各开一条
+# slotSubscribe，取最高 slot；落后源的较低 slot 与他源重复 slot 丢弃计数（diag.headPoll.wsBehind/wsLead），不再按
+# 回退清缓冲；样本记 wsOrigin。根因：公共 api.mainnet-beta 流间歇落后 20–39 slot 且不断线（HK 8 分钟实测 p90 20、
+# publicnode ≤2、CPU 闲）。EVM 不变（单源 + 失败轮换）。
+ADDON_VERSION = "2026.10.22-sol-multisource-head-v10.15"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -1825,6 +1829,9 @@ class ChainHeadWindow:
             "backoffMs": {},
             "rateLimited": defaultdict(int),
             "pollBehind": defaultdict(int),
+            # v10.15（AG-3 B）：多源 Solana ws-head 中被丢弃的落后/重复 slot 通知数，与各源领先次数
+            "wsBehind": defaultdict(int),
+            "wsLead": defaultdict(int),
         }
         # v10.5：WS newHeads 可观测（原先失败静默吞掉）。只记 host + 异常类名/状态码，
         # 计数有界（每链固定键），无 URL query/消息体/头。
@@ -1835,6 +1842,8 @@ class ChainHeadWindow:
             "lastErr": {},
             "active": {},
         }
+        # v10.15（Kimi review）：每链当前已订阅的 ws 源 host 集——多源时单个源断开不得清掉他源仍在推的头
+        self.ws_live = defaultdict(set)
 
     def diag_snapshot(self):
         with self.lock:
@@ -1846,6 +1855,8 @@ class ChainHeadWindow:
                 "backoffMs": dict(self.diag["backoffMs"]),
                 "rateLimited": dict(self.diag["rateLimited"]),
                 "pollBehind": dict(self.diag["pollBehind"]),
+                "wsBehind": dict(self.diag["wsBehind"]),
+                "wsLead": dict(self.diag["wsLead"]),
             }
 
     def ws_diag_snapshot(self):
@@ -1862,7 +1873,8 @@ class ChainHeadWindow:
         with self.lock:
             self.ws_diag["fail"][chain] += 1
             self.ws_diag["lastErr"][chain] = f"{host}: {reason}"[:120]
-            self.ws_diag["active"][chain] = None
+            self.ws_live[chain].discard(host)
+            self.ws_diag["active"][chain] = ",".join(sorted(self.ws_live[chain])) or None
 
     def _poll_call(self, chain, method, params):
         """单次轮询调用：默认走 keep-alive 客户端；测试注入 rpc_call 时走注入。"""
@@ -1897,12 +1909,20 @@ class ChainHeadWindow:
             if chain not in CHAINS:
                 continue
             self.samples[chain] = deque(maxlen=512)
-            for worker in (self._ws, self._poll):
-                thread = threading.Thread(target=worker, args=(chain,), daemon=True)
+            # v10.15（AG-3 选项 B，owner 2026-10-22）：Solana 对每个已登记 WSS 源各开一条 slotSubscribe，
+            # 取最高 slot——公共 api.mainnet-beta 流间歇落后 20–39 slot 却不断线（HK 实测），按失败换源的
+            # 单源轮换会一直吃滞后流。EVM 维持单源 + 失败轮换。
+            if chain == "solana" and self.connect is not None:
+                jobs = [(self._ws_fixed, (chain, url)) for url in _head_ws_urls(chain)]
+            else:
+                jobs = [(self._ws, (chain,))]
+            jobs.append((self._poll, (chain,)))
+            for worker, args in jobs:
+                thread = threading.Thread(target=worker, args=args, daemon=True)
                 self.threads.append(thread)
                 thread.start()
 
-    def add(self, chain, result, source, sent=None):
+    def add(self, chain, result, source, sent=None, origin=None):
         sol = chain == "solana"
         try:
             height = (
@@ -1940,6 +1960,26 @@ class ChainHeadWindow:
             if source == "rpc-poll" and previous and height < previous["height"]:
                 self.diag["pollBehind"][chain] += 1
                 return
+            # v10.15（AG-3 B，多源 Solana）：ws slot 低于已接受头 = 该源落后，不是回退——丢弃计数；同 slot
+            # 再到（他源，parent 相同/未知）= 重复，首到为准。同 slot 异 proven parent 仍落入下方分叉清空。
+            if (
+                sol
+                and source == "ws-head"
+                and previous
+                and (
+                    height < previous["height"]
+                    or (
+                        height == previous["height"]
+                        and (
+                            parent is None
+                            or previous.get("parent") is None
+                            or parent == previous["parent"]
+                        )
+                    )
+                )
+            ):
+                self.diag["wsBehind"][chain] += 1
+                return
             # A regression/conflicting head breaks continuity; never select a
             # pre-fork buffered head for a later hook. Solana heads carry no hash —
             # the parent slot is the continuity link: same height with a different
@@ -1972,8 +2012,11 @@ class ChainHeadWindow:
                     "observedTs": at,
                     "source": source,
                     "roundtripMs": None if sent is None else at - sent,
+                    **({"wsOrigin": origin} if sol and origin else {}),
                 }
             )
+            if sol and origin and source == "ws-head":
+                self.diag["wsLead"][f"{chain}|{origin}"] += 1
 
     def snapshot(self, run_id, at):
         with self.lock:
@@ -2090,6 +2133,22 @@ class ChainHeadWindow:
             else:
                 self.stop.wait(HEAD_WS_RETRY_S)
 
+    def _ws_fixed(self, chain, url):
+        """v10.15：单一端点常驻订阅（多源 Solana 用）——断开/失败只重连本端点，退避与轮换模式同参。"""
+        host = _host_of(url)
+        fails = 0
+        while not self.stop.is_set():
+            got_frame = self._ws_session(chain, url, host)
+            if self.stop.is_set():
+                break
+            if got_frame:
+                fails = 0
+                self.stop.wait(HEAD_WS_RETRY_S)
+            else:
+                fails += 1
+                lo, hi = HEAD_WS_CYCLE_BACKOFF_S
+                self.stop.wait(min(hi, lo * (2 ** min(fails - 1, 8))))
+
     def _ws_session(self, chain, url, host):
         """单个端点的一次订阅会话。返回是否收到过有效通知；失败/静默一律记 headWs 诊断。"""
         sol = chain == "solana"
@@ -2138,7 +2197,8 @@ class ChainHeadWindow:
                             last_progress = time.monotonic()
                             with self.lock:
                                 self.ws_diag["subscribed"][chain] += 1
-                                self.ws_diag["active"][chain] = host
+                                self.ws_live[chain].add(host)
+                                self.ws_diag["active"][chain] = ",".join(sorted(self.ws_live[chain]))
                         elif (
                             subscription is not None
                             and (msg.get("params") or {}).get("subscription")
@@ -2146,7 +2206,7 @@ class ChainHeadWindow:
                             and msg.get("method")
                             == ("slotNotification" if sol else "eth_subscription")
                         ):
-                            self.add(chain, msg["params"]["result"], "ws-head")
+                            self.add(chain, msg["params"]["result"], "ws-head", origin=host)
                             got_frame = True
                             last_progress = time.monotonic()
                     if reason is None and not self.stop.is_set():
@@ -2157,8 +2217,14 @@ class ChainHeadWindow:
                     with self.lock:
                         if ws in self.sockets:
                             self.sockets.remove(ws)
+                        self.ws_live[chain].discard(host)
+                        # 窗口运行中某源断开 → active 只留仍订阅的源；正常关窗（stop）保留最后服务源供诊断
+                        if not self.stop.is_set():
+                            self.ws_diag["active"][chain] = ",".join(sorted(self.ws_live[chain])) or None
+                        # 只有该链再无任何已订阅 ws 源时才清空 ws 头（多源时他源仍在推，不得连坐）
                         if (
-                            self.samples.get(chain)
+                            not self.ws_live[chain]
+                            and self.samples.get(chain)
                             and self.samples[chain][-1]["source"] == "ws-head"
                         ):
                             self.samples[chain].clear()

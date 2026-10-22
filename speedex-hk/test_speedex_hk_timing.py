@@ -6261,13 +6261,119 @@ class TestChainHeadSolForkContinuity(unittest.TestCase):
             self.assertEqual(
                 (snap["status"], snap["height"], snap["parent"]), ("ok", 105, 102)
             )
-            # 高度回退（更低 slot）同样清空（与 EVM 同律）
+            # v10.15（AG-3 B）：更低的 ws slot = 落后源，丢弃计数，不清缓冲（头仍 105）
             now[0] = 1500
             c.add("solana", {"parent": 101, "slot": 102, "root": 101}, "ws-head")
+            self.assertEqual(c.snapshot("sol-heads", 1450)["solana"]["height"], 105)
+            self.assertEqual(c.snapshot("sol-heads", 1550)["solana"]["height"], 105)
+            self.assertEqual(c.diag_snapshot()["wsBehind"], {"solana": 1})
+        finally:
+            c.close()
+
+    def test_sol_multisource_highest_slot_wins_v10_15(self):
+        """v10.15 AG-3 B：多源 Solana——落后源低 slot 丢弃、同 slot 重复首到为准、记 wsOrigin 与 diag。"""
+        now = [1000]
+        c = self._window(now)
+        try:
+            c.add("solana", {"parent": 499, "slot": 500, "root": 498}, "ws-head", origin="solana.publicnode.com")
+            now[0] = 1050
+            c.add("solana", {"parent": 475, "slot": 476, "root": 474}, "ws-head", origin="api.mainnet-beta.solana.com")
+            now[0] = 1100
+            c.add("solana", {"parent": 499, "slot": 500, "root": 498}, "ws-head", origin="api.mainnet-beta.solana.com")
+            snap = c.snapshot("sol-heads", 1150)["solana"]
             self.assertEqual(
-                c.snapshot("sol-heads", 1450)["solana"]["status"], "no-pre-anchor-head"
+                (snap["status"], snap["height"], snap["observedTs"], snap["wsOrigin"]),
+                ("ok", 500, 1000, "solana.publicnode.com"),
             )
-            self.assertEqual(c.snapshot("sol-heads", 1550)["solana"]["height"], 102)
+            now[0] = 1200
+            c.add("solana", {"parent": 500, "slot": 501, "root": 499}, "ws-head", origin="api.mainnet-beta.solana.com")
+            snap = c.snapshot("sol-heads", 1250)["solana"]
+            self.assertEqual((snap["height"], snap["wsOrigin"]), (501, "api.mainnet-beta.solana.com"))
+            d = c.diag_snapshot()
+            self.assertEqual(d["wsBehind"], {"solana": 2})
+            self.assertEqual(
+                d["wsLead"],
+                {"solana|solana.publicnode.com": 1, "solana|api.mainnet-beta.solana.com": 1},
+            )
+            # 同 slot 异 proven parent 仍是分叉——清空重锚
+            now[0] = 1300
+            c.add("solana", {"parent": 499, "slot": 501, "root": 498}, "ws-head", origin="solana.publicnode.com")
+            self.assertEqual(c.snapshot("sol-heads", 1250)["solana"]["status"], "no-pre-anchor-head")
+        finally:
+            c.close()
+
+    def test_sol_one_source_ending_keeps_other_sources_heads_v10_15(self):
+        """Kimi review（v10.15）：多源时单个 Solana ws 会话结束不得清掉他源仍在推的头；最后一个源结束才清。"""
+        import json as _json
+
+        def fake_connect(slot):
+            msgs = [_json.dumps({"jsonrpc": "2.0", "id": 1, "result": 7}),
+                    _json.dumps({"jsonrpc": "2.0", "method": "slotNotification",
+                                 "params": {"subscription": 7, "result": {"slot": slot, "parent": slot - 1, "root": slot - 2}}})]
+
+            class FakeWS:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+                def send(self, _):
+                    pass
+
+                def recv(self, timeout=None):
+                    if msgs:
+                        return msgs.pop(0)
+                    raise RuntimeError("closed")
+
+            return lambda url, **k: FakeWS()
+
+        now = [1000]
+        c = self._window(now)
+        try:
+            c.ws_live["solana"].add("solana.publicnode.com")  # another source still subscribed
+            c.connect = fake_connect(500)
+            c._ws_session("solana", "wss://api.mainnet-beta.solana.com/", "api.mainnet-beta.solana.com")
+            snap = c.snapshot("sol-heads", 1100)["solana"]
+            self.assertEqual((snap["status"], snap["height"]), ("ok", 500), "other source live → heads kept")
+            self.assertEqual(c.ws_diag_snapshot()["active"]["solana"], "solana.publicnode.com")
+            c.ws_live["solana"].discard("solana.publicnode.com")  # last other source gone
+            now[0] = 1200
+            c.connect = fake_connect(501)
+            c._ws_session("solana", "wss://solana-rpc.publicnode.com/", "solana-rpc.publicnode.com")
+            self.assertEqual(c.snapshot("sol-heads", 1250)["solana"]["status"], "no-pre-anchor-head",
+                             "no subscribed source left → ws heads cleared (old single-source behaviour)")
+        finally:
+            c.close()
+
+    def test_sol_start_subscribes_every_registered_wss_source_v10_15(self):
+        """v10.15：start() 对 Solana 每个 _head_ws_urls 源各起一条常驻订阅；EVM 仍单源轮换。"""
+        seen = []
+
+        class FakeWS:
+            def __init__(self, url):
+                self.url = url
+
+            def __enter__(self):
+                seen.append(self.url)
+                raise OSError("offline")
+
+            def __exit__(self, *a):
+                return False
+
+        c = A.ChainHeadWindow(rpc_call=lambda *a, **k: None, connect=lambda url, **k: FakeWS(url), clock=lambda: 1000)
+        try:
+            c.start("multi", ["solana", "robinhood"])
+            deadline = time.time() + 3
+            want = set(A._head_ws_urls("solana"))
+            while time.time() < deadline and not want.issubset(set(seen)):
+                time.sleep(0.05)
+            self.assertTrue(len(want) >= 2, want)
+            self.assertTrue(want.issubset(set(seen)), (want, seen))
+            ws_threads = [t for t in c.threads if getattr(t, "_target", None) == c._ws_fixed]
+            self.assertEqual(len(ws_threads), len(want), "one fixed subscription per Solana source")
+            evm = [t for t in c.threads if getattr(t, "_target", None) == c._ws]
+            self.assertEqual(len(evm), 1, "EVM keeps a single rotating subscription")
         finally:
             c.close()
 
@@ -7060,7 +7166,7 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.10.22-sol-slot-skip-v1-sig-v10.14")
+        self.assertEqual(A.ADDON_VERSION, "2026.10.22-sol-multisource-head-v10.15")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 
