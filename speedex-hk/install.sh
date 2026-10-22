@@ -77,7 +77,13 @@ chmod 700 "$APP"
 # review R29（2026-09-05）：依赖全部锁定——同源码不同 runtime 的部署漂移已实测发生
 # （两节点曾 12.2.3/11.0.2 并存）。升降级走改这里+重装，不靠「可执行文件存在」。
 # mitmproxy 12.x 需要 Python≥3.12；py3.11 节点锁 11.0.2（对齐路径 = OS/Python 升级）。
-PYVER="$(python3 -c 'import sys;print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+# 2026-10-22（hk-vmiss-2：Debian 12 系统 python 3.11）：钉选与 venv 用的解释器——SPEEDEX_HK_PYTHON 显式覆盖；
+# 否则独立解释器 /opt/speedex-python/bin/python3（uv 安装的 python-build-standalone 3.12）存在即优先；
+# 都没有才用系统 python3。避免重跑 install.sh 把已升 3.12/12.3 的节点按系统 3.11 重建回 11.0.2。
+HK_PY="${SPEEDEX_HK_PYTHON:-}"
+[ -z "$HK_PY" ] && [ -x /opt/speedex-python/bin/python3 ] && HK_PY=/opt/speedex-python/bin/python3
+[ -z "$HK_PY" ] && HK_PY=python3
+PYVER="$("$HK_PY" -c 'import sys;print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
 if [ "$(printf '%s\n3.12\n' "$PYVER" | sort -V | head -1)" = "3.12" ]; then
   MITM_PROXY_VER=12.3.0  # 2026-10-22：12.3 的 certifi>=2026.10.19 不再信任 eMudhra emSign ECC Root CA - G3（中间 CA 私钥泄露）
   MSGPACK_VER=1.1.2
@@ -99,7 +105,7 @@ if [ -x "$APP/venv/bin/python" ]; then
   fi
 fi
 [ -x "$APP/venv/bin/mitmdump" ] || {
-  python3 -m venv "$APP/venv"
+  "$HK_PY" -m venv "$APP/venv"
   "$APP/venv/bin/pip" install -q --upgrade pip
 }
 # 幂等收敛：版本不符即重装到锁定集（含既有节点的升级/降级）

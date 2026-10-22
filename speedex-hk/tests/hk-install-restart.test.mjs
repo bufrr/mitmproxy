@@ -469,3 +469,20 @@ test('NR-01：GNU shim 无条件安装；GNU_TOOL_DIRS 置空强制 python 回�
   }).trim();
   assert.equal(rpOut, path.join(fs.realpathSync(fx.root), 'a', 'c'), 'realpath -m 回退必须压平 ./..// 段');
 });
+
+test('SPEEDEX_HK_PYTHON（2026-10-22 hk-vmiss-2）：系统 python3 为 3.11 时用指定 3.12 解释器选钉选集——不按 3.11 重建 venv', () => {
+  const fx = buildFixture({ active: true });
+  try {
+    // 系统 python3 报 3.11（Debian 12）；指定解释器报 3.12（/opt/speedex-python 形态）
+    writeStub(path.join(fx.bin, 'python3'), `#!/bin/sh
+if [ "$1" = "-c" ]; then echo "3.11"; exit 0; fi
+exec "$REALPY" "$@"
+`);
+    const py312 = path.join(fx.root, 'py312');
+    writeStub(py312, STUBS.python3);
+    const out = runInstall(fx, { SPEEDEX_HK_PYTHON: py312 });
+    assert.doesNotMatch(out, /重建 venv/, 'venv python 3.12 = 选定解释器 3.12 → 不重建');
+  } finally {
+    fs.rmSync(fx.root, { recursive: true, force: true });
+  }
+});

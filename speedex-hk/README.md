@@ -28,7 +28,7 @@ speedex 主仓只保留消费侧 `scripts/lib/hk-timing-client.mjs` 等与部署
 
 ## 部署目标版本
 
-mitmproxy pip 钉版（`install.sh`）：12.3.0（python 3.13 节点；2026-10-22 自 12.2.3 升级，eMudhra CA 泄露后 certifi 去信任）/ 11.0.2（python 3.11 节点），
+mitmproxy pip 钉版（`install.sh`）：12.3.0（python ≥3.12 节点；2026-10-22 自 12.2.3 升级，eMudhra CA 泄露后 certifi 去信任。钉选解释器：`SPEEDEX_HK_PYTHON` > `/opt/speedex-python/bin/python3`（uv 独立 3.12，hk-vmiss-2 Debian 12 用）> 系统 python3）/ 11.0.2（python 3.11 节点），
 `websockets==17.1`、`msgpack==1.1.2/1.1.0`。上游源码树**不被本目录修改**——
 我们只消费 pip 安装的 mitmproxy hook API。
 
