@@ -1,0 +1,58 @@
+[Unit]
+Description=speedex HK timing proxy — ISOLATED EXPERIMENT instance (selective GMGN/OKX MITM scaffolding, default OFF)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# ============================================================================
+# 隔离实验实例（2026-09-08 脚手架；SOP 与可行性：docs/plans/hk-selective-mitm.md）
+#
+# 与生产 speedex-mitm.service 完全隔离：
+#   - APP 目录 /opt/speedex-mitm-exp（独立 htpasswd / proxy.env / CA confdir）
+#   - 代理监听 127.0.0.1:18544（loopback-only，不公网——只经 SSH 隧道供
+#     隔离研究 Chrome 访问；生产为 0.0.0.0:8443）
+#   - 控制面意图端口 127.0.0.1:18072（生产 8072）
+#   - install.sh 实验分支拒绝任何生产端口/路径/unit 名
+#
+# ⚠ 默认 OFF 是策略门（非技术阻塞）：addon 消费 SPEEDEX_HK_CTRL_PORT
+#   （_ctrl_port()，非法值回退 8072）——本 unit 控制面 18072 与生产 8072 并存
+#   不 bind 冲突。本 unit 仍只安装不启动（install.sh 默认不 enable；SOP +
+#   当次授权后 SPEEDEX_HK_EXP_START=1 才启动）。
+#
+# ⚠ allow_hosts 与生产一致——GMGN/OKX 保持透传（默认 OFF）。候选主机
+#   regex 见 deploy/hk-proxy/selective-decrypt.overlay.example；未经
+#   SOP 逐步 A/B 与当次授权不得并入。改后必须按 overlay 文末核验进程实际
+#   收到的转义形式，并重建实验连接（旧 WSS 不重握手）。
+#
+# 诊断最小化（契约详见 overlay 文件）：host/已登记 path 类别/固定错误类别/
+# 状态码/协议/帧计数与尺寸/资源水位/脱敏身份；绝不落认证头、token、完整
+# query、签名 body、完整抓包。install.sh 实验分支拒绝 flow_detail≥2 与
+# save_stream_file。观察-only：不改请求、不自动重试、不独立广播。
+# 认证沿用 htpasswd 文件（0600，凭据不上 argv/environ）——loopback 隧道
+# 端点同样强制认证。
+# ============================================================================
+WorkingDirectory=/opt/speedex-mitm-exp
+Environment=SPEEDEX_HK_CTRL_PORT=18072
+ExecStart=/opt/speedex-mitm-exp/venv/bin/mitmdump \
+  --mode regular \
+  --listen-host 127.0.0.1 \
+  --listen-port 18544 \
+  --proxyauth @/opt/speedex-mitm-exp/htpasswd \
+  --set confdir=/opt/speedex-mitm-exp/.mitmproxy \
+  --set flow_detail=1 \
+  --set stream_large_bodies=256k \
+  --set body_size_limit=2m \
+  --set keep_host_header=false \
+  --set block_global=false \
+  --set "allow_hosts=^(.*\\.)?(turnkey\\.com|padre\\.gg|binance\\.com|fomo\\.family|relay\\.link)(:\\d+)?$" \
+  -s /opt/speedex-mitm-exp/speedex_hk_timing.py \
+  --quiet
+Restart=always
+RestartSec=3
+# 与生产同律：1G 小机 mitmproxy RSS 常态 150-300MB，留余量
+MemoryMax=700M
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
