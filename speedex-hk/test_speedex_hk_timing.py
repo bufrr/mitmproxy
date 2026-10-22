@@ -1,0 +1,8893 @@
+"""speedex_hk_timing addon 离线单测——无需 mitmproxy/网络（flow 用合成桩，
+_jsonrpc 轮询打桩）。帧形状全部来自仓库夹具/文档（tests/classify-ws.test.mjs、
+fomo-runner.test.mjs、binance-ws.test.mjs、runner-core.mjs 引用的生产样本）。
+运行：python3 deploy/hk-proxy/test_speedex_hk_timing.py（或 verify 的 node 包装）。"""
+
+# Socket-boundary fixture: never bind or contact host production/tunnel ports.
+# Keep requested port semantics (8072/18072) for resolver/rebind assertions,
+# while each real test HTTP server binds an OS-assigned port. Reloaded addon
+# modules see the same fixture; all servers are owned by this test process.
+import atexit
+import http.server
+import json
+import zlib
+import os
+import re
+import sys
+import time
+import threading
+import types
+import unittest
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from unittest.mock import patch
+
+_REAL_HTTP_SERVER = http.server.ThreadingHTTPServer
+_TEST_SERVERS = {}
+_ALL_TEST_SERVERS = []
+
+
+class IsolatedHTTPServer(_REAL_HTTP_SERVER):
+    def __init__(self, address, handler, *args, **kwargs):
+        host, requested_port = address
+        if host != "127.0.0.1":
+            raise AssertionError("test control server must remain loopback")
+        super().__init__((host, 0), handler, *args, **kwargs)
+        _TEST_SERVERS[requested_port] = self
+        _ALL_TEST_SERVERS.append(self)
+
+
+def _close_test_servers():
+    for server in _ALL_TEST_SERVERS:
+        server.server_close()
+    http.server.ThreadingHTTPServer = _REAL_HTTP_SERVER
+
+
+http.server.ThreadingHTTPServer = IsolatedHTTPServer
+atexit.register(_close_test_servers)
+
+sys.path.insert(0, str(Path(__file__).parent))
+import speedex_hk_timing as A  # noqa: E402
+
+# Control-plane tests never start live head transports. Collector is exercised below.
+A._start_heads = lambda *_: None
+
+
+class FakeWSMsg:
+    def __init__(self, content, from_client=False):
+        self.content = content
+        self.from_client = from_client
+
+
+class FakeReq:
+    def __init__(self, host, path, method="POST", body=""):
+        self.pretty_host = host
+        self.path = path
+        self.method = method
+        self._body = body
+
+    def get_text(self):
+        return self._body
+
+
+class FakeResp:
+    def __init__(self, body=""):
+        self._body = body
+
+    def get_text(self):
+        return self._body
+
+
+class FakeFlow:
+    def __init__(self, host, path, method="POST", req_body="", resp_body=""):
+        self.request = FakeReq(host, path, method, req_body)
+        self.response = FakeResp(resp_body)
+        self.metadata = {}
+        self.id = "flow-" + str(abs(hash((host, path, time.monotonic_ns()))) % 10**8)
+        self.websocket = None
+
+
+def ws_frame(host, payload, from_client=False):
+    f = FakeFlow(host, "/ws")
+    f.websocket = types.SimpleNamespace(messages=[FakeWSMsg(payload, from_client)])
+    return f
+
+
+def fresh():
+    A.STORE = A.Store()
+    return A.STORE
+
+
+# r8（PX-01）：Turnkey `POST /public/v1/submit/sign_raw_payload` 的**真实响应形状**——
+# ActivityResponse 信封（docs.turnkey.com api-reference sign-raw-payload；全部值合成）：
+# activity.id 是签名活动 UUID（不是订单号）、intent.payload 是签名摘要（不是 tx hash）、
+# result.signRawPayloadResult 只有 r/s/v 签名分量——**没有任何订单/交易身份键**。
+TURNKEY_ACTIVITY_ID = "3f1c9e2a-7b4d-4c0e-9a11-0000000000d1"
+
+
+def turnkey_sign_response(now_ms=None):
+    now_ms = now_ms or int(time.time() * 1000)
+    return json.dumps(
+        {
+            "activity": {
+                "id": TURNKEY_ACTIVITY_ID,
+                "organizationId": "9b2d7c1e-1111-4222-8333-0000000000d2",
+                "status": "ACTIVITY_STATUS_COMPLETED",
+                "type": "ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2",
+                "timestampMs": str(now_ms),
+                "intent": {
+                    "signRawPayloadIntentV2": {
+                        "signWith": "0x" + "ab" * 20,
+                        "payload": "d1" * 32,  # 签名摘要（64 hex），不是交易 hash
+                        "encoding": "PAYLOAD_ENCODING_HEXADECIMAL",
+                        "hashFunction": "HASH_FUNCTION_NO_OP",
+                    }
+                },
+                "result": {
+                    "signRawPayloadResult": {"r": "1a" * 32, "s": "2b" * 32, "v": "01"}
+                },
+                "votes": [],
+                "fingerprint": "sha256:" + "00" * 8,
+                "canApprove": False,
+                "canReject": False,
+                "createdAt": {"seconds": str(now_ms // 1000), "nanos": "0"},
+                "updatedAt": {"seconds": str(now_ms // 1000), "nanos": "0"},
+            }
+        }
+    )
+
+
+def padre_sign_leg(run, anchor_hash=None, req_body="{}", manifest=None):
+    """Turnkey sign 请求 + **真实形状**响应建 sign 腿（生产路径：响应不提供任何锚）。
+    anchor_hash 非空时**直接注入**独立锚（A.STORE.update_anchor）——模拟未来 Padre 自有
+    下单通道（client→_multiplex 请求帧）提供的锚源，生产今日**不存在**；只为保住
+    DONE/新鲜度/同节点/锚门（k2x54 重放等事故边界）的覆盖，不代表 Padre 今日可观测。"""
+    if manifest is not None:
+        A.STORE.mark_open(run, manifest=manifest)
+    else:
+        A.STORE.mark_open(run)
+    f = FakeFlow(
+        "api.turnkey.com",
+        "/public/v1/submit/sign_raw_payload",
+        "POST",
+        req_body,
+        resp_body=turnkey_sign_response(),
+    )
+    A.addons[0].request(f)
+    A.addons[0].response(f)
+    leg = A.STORE.legs[run][-1]
+    if anchor_hash:
+        A.STORE.update_anchor(leg, {"txHash": anchor_hash})
+    return leg
+
+
+class TestHkTiming(unittest.TestCase):
+    def setUp(self):
+        fresh()
+
+    def test_mark_shape(self):
+        A.STORE.mark_open("r1", "t")
+        self.assertTrue(A.STORE.any_open())
+        A.STORE.mark_close("r1")
+        self.assertFalse(A.STORE.any_open())
+
+    def test_okx_full_leg(self):
+        """OKX：broadcast 响应结构化抽 hash/orderId（键白名单，r8）；dex-swap-order-info status "1" 成功帧。"""
+        A.STORE.mark_open("run-okx")
+        orig = A._jsonrpc
+        A._jsonrpc = lambda url, m, p, timeout=10: {
+            "status": "0x1",
+            "blockNumber": "0x1",
+            "blockHash": "0x" + "99" * 32,
+            "transactionHash": "0x" + "ab" * 32,
+        }
+        try:
+            f = FakeFlow(
+                "web3.okx.com",
+                "/priapi/v6/dx/trade/multi/broadcast",
+                "POST",
+                req_body=json.dumps({"data": {"chainId": "56"}}),
+                resp_body=json.dumps(
+                    {
+                        "code": "0",
+                        "data": {
+                            "transactionHash": "0x" + "ab" * 32,
+                            "orderId": "ord1",
+                        },
+                    }
+                ),
+            )
+            A.addons[0].request(f)
+            A.addons[0].response(f)
+            time.sleep(0.05)
+            # 创建帧不算成功
+            A.addons[0].websocket_message(
+                ws_frame(
+                    "wsdexpri.okx.com",
+                    json.dumps(
+                        {
+                            "arg": {"channel": "dex-swap-order-info"},
+                            "data": {"dexData": {"status": "0", "orderId": "ord1"}},
+                        }
+                    ),
+                )
+            )
+            self.assertIsNone(A.STORE.timeline("run-okx")["legs"][0]["hkL1aMs"])
+            # 成功帧
+            A.addons[0].websocket_message(
+                ws_frame(
+                    "wsdexpri.okx.com",
+                    json.dumps(
+                        {
+                            "arg": {"channel": "dex-swap-order-info"},
+                            "data": {
+                                "dexData": {
+                                    "status": "1",
+                                    "orderId": "ord1",
+                                    "transactionHash": "0x" + "ab" * 32,
+                                }
+                            },
+                        }
+                    ),
+                )
+            )
+            time.sleep(0.25)
+        finally:
+            A._jsonrpc = orig
+        leg = A.STORE.timeline("run-okx")["legs"][0]
+        self.assertEqual(leg["chain"], "bsc")
+        self.assertIsNotNone(leg["hkL1aMs"])
+        self.assertIsNotNone(leg["hkL3Ms"])
+        self.assertEqual(leg["txHash"], "0xabababab…ababab")
+        self.assertIsNone(leg["incomplete"])
+        # R24：receipt 证据存块身份
+        rc = leg["evidence"]["receipt"]
+        self.assertEqual(rc["blockHash"], "0x" + "99" * 32)
+        self.assertEqual(rc["blockNumber"], "0x1")
+
+    def test_gmgn_processed_order_info(self):
+        """GMGN：swap_batch_order 下单；tg_processed_order_info st=successful si=buy。"""
+        A.STORE.mark_open("run-g")
+        orig = A._jsonrpc
+        A._jsonrpc = lambda url, m, p, timeout=10: {
+            "value": [
+                {"confirmationStatus": "confirmed", "err": None, "slot": 287654321}
+            ]
+        }
+        sig = "5" * 88
+        try:
+            f = FakeFlow(
+                "gmgn.ai",
+                "/tapi/v1/swap_batch_order",
+                "POST",
+                resp_body=json.dumps({"data": {"hash": sig, "orderId": "g1"}}),
+            )
+            A.addons[0].request(f)
+            A.addons[0].response(f)
+            A.addons[0].websocket_message(
+                ws_frame(
+                    "ws.gmgn.ai",
+                    json.dumps(
+                        {
+                            "channel": "tg_processed_order_info",
+                            "data": [
+                                {
+                                    "h": sig,
+                                    "oi": "g1",
+                                    "st": "successful",
+                                    "si": "buy",
+                                    "ch": "sol",
+                                }
+                            ],
+                        }
+                    ),
+                )
+            )
+            time.sleep(0.25)
+        finally:
+            A._jsonrpc = orig
+        leg = A.STORE.timeline("run-g")["legs"][0]
+        self.assertIsNotNone(leg["hkL1aMs"])
+        self.assertIsNotNone(leg["hkL3Ms"], "base58 sig → solana 轮询")
+        self.assertEqual(
+            leg["evidence"]["receipt"]["slot"], 287654321, "R24：Sol receipt 存 slot"
+        )
+        # 卖单不采纳（新开窗口前先关旧窗口——单批纪律与生产一致）
+        A.STORE.mark_close("run-g")
+        A.STORE.mark_open("run-g2")
+        f = FakeFlow(
+            "gmgn.ai",
+            "/tapi/v1/swap_batch_order",
+            "POST",
+            resp_body=json.dumps({"data": {"hash": sig, "orderId": "g2"}}),
+        )
+        A.addons[0].request(f)
+        A.addons[0].response(f)
+        A.addons[0].websocket_message(
+            ws_frame(
+                "ws.gmgn.ai",
+                json.dumps(
+                    {
+                        "channel": "tg_processed_order_info",
+                        "data": [
+                            {"h": sig, "oi": "g2", "st": "successful", "si": "sell"}
+                        ],
+                    }
+                ),
+            )
+        )
+        self.assertIsNone(A.STORE.timeline("run-g2")["legs"][0]["hkL1aMs"])
+
+    def test_padre_msgpack_done(self):
+        """PX-01（r8，案例 D）：Padre 出站锚只有 Turnkey sign_raw_payload——其**真实**响应
+        是 ActivityResponse（activity.id 签名活动 UUID / intent.payload 签名摘要 /
+        result.signRawPayloadResult r,s,v），**没有任何订单/交易身份键** → 腿无独立锚 →
+        任何 DONE 帧（无 orderId / 回显活动 UUID 作 orderId / 他单 orderId）都不得正向
+        匹配：不产 L1a′、不挂 hash、不起 receipt 轮询；关窗后 sign 腿如实
+        no-execution-proof，授权槽占位 no-order-observed，counts attempted=observed=0。
+        旧夹具 `{"transactionHash": …}` 是捏造的 Turnkey 响应（真实响应无此键），旧正则
+        曾把 activity.id 写成 orderId（evidence.anchor.legacyRegexDiverged 如实为 true）。
+        DONE 门本身的正向覆盖见 test_padre_stale_replay_rejected（注入锚）。"""
+        import msgpack
+
+        polled = []
+        orig = A._poll_receipt
+        A._poll_receipt = lambda *a, **k: polled.append(a)
+        try:
+            leg_int = padre_sign_leg(
+                "run-p",
+                manifest={
+                    "version": 1,
+                    "runId": "run-p",
+                    "rounds": 1,
+                    "legs": [{"platform": "padre", "chain": "bsc", "rounds": 1}],
+                },
+            )
+            self.assertEqual(
+                leg_int["_anchor"],
+                {},
+                "真实 Turnkey 响应不得建立任何锚（activity.id 不是订单号）",
+            )
+            h = "0x" + "dd" * 32
+            now_ms = int(time.time() * 1000)
+            for node in (
+                {"txnStatus": "DONE", "txnHash": h, "creationTime": now_ms},
+                {
+                    "txnStatus": "DONE",
+                    "txnHash": h,
+                    "orderId": TURNKEY_ACTIVITY_ID,
+                    "creationTime": now_ms,
+                },
+                {
+                    "txnStatus": "DONE",
+                    "txnHash": h,
+                    "orderId": "padre-order-77",
+                    "creationTime": now_ms,
+                },
+            ):
+                A.addons[0].websocket_message(
+                    ws_frame("backend3.padre.gg", msgpack.packb([373, 200, node]))
+                )
+            open_leg = A.STORE.timeline("run-p")["legs"][0]
+            self.assertIsNone(
+                open_leg["hkL1aMs"],
+                "无独立锚 → DONE 不得算成功（含回显活动 UUID 的帧）",
+            )
+            self.assertIsNone(open_leg["txHash"], "无锚帧 hash 不得挂载")
+            self.assertEqual(open_leg["anchorRole"], "sign", "不得晋升 order")
+            self.assertEqual(polled, [], "无锚帧不得触发 receipt 轮询")
+            A.STORE.mark_close("run-p")
+        finally:
+            A._poll_receipt = orig
+        tl = A.STORE.timeline("run-p")
+        self.assertEqual(
+            tl["counts"], {"requested": 1, "attempted": 0, "observed": 0, "unbound": 0}
+        )
+        sign, ph = tl["legs"]
+        self.assertEqual(
+            (sign["anchorRole"], sign["incomplete"]), ("sign", "no-execution-proof")
+        )
+        self.assertEqual(
+            sign["evidence"]["anchor"]["keys"], [], "锚键为空——缺失原因在输出可见"
+        )
+        self.assertTrue(
+            sign["evidence"]["anchor"]["legacyRegexDiverged"],
+            "旧正则会把 activity.id 当 orderId——分歧如实记录",
+        )
+        self.assertEqual(ph["incomplete"], "no-order-observed", "授权槽占位保留")
+        self.assertEqual(
+            A.STORE.diag.get("wsFrameNoLegMatch"),
+            3,
+            "三帧带身份却无腿可归属——计诊断，不静默",
+        )
+        self.assertEqual(
+            tl["diag"].get("wsFrameNoLegMatch"), 3, "per-run diag 同步透出"
+        )
+
+    def test_padre_stale_replay_rejected(self):
+        """k2x54 实证：padre 会重放上一批的 FILLED 帧——带旧 creationTime 的帧整帧弃用。
+        R07 加严后分两道门各自验证：①锚匹配但源时间陈旧 → 拒（纯新鲜性门）；
+        ②新鲜但 hash 与锚不匹配 → 拒（纯关联门）；③锚匹配+新鲜 → 采纳。
+        r8：锚由测试直接注入（生产今日无 Padre 锚源，见 padre_sign_leg）。"""
+        import msgpack
+
+        h_anchor = "0x" + "88" * 32
+        orig = A._jsonrpc
+        A._jsonrpc = lambda url, m, p, timeout=10: {
+            "status": "0x1",
+            "blockNumber": "0x1",
+            "blockHash": "0x" + "99" * 32,
+            "transactionHash": h_anchor,
+        }
+        try:
+            padre_sign_leg("run-ps", anchor_hash=h_anchor)
+            old_ms = int((time.time() - 3600) * 1000)  # 1 小时前的重放帧
+            # ①锚匹配但陈旧：纯新鲜性门拒收（不得凭锚匹配绕过陈旧门）
+            stale = msgpack.packb(
+                [
+                    373,
+                    200,
+                    {"txnStatus": "DONE", "txnHash": h_anchor, "creationTime": old_ms},
+                ]
+            )
+            A.addons[0].websocket_message(ws_frame("backend3.padre.gg", stale))
+            leg0 = A.STORE.timeline("run-ps")["legs"][0]
+            self.assertIsNone(leg0["hkL1aMs"], "陈旧重放 DONE 不得算成功")
+            # ②新鲜但锚不匹配：纯关联门拒收（锚 hash 不得被覆盖）
+            mismatched = msgpack.packb(
+                [
+                    373,
+                    200,
+                    {
+                        "txnStatus": "DONE",
+                        "txnHash": "0x" + "77" * 32,
+                        "creationTime": int(time.time() * 1000),
+                    },
+                ]
+            )
+            A.addons[0].websocket_message(ws_frame("backend3.padre.gg", mismatched))
+            leg1 = A.STORE.timeline("run-ps")["legs"][0]
+            self.assertIsNone(leg1["hkL1aMs"], "锚不匹配的新鲜 DONE 不得算成功")
+            self.assertEqual(
+                leg1["txHash"], "0x88888888…888888", "冲突帧不得覆盖锚 hash"
+            )
+            # ③锚匹配 + 新鲜（creationTime=now）正常采纳
+            fresh = msgpack.packb(
+                [
+                    373,
+                    200,
+                    {
+                        "txnStatus": "DONE",
+                        "txnHash": h_anchor,
+                        "creationTime": int(time.time() * 1000),
+                    },
+                ]
+            )
+            A.addons[0].websocket_message(ws_frame("backend3.padre.gg", fresh))
+            time.sleep(0.25)
+        finally:
+            A._jsonrpc = orig
+        leg = A.STORE.timeline("run-ps")["legs"][0]
+        self.assertIsNotNone(leg["hkL1aMs"], "锚匹配的新鲜 DONE 帧正常算成功")
+        self.assertEqual(leg["txHash"], "0x88888888…888888")
+
+    def test_binance_pending_then_finished(self):
+        """Binance：place-order 响应只有 orderId；PENDING 帧先见 hash；FINISHED 成功。"""
+        A.STORE.mark_open("run-b")
+        orig = A._jsonrpc
+        A._jsonrpc = lambda url, m, p, timeout=10: {
+            "status": "0x1",
+            "blockNumber": "0x1",
+            "blockHash": "0x" + "99" * 32,
+            "transactionHash": "0x" + "ef" * 32,
+        }
+        try:
+            f = FakeFlow(
+                "web3.binance.com",
+                "/bapi/defi/v2/private/wallet-direct/web-dex/place-order",
+                "POST",
+                req_body=json.dumps({"clientOrderId": "cid-1", "chain": "BSC"}),
+                resp_body=json.dumps(
+                    {
+                        "code": "000000",
+                        "success": True,
+                        "data": {"orderId": "oid-1", "clientOrderId": "cid-1"},
+                    }
+                ),
+            )
+            A.addons[0].request(f)
+            A.addons[0].response(f)
+            # PENDING：取 hash 不当成功
+            A.addons[0].websocket_message(
+                ws_frame(
+                    "web3-stream.binance.com",
+                    json.dumps(
+                        {
+                            "stream": "w3pc:x",
+                            "data": {
+                                "bizKey": "DEX_ALL_ORDER",
+                                "content": {
+                                    "orderId": "oid-1",
+                                    "clientOrderId": "cid-1",
+                                    "status": "PENDING",
+                                    "orderTxId": "0x" + "ef" * 32,
+                                },
+                            },
+                        }
+                    ),
+                )
+            )
+            leg0 = A.STORE.timeline("run-b")["legs"][0]
+            self.assertIsNone(leg0["hkL1aMs"], "PENDING 不是成功")
+            self.assertEqual(
+                leg0["txHash"], "0xefefefef…efefef", "PENDING 帧 hash 已收"
+            )
+            # 别的订单的 FINISHED 不串单
+            A.addons[0].websocket_message(
+                ws_frame(
+                    "web3-stream.binance.com",
+                    json.dumps(
+                        {
+                            "stream": "w3pc:x",
+                            "data": {
+                                "bizKey": "DEX_ALL_ORDER",
+                                "content": {
+                                    "orderId": "oid-OTHER",
+                                    "status": "FINISHED",
+                                },
+                            },
+                        }
+                    ),
+                )
+            )
+            self.assertIsNone(
+                A.STORE.timeline("run-b")["legs"][0]["hkL1aMs"],
+                "orderId 不匹配不得采纳",
+            )
+            A.addons[0].websocket_message(
+                ws_frame(
+                    "web3-stream.binance.com",
+                    json.dumps(
+                        {
+                            "stream": "w3pc:x",
+                            "data": {
+                                "bizKey": "DEX_ALL_ORDER",
+                                "content": {
+                                    "orderId": "oid-1",
+                                    "clientOrderId": "cid-1",
+                                    "status": "FINISHED",
+                                    "orderTxId": "0x" + "ef" * 32,
+                                },
+                            },
+                        }
+                    ),
+                )
+            )
+            time.sleep(0.25)
+        finally:
+            A._jsonrpc = orig
+        leg = A.STORE.timeline("run-b")["legs"][0]
+        self.assertEqual(leg["chain"], "bsc", "请求体 chain:'BSC' 应映射 bsc")
+        self.assertIsNotNone(leg["hkL1aMs"])
+        self.assertIsNotNone(leg["hkL3Ms"], "PENDING 帧已见 hash → 轮询已启动")
+
+    def test_fomo_relay_three_way(self):
+        """FOMO：relaySwapId↔subscribe filters.id↔data.requestId 三段相等；success 帧。"""
+        A.STORE.mark_open("run-f")
+        rid = "0x" + "9a" * 32
+        orig = A._jsonrpc
+        A._jsonrpc = lambda url, m, p, timeout=10: {
+            "status": "0x1",
+            "blockNumber": "0x1",
+            "blockHash": "0x" + "99" * 32,
+            "transactionHash": p[0],
+        }  # R24：echo 被轮询的 hash
+        try:
+            f = FakeFlow(
+                "prod-api.fomo.family",
+                "/swaps/v2",
+                "POST",
+                resp_body=json.dumps(
+                    {
+                        "success": True,
+                        "responseObject": {
+                            "v2Swap": {"relaySwapId": rid, "destinationChainId": 4663}
+                        },
+                    }
+                ),
+            )
+            A.addons[0].request(f)
+            A.addons[0].response(f)
+            # 页面出站 subscribe（from_client）——绑定 requestId
+            A.addons[0].websocket_message(
+                ws_frame(
+                    "ws.relay.link",
+                    json.dumps(
+                        {
+                            "type": "subscribe",
+                            "event": "request.status.updated",
+                            "filters": {"id": rid},
+                        }
+                    ),
+                    from_client=True,
+                )
+            )
+            # pending 帧不算
+            A.addons[0].websocket_message(
+                ws_frame(
+                    "ws.relay.link",
+                    json.dumps(
+                        {
+                            "event": "request.status.updated",
+                            "data": {"status": "pending", "requestId": rid},
+                        }
+                    ),
+                )
+            )
+            self.assertIsNone(A.STORE.timeline("run-f")["legs"][0]["hkL1aMs"])
+            A.addons[0].websocket_message(
+                ws_frame(
+                    "ws.relay.link",
+                    json.dumps(
+                        {
+                            "event": "request.status.updated",
+                            "data": {
+                                "status": "success",
+                                "requestId": rid,
+                                "txHashes": ["0x" + "12" * 32],
+                                "destinationChainId": 4663,
+                            },
+                        }
+                    ),
+                )
+            )
+            time.sleep(0.25)
+        finally:
+            A._jsonrpc = orig
+        leg = A.STORE.timeline("run-f")["legs"][0]
+        self.assertEqual(
+            leg["chain"], "robinhood", "destinationChainId 4663 → robinhood"
+        )
+        self.assertIsNotNone(leg["hkL1aMs"])
+        self.assertIsNotNone(leg["hkL3Ms"], "success 帧 txHashes[0] → EVM 轮询")
+
+    def test_rounds_occurrence_and_no_mark(self):
+        """无窗口不记录；同平台多次下单记到达序 observationIndex（r7：授权轮 round
+        不再按出现序填写——恒 None，唯一关联由 EU 侧 authorizedRound 回配）。"""
+        f = FakeFlow(
+            "web3.okx.com", "/priapi/v6/dx/trade/multi/broadcast", "POST", "{}"
+        )
+        A.addons[0].request(f)
+        self.assertEqual(A.STORE.timeline("nope")["legs"], [])
+        A.STORE.mark_open("run-n")
+        for _ in range(3):
+            fx = FakeFlow("prod-api.fomo.family", "/swaps/v2", "POST", "", "{}")
+            A.addons[0].request(fx)
+            A.addons[0].response(fx)
+        legs = A.STORE.timeline("run-n")["legs"]
+        self.assertEqual(
+            [x["observationIndex"] for x in legs], [1, 2, 3], "到达序连续编号"
+        )
+        self.assertEqual(
+            [x["round"] for x in legs], [None, None, None], "r7：到达序不冒充授权轮"
+        )
+
+    def test_stale_replay_no_pollution(self):
+        """v5hh3 复盘回归：陈旧/跨批重放帧不得把旧 hash 挂到新腿；缺 id 的 FINISHED 不算成功；
+        同 hash 不得挂两条腿。"""
+        A.STORE.mark_open("run-sr")
+        orig = A._jsonrpc
+        A._jsonrpc = lambda url, m, p, timeout=10: {
+            "status": "0x1",
+            "blockNumber": "0x1",
+            "blockHash": "0x" + "99" * 32,
+            "transactionHash": p[0],
+        }
+        h1 = "0x" + "aa" * 32
+        h2 = "0x" + "bb" * 32
+        po = "/bapi/defi/v2/private/wallet-direct/web-dex/place-order"
+
+        def fin(oid, cid, h, **kw):
+            c = {"status": "FINISHED", "orderTxId": h}
+            if oid:
+                c["orderId"] = oid
+            if cid:
+                c["clientOrderId"] = cid
+            c.update(kw)
+            return ws_frame(
+                "web3-stream.binance.com",
+                json.dumps(
+                    {
+                        "stream": "w3pc:x",
+                        "data": {"bizKey": "DEX_ALL_ORDER", "content": c},
+                    }
+                ),
+            )
+
+        try:
+            # r1 正常成交 oid-A/h1
+            f1 = FakeFlow(
+                "web3.binance.com",
+                po,
+                "POST",
+                req_body=json.dumps({"clientOrderId": "c1", "chain": "BSC"}),
+                resp_body=json.dumps(
+                    {
+                        "code": "000000",
+                        "data": {"orderId": "oid-A", "clientOrderId": "c1"},
+                    }
+                ),
+            )
+            A.addons[0].request(f1)
+            A.addons[0].response(f1)
+            A.addons[0].websocket_message(fin("oid-A", "c1", h1))
+            time.sleep(0.3)
+            # r2 新腿 oid-B；重放 r1 的 FINISHED → 不得污染
+            f2 = FakeFlow(
+                "web3.binance.com",
+                po,
+                "POST",
+                req_body=json.dumps({"clientOrderId": "c2", "chain": "BSC"}),
+                resp_body=json.dumps(
+                    {
+                        "code": "000000",
+                        "data": {"orderId": "oid-B", "clientOrderId": "c2"},
+                    }
+                ),
+            )
+            A.addons[0].request(f2)
+            A.addons[0].response(f2)
+            A.addons[0].websocket_message(fin("oid-A", "c1", h1))
+            leg2 = A.STORE.timeline("run-sr")["legs"][1]
+            self.assertIsNone(leg2["txHash"], "重放帧 hash 不得挂到新腿")
+            self.assertIsNone(leg2["hkL1aMs"], "重放 FINISHED 不得算新腿成功")
+            # 缺 id 的 FINISHED 也不算成功、hash 也不采纳
+            A.addons[0].websocket_message(fin(None, None, h2))
+            leg2 = A.STORE.timeline("run-sr")["legs"][1]
+            self.assertIsNone(leg2["txHash"])
+            self.assertIsNone(leg2["hkL1aMs"])
+            # r2 自己的正向匹配 FINISHED → 采纳
+            A.addons[0].websocket_message(fin("oid-B", "c2", h2))
+            time.sleep(0.3)
+        finally:
+            A._jsonrpc = orig
+        legs = A.STORE.timeline("run-sr")["legs"]
+        self.assertEqual(len(legs), 2)
+        self.assertIsNotNone(legs[0]["hkL1aMs"])
+        self.assertIsNotNone(legs[1]["hkL1aMs"])
+        self.assertIsNotNone(legs[1]["hkL3Ms"])
+        self.assertNotEqual(
+            legs[0]["txHash"], legs[1]["txHash"], "同 hash 不得挂两条腿"
+        )
+
+    def test_incomplete_no_fabrication(self):
+        """关联不上 = null + incomplete，绝不发明数字。"""
+        A.STORE.mark_open("run-z")
+        f = FakeFlow(
+            "web3.okx.com", "/priapi/v6/dx/trade/multi/broadcast", "POST", "{}", "{}"
+        )
+        A.addons[0].request(f)
+        A.addons[0].response(f)
+        leg = A.STORE.timeline("run-z")["legs"][0]
+        self.assertIsNone(leg["hkL1aMs"])
+        self.assertIsNone(leg["hkL3Ms"])
+
+    def test_ws_messages_trimmed(self):
+        """长连行情流内存有界：每条消息后 messages 只剩最新一条（开窗/关窗都裁剪）。"""
+        # 关窗（无任何 mark）：未分类主机关窗流也要裁
+        f = FakeFlow("nbstream.binance.com", "/ws")
+        f.websocket = types.SimpleNamespace(
+            messages=[FakeWSMsg("{}") for _ in range(50)]
+        )
+        for _ in range(3):
+            f.websocket.messages.append(FakeWSMsg("{}"))
+            A.addons[0].websocket_message(f)
+            self.assertEqual(len(f.websocket.messages), 1)
+        # 开窗 + 平台主机：处理后同样只剩 1 条，且最新条保持可读
+        A.STORE.mark_open("run-t")
+        f2 = ws_frame("ws.gmgn.ai", json.dumps({"channel": "tick"}))
+        f2.websocket.messages = [
+            FakeWSMsg("{}") for _ in range(20)
+        ] + f2.websocket.messages
+        A.addons[0].websocket_message(f2)
+        self.assertEqual(len(f2.websocket.messages), 1)
+        self.assertIn("tick", f2.websocket.messages[-1].content)
+
+    def test_leg_fields_are_milliseconds(self):
+        """单位回归：腿时间戳与 hkL1aMs 必须是毫秒（曾存 monotonic 秒，UI 把 0.6s 显示成 1ms）。"""
+        A.STORE.mark_open("run-ms")
+        orig = A._jsonrpc
+        A._jsonrpc = lambda url, m, p, timeout=10: {
+            "status": "0x1",
+            "blockNumber": "0x1",
+            "blockHash": "0x" + "99" * 32,
+            "transactionHash": p[0],
+        }
+        try:
+            f = FakeFlow(
+                "web3.okx.com",
+                "/priapi/v6/dx/trade/multi/broadcast",
+                "POST",
+                req_body=json.dumps({"data": {"chainId": "56"}}),
+                resp_body=json.dumps(
+                    {
+                        "code": "0",
+                        "data": {"transactionHash": "0x" + "cd" * 32, "orderId": "o1"},
+                    }
+                ),
+            )
+            A.addons[0].request(f)
+            A.addons[0].response(f)
+            time.sleep(0.25)
+            A.addons[0].websocket_message(
+                ws_frame(
+                    "wsdexpri.okx.com",
+                    json.dumps(
+                        {
+                            "arg": {"channel": "dex-swap-order-info"},
+                            "data": {
+                                "dexData": {
+                                    "status": "1",
+                                    "orderId": "o1",
+                                    "transactionHash": "0x" + "cd" * 32,
+                                }
+                            },
+                        }
+                    ),
+                )
+            )
+            time.sleep(0.2)
+        finally:
+            A._jsonrpc = orig
+        leg = A.STORE.timeline("run-ms")["legs"][0]
+        self.assertGreaterEqual(
+            leg["hkL1aMs"], 200, "0.25s 睡眠后 hkL1aMs 应 ≥200ms（秒 bug 会给 0.2）"
+        )
+        self.assertLess(leg["hkL1aMs"], 5000)
+        for k in ("tOrderOutMs", "tFirstRespMs", "tSuccessPushMs"):
+            self.assertGreater(
+                leg[k], 10**6, f"{k} 应是毫秒级绝对值（秒域 uptime 需 >11 天才到 1e6）"
+            )
+
+
+# ── R07：成功判定缺正向关联 ──
+
+
+class TestR07PositiveCorrelation(unittest.TestCase):
+    def setUp(self):
+        fresh()
+
+    def test_fomo_success_requires_anchor(self):
+        """R07：FOMO 成功帧必须与请求/响应建立的锚（relaySwapId/subscribe 绑定）
+        正向匹配——腿无锚或帧无 requestId 都不得出 L1a'。"""
+        A.STORE.mark_open("run-fx")
+        rid = "0x" + "9a" * 32
+        orig = A._jsonrpc
+        A._jsonrpc = lambda url, m, p, timeout=10: {
+            "status": "0x1",
+            "blockNumber": "0x1",
+            "blockHash": "0x" + "99" * 32,
+            "transactionHash": p[0],
+        }
+        try:
+            # 腿1：响应提取失败（无 relaySwapId）→ 腿无锚；成功帧带 requestId 也不算
+            f1 = FakeFlow("prod-api.fomo.family", "/swaps/v2", "POST", resp_body="{}")
+            A.addons[0].request(f1)
+            A.addons[0].response(f1)
+            A.addons[0].websocket_message(
+                ws_frame(
+                    "ws.relay.link",
+                    json.dumps(
+                        {
+                            "event": "request.status.updated",
+                            "data": {
+                                "status": "success",
+                                "requestId": rid,
+                                "txHashes": ["0x" + "12" * 32],
+                                "destinationChainId": 4663,
+                            },
+                        }
+                    ),
+                )
+            )
+            leg1 = A.STORE.timeline("run-fx")["legs"][0]
+            self.assertIsNone(leg1["hkL1aMs"], "腿无独立锚 → 成功帧不得采纳")
+            self.assertIsNone(leg1["txHash"], "无锚帧 hash 不得挂载")
+            # 腿2：有锚（响应 relaySwapId），帧缺 requestId → 不得算成功
+            f2 = FakeFlow(
+                "prod-api.fomo.family",
+                "/swaps/v2",
+                "POST",
+                resp_body=json.dumps(
+                    {
+                        "success": True,
+                        "responseObject": {
+                            "v2Swap": {"relaySwapId": rid, "destinationChainId": 4663}
+                        },
+                    }
+                ),
+            )
+            A.addons[0].request(f2)
+            A.addons[0].response(f2)
+            A.addons[0].websocket_message(
+                ws_frame(
+                    "ws.relay.link",
+                    json.dumps(
+                        {
+                            "event": "request.status.updated",
+                            "data": {
+                                "status": "success",
+                                "txHashes": ["0x" + "34" * 32],
+                            },
+                        }
+                    ),
+                )
+            )
+            leg2 = A.STORE.timeline("run-fx")["legs"][1]
+            self.assertIsNone(leg2["hkL1aMs"], "帧无 requestId → 不得凭时间窗充数")
+            # 正向控制：帧 requestId ≡ 锚 → 采纳
+            A.addons[0].websocket_message(
+                ws_frame(
+                    "ws.relay.link",
+                    json.dumps(
+                        {
+                            "event": "request.status.updated",
+                            "data": {
+                                "status": "success",
+                                "requestId": rid,
+                                "txHashes": ["0x" + "34" * 32],
+                                "destinationChainId": 4663,
+                            },
+                        }
+                    ),
+                )
+            )
+            time.sleep(0.25)
+        finally:
+            A._jsonrpc = orig
+        leg2 = A.STORE.timeline("run-fx")["legs"][1]
+        self.assertIsNotNone(leg2["hkL1aMs"], "正向匹配成功帧正常采纳")
+        self.assertIsNotNone(leg2["hkL3Ms"])
+
+    def test_binance_frame_cannot_self_certify(self):
+        """R07：腿的 orderId 不得由待判成功帧自己先写入再自证关联——锚只能来自
+        请求/响应。腿无锚时 FINISHED 帧（哪怕带 orderId+hash）不算成功。"""
+        A.STORE.mark_open("run-sc")
+        orig = A._jsonrpc
+        A._jsonrpc = lambda url, m, p, timeout=10: {
+            "status": "0x1",
+            "blockNumber": "0x1",
+            "blockHash": "0x" + "99" * 32,
+            "transactionHash": p[0],
+        }
+        try:
+            # 响应体无 orderId（提取失败）且请求体无 clientOrderId → 腿无锚
+            f = FakeFlow(
+                "web3.binance.com",
+                "/bapi/defi/v2/private/wallet-direct/web-dex/place-order",
+                "POST",
+                req_body=json.dumps({"chain": "BSC"}),
+                resp_body="{}",
+            )
+            A.addons[0].request(f)
+            A.addons[0].response(f)
+            A.addons[0].websocket_message(
+                ws_frame(
+                    "web3-stream.binance.com",
+                    json.dumps(
+                        {
+                            "stream": "w3pc:x",
+                            "data": {
+                                "bizKey": "DEX_ALL_ORDER",
+                                "content": {
+                                    "orderId": "oid-X",
+                                    "status": "FINISHED",
+                                    "orderTxId": "0x" + "ef" * 32,
+                                },
+                            },
+                        }
+                    ),
+                )
+            )
+            leg = A.STORE.timeline("run-sc")["legs"][0]
+            self.assertIsNone(
+                leg["hkL1aMs"], "帧自带 orderId 先写入腿再自证 → 不得算成功"
+            )
+            self.assertIsNone(leg["txHash"], "无正向锚匹配 → hash 不得挂载")
+        finally:
+            A._jsonrpc = orig
+
+    def test_padre_done_needs_same_node_hash_and_fresh_ts(self):
+        """R07：padre DONE ①必须同节点带合法 hash；②时间新鲜性只在同一 DONE 节点子树
+        内校验——根节点新 timestamp 不得给旧子交易背书；③DONE hash 必须与请求/响应
+        独立锚正向匹配。各负例用锚匹配的 hash 隔离被测门（除无 hash 反例）。"""
+        import msgpack
+
+        h_anchor = "0x" + "88" * 32
+        orig = A._jsonrpc
+        A._jsonrpc = lambda url, m, p, timeout=10: {
+            "status": "0x1",
+            "blockNumber": "0x1",
+            "blockHash": "0x" + "99" * 32,
+            "transactionHash": p[0],
+        }
+        now_ms = int(time.time() * 1000)
+        old_ms = now_ms - 3600_000
+        try:
+            padre_sign_leg(
+                "run-pd", anchor_hash=h_anchor
+            )  # r8：锚注入（生产无 Padre 锚源）
+            # ①DONE 无 hash（有时间戳）→ 整帧拒收，不算成功
+            A.addons[0].websocket_message(
+                ws_frame(
+                    "backend3.padre.gg",
+                    msgpack.packb(
+                        [373, 200, {"txnStatus": "DONE", "creationTime": now_ms}]
+                    ),
+                )
+            )
+            leg = A.STORE.timeline("run-pd")["legs"][0]
+            self.assertIsNone(leg["hkL1aMs"], "DONE 无同节点 hash → 不算成功")
+            # ②跨 entry 拼接：根节点新 timestamp + 子 DONE（锚匹配 hash）旧 creationTime → 拒
+            stitched = msgpack.packb(
+                [
+                    373,
+                    200,
+                    {
+                        "timestamp": now_ms,
+                        "sub": {
+                            "txnStatus": "DONE",
+                            "txnHash": h_anchor,
+                            "creationTime": old_ms,
+                        },
+                    },
+                ]
+            )
+            A.addons[0].websocket_message(ws_frame("backend3.padre.gg", stitched))
+            leg = A.STORE.timeline("run-pd")["legs"][0]
+            self.assertIsNone(leg["hkL1aMs"], "根新 timestamp 不得给旧子 DONE 背书")
+            # ②b DONE 节点无时间戳 → 缺源时间不新鲜
+            A.addons[0].websocket_message(
+                ws_frame(
+                    "backend3.padre.gg",
+                    msgpack.packb(
+                        [373, 200, {"txnStatus": "DONE", "txnHash": h_anchor}]
+                    ),
+                )
+            )
+            leg = A.STORE.timeline("run-pd")["legs"][0]
+            self.assertIsNone(leg["hkL1aMs"], "DONE 节点缺时间戳 → 不算成功")
+            # 正向控制：同节点锚匹配 hash + 新鲜 creationTime → 采纳
+            good = msgpack.packb(
+                [
+                    373,
+                    200,
+                    {"txnStatus": "DONE", "txnHash": h_anchor, "creationTime": now_ms},
+                ]
+            )
+            A.addons[0].websocket_message(ws_frame("backend3.padre.gg", good))
+            time.sleep(0.25)
+        finally:
+            A._jsonrpc = orig
+        leg = A.STORE.timeline("run-pd")["legs"][0]
+        self.assertIsNotNone(leg["hkL1aMs"], "同节点锚匹配 hash+新鲜时间戳正常采纳")
+        self.assertEqual(leg["txHash"], "0x88888888…888888")
+        self.assertIsNotNone(leg["hkL3Ms"])
+
+
+# ── R08：receipt 单 poller + 首次时刻只写一次 ──
+
+
+class TestR08ReceiptPoller(unittest.TestCase):
+    def setUp(self):
+        fresh()
+
+    def test_single_receipt_poller_latch(self):
+        """R08：run+chain+hash 原子闩锁——每腿至多一个 poller，轮询用腿锁定 hash；
+        冲突 hash 整帧拒收（不得起第二个 poller、不得覆盖腿 hash）。"""
+        A.STORE.mark_open("run-pl")
+        h1 = "0x" + "ab" * 32
+        h2 = "0x" + "cd" * 32
+        starts = []
+        orig = A._poll_receipt
+        A._poll_receipt = lambda *a, **k: starts.append(a)
+        try:
+            f = FakeFlow(
+                "web3.okx.com",
+                "/priapi/v6/dx/trade/multi/broadcast",
+                "POST",
+                resp_body=json.dumps(
+                    {"code": "0", "data": {"transactionHash": h1, "orderId": "o1"}}
+                ),
+            )
+            A.addons[0].request(f)
+            A.addons[0].response(f)
+            time.sleep(0.05)
+            self.assertEqual(len(starts), 1, "响应见 hash → 恰好一个 poller")
+            # 同 hash 成功帧 → 不得再起 poller
+            A.addons[0].websocket_message(
+                ws_frame(
+                    "wsdexpri.okx.com",
+                    json.dumps(
+                        {
+                            "arg": {"channel": "dex-swap-order-info"},
+                            "data": {
+                                "dexData": {
+                                    "status": "1",
+                                    "orderId": "o1",
+                                    "transactionHash": h1,
+                                }
+                            },
+                        }
+                    ),
+                )
+            )
+            time.sleep(0.05)
+            # 冲突 hash 帧 → 整帧拒收
+            A.addons[0].websocket_message(
+                ws_frame(
+                    "wsdexpri.okx.com",
+                    json.dumps(
+                        {
+                            "arg": {"channel": "dex-swap-order-info"},
+                            "data": {
+                                "dexData": {
+                                    "status": "1",
+                                    "orderId": "o1",
+                                    "transactionHash": h2,
+                                }
+                            },
+                        }
+                    ),
+                )
+            )
+            time.sleep(0.05)
+        finally:
+            A._poll_receipt = orig
+        self.assertEqual(len(starts), 1, "同腿不得起第二个 poller")
+        self.assertEqual(starts[0][3], h1, "poller 必须轮询腿锁定的 hash")
+        leg = A.STORE.timeline("run-pl")["legs"][0]
+        self.assertEqual(leg["txHash"], "0xabababab…ababab", "冲突帧不得覆盖腿 hash")
+
+    def test_settle_receipt_first_write_wins(self):
+        """R08：首次成功时刻只写一次——_settle_receipt 已有值不再覆盖。"""
+        leg = A.STORE.new_leg("run-x", "okx", "bsc", {"t": 1.0, "tw": "x"})
+        A._settle_receipt(leg, {"status": 1, "blockNumber": "0x1"})
+        t1 = leg["tReceiptMs"]
+        r1 = dict(leg["receipt"])
+        time.sleep(0.02)
+        A._settle_receipt(leg, {"status": 1, "blockNumber": "0x2"})
+        self.assertEqual(leg["tReceiptMs"], t1, "tReceiptMs 不得被第二次 settle 覆盖")
+        self.assertEqual(leg["receipt"], r1, "receipt 证据不得被覆盖")
+
+
+# ── R09：跨批窗口隔离 ──
+
+
+class TestR09WindowIsolation(unittest.TestCase):
+    def setUp(self):
+        fresh()
+
+    def test_window_close_freezes_legs(self):
+        """R09：A 批关闭后其腿冻结——迟到 WS 帧不得更新 A 的腿，事件不得记进 B。"""
+        orig = A._jsonrpc
+        A._jsonrpc = lambda url, m, p, timeout=10: {
+            "status": "0x1",
+            "blockNumber": "0x1",
+            "blockHash": "0x" + "99" * 32,
+            "transactionHash": p[0],
+        }
+        h1 = "0x" + "ab" * 32
+        try:
+            A.STORE.mark_open("run-A")
+            f1 = FakeFlow(
+                "web3.okx.com",
+                "/priapi/v6/dx/trade/multi/broadcast",
+                "POST",
+                resp_body=json.dumps(
+                    {"code": "0", "data": {"transactionHash": h1, "orderId": "oA"}}
+                ),
+            )
+            A.addons[0].request(f1)
+            A.addons[0].response(f1)
+            A.STORE.mark_close("run-A")
+            A.STORE.mark_open("run-B")
+            # 属于 A 腿的迟到成功帧
+            A.addons[0].websocket_message(
+                ws_frame(
+                    "wsdexpri.okx.com",
+                    json.dumps(
+                        {
+                            "arg": {"channel": "dex-swap-order-info"},
+                            "data": {
+                                "dexData": {
+                                    "status": "1",
+                                    "orderId": "oA",
+                                    "transactionHash": h1,
+                                }
+                            },
+                        }
+                    ),
+                )
+            )
+            leg_a = A.STORE.timeline("run-A")["legs"][0]
+            self.assertIsNone(leg_a["hkL1aMs"], "关窗后帧不得更新 A 的腿")
+            self.assertEqual(
+                A.STORE.timeline("run-B")["legs"], [], "B 不得收到 A 腿的腿记录"
+            )
+            self.assertEqual(
+                list(A.STORE.events.get("run-B", [])), [], "A 腿的事件不得记进 B"
+            )
+        finally:
+            A._jsonrpc = orig
+
+    def test_mark_open_closes_other_windows(self):
+        """R09：拒绝多窗并存——新开窗显式关闭旧窗（保留其 incomplete 状态）。"""
+        A.STORE.mark_open("run-old")
+        f = FakeFlow(
+            "web3.okx.com", "/priapi/v6/dx/trade/multi/broadcast", "POST", "{}", "{}"
+        )
+        A.addons[0].request(f)
+        A.STORE.mark_open("run-new")
+        self.assertIsNotNone(
+            A.STORE.marks["run-old"]["closed"], "新窗开启须显式关闭旧窗"
+        )
+        self.assertEqual(A.STORE.open_run_ids(), ["run-new"], "open_run_ids 只含最新窗")
+        leg = A.STORE.timeline("run-old")["legs"][0]
+        self.assertIsNone(leg["hkL1aMs"], "旧窗腿保留未成功状态，不得被新窗流量更新")
+
+    def test_receipt_writeback_requires_open_window(self):
+        """R09：receipt 线程回写前核验腿未被冻结——关窗后的回写丢弃。"""
+        A.STORE.mark_open("run-fz")
+        f = FakeFlow(
+            "web3.okx.com", "/priapi/v6/dx/trade/multi/broadcast", "POST", "{}", "{}"
+        )
+        A.addons[0].request(f)
+        leg = A.STORE.legs["run-fz"][0]
+        A.STORE.mark_close("run-fz")
+        A._settle_receipt(leg, {"status": 1, "blockNumber": "0x1"})
+        self.assertIsNone(leg["tReceiptMs"], "关窗后的 receipt 回写必须丢弃")
+        A._settle_incomplete(leg, "receipt poll timeout")
+        self.assertIsNone(leg["incomplete"], "关窗后的 incomplete 回写同样丢弃")
+
+
+# ── R18/R29：热重载控制面/采集面分裂 + build manifest ──
+
+
+def _http_json(method, url, obj=None):
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.hostname != "127.0.0.1" or parsed.port not in _TEST_SERVERS:
+        raise AssertionError("request has no owned test server")
+    server = _TEST_SERVERS[parsed.port]
+    if server.socket.fileno() < 0:
+        raise urllib.error.URLError("owned test server is closed")
+    url = urllib.parse.urlunsplit(
+        parsed._replace(netloc=f"127.0.0.1:{server.server_address[1]}")
+    )
+    data = json.dumps(obj).encode() if obj is not None else None
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={"content-type": "application/json"} if data else {},
+    )
+    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+        req, timeout=5
+    ) as r:
+        return r.status, json.loads(r.read().decode())
+
+
+class TestR18R29ControlPlane(unittest.TestCase):
+    def setUp(self):
+        fresh()
+
+    def test_health_build_manifest(self):
+        """R29：/health 带 build manifest（addon 版本/运行环境/实例 id）。"""
+        code, body = _http_json("GET", "http://127.0.0.1:8072/health")
+        self.assertEqual(code, 200)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["addonVersion"], A.ADDON_VERSION)
+        self.assertEqual(body["instanceId"], A.INSTANCE_ID)
+        import platform as _pf
+
+        self.assertEqual(body["pythonVersion"], _pf.python_version())
+        self.assertIn("mitmproxyVersion", body, "键必须存在（离线环境值可为 null）")
+
+    def test_ctrl_takeover_and_split_reporting(self):
+        """R18：重载接管（旧 server shutdown/join 后 rebing 成功，health 仍 200）；
+        bind 失败/分裂时 health 如实 503 而非假装正常；done() 关停控制面。"""
+        # 模拟进程内热重载：再次 _start_ctrl —— 先停旧 server 再绑新 server
+        A._start_ctrl()
+        code, body = _http_json("GET", "http://127.0.0.1:8072/health")
+        self.assertEqual(
+            (code, body["ok"], body["instanceId"]), (200, True, A.INSTANCE_ID)
+        )
+        # 模拟新实例 bind 失败留下的分裂标记 → health 如实报错
+        reg = A._ctrl_registry()
+        reg["bindError"] = "injected-test"
+        try:
+            _http_json("GET", "http://127.0.0.1:8072/health")
+            self.fail("bindError 时 /health 必须非 2xx")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 503)
+            body = json.loads(e.read().decode())
+            self.assertFalse(body["ok"])
+            self.assertIn("bind", body["error"])
+        reg["bindError"] = None
+        # 模拟 loadedInstanceId 与 serving instanceId 分裂
+        reg["loadedInstanceId"] = "other-instance"
+        try:
+            _http_json("GET", "http://127.0.0.1:8072/health")
+            self.fail("实例分裂时 /health 必须非 2xx")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 503)
+        reg["loadedInstanceId"] = A.INSTANCE_ID
+        code, body = _http_json("GET", "http://127.0.0.1:8072/health")
+        self.assertEqual(code, 200)
+        # done()：本实例控制面关停 → 连接被拒；再次 _start_ctrl 恢复
+        A.addons[0].done()
+        with self.assertRaises(urllib.error.URLError):
+            _http_json("GET", "http://127.0.0.1:8072/health")
+        A._start_ctrl()
+        code, body = _http_json("GET", "http://127.0.0.1:8072/health")
+        self.assertEqual((code, body["ok"]), (200, True))
+
+
+# ── 控制面 _send 断连纪律（NR-16：journal 诊断最小化）──
+
+
+class _FakeWfile:
+    """_Ctrl._send 的 wfile 桩：可注入写异常；成功路径记录全部写入字节。"""
+
+    def __init__(self, error=None):
+        self.error = error
+        self.writes = []
+
+    def write(self, b):
+        if self.error is not None:
+            raise self.error
+        self.writes.append(bytes(b))
+
+
+def _bare_ctrl(wfile):
+    """绕过 BaseHTTPRequestHandler.__init__（不开 socket）构造裸 _Ctrl 实例。"""
+    h = A._Ctrl.__new__(A._Ctrl)
+    h.requestline = "GET /health HTTP/1.1"
+    h.request_version = "HTTP/1.1"
+    h.wfile = wfile
+    return h
+
+
+class TestCtrlSendDisconnect(unittest.TestCase):
+    """_send 只吞「明确断连」（BrokenPipeError/ConnectionResetError——客户端经 SSH
+    隧道中途断开，响应注定送达不到；默认 handle_error 会把完整 traceback 打进
+    journal）。其余异常必须照常传播（fail loud，不吞）。纯离线：裸实例 + wfile 桩，
+    不占用任何端口。"""
+
+    def setUp(self):
+        fresh()
+
+    def test_broken_pipe_swallowed(self):
+        for err in (BrokenPipeError("EPIPE"), ConnectionResetError("ECONNRESET")):
+            h = _bare_ctrl(_FakeWfile(error=err))
+            h._send(200, {"ok": True})  # 不抛即通过
+
+    def test_other_errors_propagate(self):
+        import errno
+
+        for err in (
+            OSError(
+                errno.EAGAIN, "buffer full"
+            ),  # 非断连 OSError（BlockingIOError）不吞
+            ValueError("boom"),
+            RuntimeError("boom"),
+        ):
+            h = _bare_ctrl(_FakeWfile(error=err))
+            with self.assertRaises(type(err)):
+                h._send(200, {"ok": True})
+
+    def test_normal_send_writes_headers_and_body(self):
+        w = _FakeWfile()
+        _bare_ctrl(w)._send(200, {"ok": True, "n": 1})
+        blob = b"".join(w.writes)
+        self.assertIn(b"200 OK", blob)  # 默认 protocol_version=HTTP/1.0
+        self.assertIn(b"content-type: application/json", blob.lower())
+        # 响应体原样完整送达（最后一次 write 即 body）
+        self.assertEqual(w.writes[-1], json.dumps({"ok": True, "n": 1}).encode())
+
+
+# ── R20：/latency 探针口径 ──
+
+
+class _FakeWsConn:
+    """websockets.sync.client.connect 桩：__enter__ 模拟握手耗时；ping 立即回。"""
+
+    def __init__(self, enter_delay):
+        self.enter_delay = enter_delay
+        self.sent = None
+
+    def __enter__(self):
+        time.sleep(self.enter_delay)
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def send(self, data):
+        self.sent = data
+
+    def recv(self, timeout=None):
+        m = re.match(r"^ping\|([0-9a-f]{32})\|", str(self.sent))
+        if m:
+            return f"pong|{m.group(1)}"
+        import msgpack
+
+        v = msgpack.unpackb(
+            self.sent if isinstance(self.sent, bytes) else bytes(self.sent), raw=False
+        )
+        return msgpack.packb([9, v[1], "pong"])
+
+
+class TestR20LatencyProbes(unittest.TestCase):
+    def test_ws_ping_excludes_handshake(self):
+        """R20：okx/padre ws-ping 不得把握手计入 ping——先连上再计时。"""
+        orig = A.ws_connect
+        A.ws_connect = lambda url, **kw: _FakeWsConn(0.4)
+        try:
+            r = A._probe_okx_ws()
+            self.assertIsNotNone(r)
+            self.assertEqual(r["method"], "ws-ping")
+            self.assertLess(r["ms"], 150, "握手 0.4s 若计入 ping 则 ≥200ms")
+            r2 = A._probe_padre_ws()
+            self.assertIsNotNone(r2)
+            self.assertLess(r2["ms"], 150, "padre 同律：握手不计入")
+        finally:
+            A.ws_connect = orig
+
+    def test_http_ping_reuses_connection(self):
+        """R20：http-ping 预热+3 热样本必须复用同一 keep-alive 连接。"""
+
+        class FakeConn:
+            instances = 0
+
+            def __init__(self, host, timeout=None):
+                FakeConn.instances += 1
+                self.requests = 0
+
+            def request(self, method, path, headers=None):
+                self.requests += 1
+
+            def getresponse(self):
+                return types.SimpleNamespace(read=lambda *a: b"{}")
+
+            def close(self):
+                pass
+
+        FakeConn.instances = 0
+        holder = {}
+
+        def factory(host, timeout=None):
+            c = FakeConn(host, timeout=timeout)
+            holder["conn"] = c
+            return c
+
+        r = A._probe_http_ping("api.binance.com", "/api/v3/ping", conn_cls=factory)
+        self.assertIsNotNone(r)
+        self.assertEqual(r["method"], "http-ping")
+        self.assertEqual(FakeConn.instances, 1, "预热+样本须在同一连接上")
+        self.assertEqual(holder["conn"].requests, 4, "1 预热 + 3 热样本")
+
+
+# ── R21：时间戳在 hook 入口冻结 ──
+
+
+class TestR21FrozenTimestamps(unittest.TestCase):
+    def setUp(self):
+        fresh()
+
+    def test_request_ts_frozen_at_entry(self):
+        """R21：tOrderOut 是 request-observed——hook 入口冻结，解析耗时不计入。"""
+        A.STORE.mark_open("run-fr")
+        orig_extract = A.RULES["okx"]["extract_chain"]
+        A.RULES["okx"]["extract_chain"] = lambda b: (time.sleep(0.6), "bsc")[1]
+        try:
+            f = FakeFlow(
+                "web3.okx.com",
+                "/priapi/v6/dx/trade/multi/broadcast",
+                "POST",
+                req_body=json.dumps({"data": {"chainId": "56"}}),
+            )
+            t_before = A._mono_ms()
+            A.addons[0].request(f)
+        finally:
+            A.RULES["okx"]["extract_chain"] = orig_extract
+        leg = A.STORE.timeline("run-fr")["legs"][0]
+        self.assertLess(
+            leg["tOrderOutMs"], t_before + 400, "解析 0.6s 之后采样 = 入口未冻结"
+        )
+        self.assertEqual(leg["chain"], "bsc")
+
+    def test_ws_success_ts_frozen_at_entry(self):
+        """R21：tSuccessPush 在 WS 钩子入口冻结——decode/判定耗时不计入。
+        r10：okx 改逐 entry 解析（ws_entries 取代 ws_success/ws_ids）——同一边界
+        改在 ws_entries 上打桩（解析耗时不得污染入口冻结时刻）。"""
+        A.STORE.mark_open("run-fw")
+        orig_rpc = A._jsonrpc
+        A._jsonrpc = lambda url, m, p, timeout=10: {
+            "status": "0x1",
+            "blockNumber": "0x1",
+            "blockHash": "0x" + "99" * 32,
+            "transactionHash": p[0],
+        }
+        orig_entries = A.RULES["okx"]["ws_entries"]
+        slow = lambda p: (
+            time.sleep(0.6),
+            [{"ids": {"orderId": "o1", "txHash": "0x" + "ab" * 32}, "success": True}],
+        )[1]
+        A.RULES["okx"]["ws_entries"] = slow
+        try:
+            f = FakeFlow(
+                "web3.okx.com",
+                "/priapi/v6/dx/trade/multi/broadcast",
+                "POST",
+                resp_body=json.dumps(
+                    {
+                        "code": "0",
+                        "data": {"transactionHash": "0x" + "ab" * 32, "orderId": "o1"},
+                    }
+                ),
+            )
+            A.addons[0].request(f)
+            A.addons[0].response(f)
+            t_before = A._mono_ms()
+            A.addons[0].websocket_message(
+                ws_frame(
+                    "wsdexpri.okx.com",
+                    json.dumps(
+                        {
+                            "arg": {"channel": "dex-swap-order-info"},
+                            "data": {
+                                "dexData": {
+                                    "status": "1",
+                                    "orderId": "o1",
+                                    "transactionHash": "0x" + "ab" * 32,
+                                }
+                            },
+                        }
+                    ),
+                )
+            )
+        finally:
+            A._jsonrpc = orig_rpc
+            A.RULES["okx"]["ws_entries"] = orig_entries
+        leg = A.STORE.timeline("run-fw")["legs"][0]
+        self.assertIsNotNone(leg["tSuccessPushMs"])
+        self.assertLess(
+            leg["tSuccessPushMs"], t_before + 400, "多次 decode 后才采样 = 入口未冻结"
+        )
+
+
+# ── R22：mark manifest 轮次登记 ──
+
+
+class TestR22Manifest(unittest.TestCase):
+    def setUp(self):
+        fresh()
+
+    def test_mark_manifest_counts_and_placeholders(self):
+        """R22：/mark 接受 manifest（rounds 数）；timeline 输出 requested/attempted/
+        observed 计数 + 缺失腿占位（incomplete=no-order-observed）。attempted 只计
+        anchorRole=order 腿——fomo 预览语义见 TestR22PreviewRoleAndBudgets。"""
+        code, _ = _http_json(
+            "POST",
+            "http://127.0.0.1:8072/mark",
+            {"runId": "run-mf", "manifest": {"rounds": 3}},
+        )
+        self.assertEqual(code, 200)
+        f = FakeFlow(
+            "web3.okx.com", "/priapi/v6/dx/trade/multi/broadcast", "POST", "{}", "{}"
+        )
+        A.addons[0].request(f)
+        A.addons[0].response(f)
+        code, tl = _http_json("GET", "http://127.0.0.1:8072/timeline/run-mf")
+        self.assertEqual(code, 200)
+        self.assertEqual(
+            tl["counts"], {"requested": 3, "attempted": 1, "observed": 0, "unbound": 0}
+        )
+        self.assertEqual(len(tl["legs"]), 3, "缺失轮次须有占位腿")
+        ph = tl["legs"][1:]
+        for x in ph:
+            self.assertEqual(x["incomplete"], "no-order-observed")
+            self.assertIsNone(x["hkL1aMs"])
+
+    def test_manifest_detail_matching_and_backward_compat(self):
+        """R22：明细 manifest 按 platform/chain 配对；无 manifest 时行为同今
+        （无占位，counts.requested=null）。"""
+        A.STORE.mark_open(
+            "run-md",
+            manifest={
+                "legs": [
+                    {"platform": "okx", "chain": "bsc"},
+                    {"platform": "okx", "chain": "bsc"},
+                ]
+            },
+        )
+        f = FakeFlow(
+            "web3.okx.com",
+            "/priapi/v6/dx/trade/multi/broadcast",
+            "POST",
+            req_body=json.dumps({"data": {"chainId": "56"}}),
+        )
+        A.addons[0].request(f)
+        tl = A.STORE.timeline("run-md")
+        self.assertEqual(
+            tl["counts"], {"requested": 2, "attempted": 1, "observed": 0, "unbound": 0}
+        )
+        self.assertEqual(len(tl["legs"]), 2)
+        self.assertEqual(tl["legs"][1]["incomplete"], "no-order-observed")
+        self.assertEqual(tl["legs"][1]["platform"], "okx")
+        # 向后兼容：无 manifest
+        A.STORE.mark_open("run-bc")
+        A.addons[0].request(
+            FakeFlow(
+                "web3.okx.com", "/priapi/v6/dx/trade/multi/broadcast", "POST", "{}"
+            )
+        )
+        tl2 = A.STORE.timeline("run-bc")
+        self.assertIsNone(tl2["counts"]["requested"])
+        self.assertEqual(tl2["counts"]["attempted"], 1)
+        self.assertEqual(len(tl2["legs"]), 1, "无 manifest 不得生成占位腿")
+
+    def test_manifest_per_leg_rounds_denominator(self):
+        """R22 二轮：client manifest 真实形状 {version,runId,rounds,legs:[{platform,
+        chain,rounds}]}——requested=Σ legs[i].rounds（3 链×4 平台 N=3 → 36，而非
+        明细腿数 12）；缺失轮次按 spec 的 rounds 逐个占位。"""
+        legs_spec = [
+            {"platform": p, "chain": c, "rounds": 3}
+            for c in ("bsc", "robinhood", "solana")
+            for p in ("gmgn", "okx", "padre", "binance")
+        ]
+        A.STORE.mark_open(
+            "run-mr",
+            manifest={"version": 1, "runId": "run-mr", "rounds": 3, "legs": legs_spec},
+        )
+        # 实际只观察到 okx/bsc × 2 个下单请求
+        for _ in range(2):
+            A.addons[0].request(
+                FakeFlow(
+                    "web3.okx.com",
+                    "/priapi/v6/dx/trade/multi/broadcast",
+                    "POST",
+                    req_body=json.dumps({"data": {"chainId": "56"}}),
+                )
+            )
+        tl = A.STORE.timeline("run-mr")
+        self.assertEqual(
+            tl["counts"],
+            {"requested": 36, "attempted": 2, "observed": 0, "unbound": 0},
+            "requested=Σ per-leg rounds（12 腿×3 轮）",
+        )
+        self.assertEqual(len(tl["legs"]), 36, "2 真实腿 + 34 占位腿")
+        ph = tl["legs"][2:]
+        self.assertTrue(
+            all(
+                x["incomplete"] == "no-order-observed" and x["hkL1aMs"] is None
+                for x in ph
+            )
+        )
+        okx_bsc_ph = [x for x in ph if x["platform"] == "okx" and x["chain"] == "bsc"]
+        self.assertEqual(len(okx_bsc_ph), 1, "okx/bsc 授权 3 轮实到 2 → 恰好 1 个占位")
+
+    def test_manifest_per_leg_rounds_preview_not_consumed(self):
+        """per-leg rounds manifest 下 fomo 预览腿同样不计 attempted、不消费授权轮次
+        占位；Relay success 正向匹配晋升 order 后才消费 1 个占位。"""
+        rid = "0x" + "9a" * 32
+        orig = A._jsonrpc
+        A._jsonrpc = lambda url, m, p, timeout=10: {
+            "status": "0x1",
+            "blockNumber": "0x1",
+            "blockHash": "0x" + "99" * 32,
+            "transactionHash": p[0],
+        }
+        try:
+            A.STORE.mark_open(
+                "run-mp",
+                manifest={
+                    "version": 1,
+                    "runId": "run-mp",
+                    "rounds": 2,
+                    "legs": [{"platform": "fomo", "chain": "robinhood", "rounds": 2}],
+                },
+            )
+            f = FakeFlow(
+                "prod-api.fomo.family",
+                "/swaps/v2",
+                "POST",
+                resp_body=json.dumps(
+                    {
+                        "success": True,
+                        "responseObject": {
+                            "v2Swap": {"relaySwapId": rid, "destinationChainId": 4663}
+                        },
+                    }
+                ),
+            )
+            A.addons[0].request(f)
+            A.addons[0].response(f)
+            tl = A.STORE.timeline("run-mp")
+            self.assertEqual(
+                tl["counts"],
+                {"requested": 2, "attempted": 0, "observed": 0, "unbound": 0},
+                "预览腿不计 attempted",
+            )
+            self.assertEqual(
+                len(tl["legs"]), 3, "1 预览腿 + 2 占位（预览不消费授权轮次）"
+            )
+            A.addons[0].websocket_message(
+                ws_frame(
+                    "ws.relay.link",
+                    json.dumps(
+                        {
+                            "event": "request.status.updated",
+                            "data": {
+                                "status": "success",
+                                "requestId": rid,
+                                "txHashes": ["0x" + "12" * 32],
+                                "destinationChainId": 4663,
+                            },
+                        }
+                    ),
+                )
+            )
+            time.sleep(0.25)
+        finally:
+            A._jsonrpc = orig
+        tl = A.STORE.timeline("run-mp")
+        self.assertEqual(tl["counts"]["attempted"], 1, "晋升 order 后计 1 次下单")
+        self.assertEqual(tl["counts"]["observed"], 1)
+        self.assertEqual(
+            len(tl["legs"]), 2, "晋升后消费 1 个占位（1 order 腿 + 1 占位）"
+        )
+
+
+# ── R23：chain 不参与跨腿去重 ──
+
+
+class TestR23ChainNotDeduped(unittest.TestCase):
+    def setUp(self):
+        fresh()
+
+    def test_chain_not_deduped_across_legs(self):
+        """R23：同 run 前腿已登记 chain=bsc，后腿 WS 帧补录 chain=bsc 不得被丢弃
+        （去重只针对 txHash/orderId/clientOrderId）。"""
+        A.STORE.mark_open("run-ch")
+        orig = A._jsonrpc
+        A._jsonrpc = lambda url, m, p, timeout=10: {
+            "status": "0x1",
+            "blockNumber": "0x1",
+            "blockHash": "0x" + "99" * 32,
+            "transactionHash": p[0],
+        }
+        try:
+            for i, oid in enumerate(("o1", "o2")):
+                h = "0x" + ("ab" if i == 0 else "cd") * 32
+                f = FakeFlow(
+                    "web3.okx.com",
+                    "/priapi/v6/dx/trade/multi/broadcast",
+                    "POST",
+                    resp_body=json.dumps(
+                        {"code": "0", "data": {"transactionHash": h, "orderId": oid}}
+                    ),
+                )
+                A.addons[0].request(f)
+                A.addons[0].response(f)
+                A.addons[0].websocket_message(
+                    ws_frame(
+                        "wsdexpri.okx.com",
+                        json.dumps(
+                            {
+                                "arg": {"channel": "dex-swap-order-info"},
+                                "data": {
+                                    "dexData": {
+                                        "status": "1",
+                                        "orderId": oid,
+                                        "transactionHash": h,
+                                        "chainId": "56",
+                                    }
+                                },
+                            }
+                        ),
+                    )
+                )
+            time.sleep(0.25)
+        finally:
+            A._jsonrpc = orig
+        legs = A.STORE.timeline("run-ch")["legs"]
+        self.assertEqual(legs[0]["chain"], "bsc")
+        self.assertEqual(legs[1]["chain"], "bsc", "后腿 chain=bsc 不得被跨腿去重丢弃")
+        self.assertIsNotNone(legs[1]["hkL1aMs"])
+
+
+# ── R24：receipt 证据核对交易/块身份 ──
+
+
+class TestReceiptRpcFallback(unittest.TestCase):
+    """2026-10-06：公共 RPC 出错即换端点 + 退避；连续未见也换端点；超时文案不变。"""
+
+    def setUp(self):
+        fresh()
+
+    def _run(self, rpc_fn, run_id, timeout=0.8):
+        import urllib.error
+
+        A.STORE.mark_open(run_id)
+        orig = A._jsonrpc
+        saved = (A.RECEIPT_POLL_TIMEOUT_S, A.RECEIPT_POLL_INTERVAL_S, A.RECEIPT_POLL_BACKOFF_MAX_S, A.RECEIPT_ROTATE_AFTER_MISSES)
+        A.RECEIPT_POLL_TIMEOUT_S, A.RECEIPT_POLL_INTERVAL_S, A.RECEIPT_POLL_BACKOFF_MAX_S, A.RECEIPT_ROTATE_AFTER_MISSES = timeout, 0.02, 0.05, 3
+        A._jsonrpc = rpc_fn
+        try:
+            f = FakeFlow("web3.okx.com", "/priapi/v6/dx/trade/multi/broadcast", "POST",
+                         resp_body=json.dumps({"code": "0", "data": {"transactionHash": "0x" + "ab" * 32, "orderId": "o1"}}))
+            A.addons[0].request(f)
+            A.addons[0].response(f)
+            time.sleep(timeout + 0.4)
+        finally:
+            A._jsonrpc = orig
+            A.RECEIPT_POLL_TIMEOUT_S, A.RECEIPT_POLL_INTERVAL_S, A.RECEIPT_POLL_BACKOFF_MAX_S, A.RECEIPT_ROTATE_AFTER_MISSES = saved
+        return A.STORE.timeline(run_id)["legs"][0], urllib.error
+
+    def _ok(self):
+        return {"status": "0x1", "blockNumber": "0x10", "blockHash": "0x" + "cd" * 32, "transactionHash": "0x" + "ab" * 32}
+
+    def test_primary_error_rotates_to_fallback(self):
+        import urllib.error
+
+        calls = []
+
+        def rpc(url, m, p, timeout=10):
+            calls.append(url)
+            if url == A.CHAINS["bsc"]["rpc"]:
+                raise urllib.error.HTTPError(url, 429, "Too Many Requests", None, None)
+            return self._ok() if url == A.CHAINS["bsc"]["rpcFallbacks"][0] else None
+
+        leg, _ = self._run(rpc, "run-fb1")
+        self.assertIsNotNone(leg["hkL3Ms"], "备用端点拿到的回执必须落定")
+        self.assertIn(A.CHAINS["bsc"]["rpcFallbacks"][0], calls)
+        self.assertEqual(leg["evidence"]["receipt"]["rpc"], A.CHAINS["bsc"]["rpcFallbacks"][0], "回执记录实际端点")
+
+    def test_primary_misses_rotate_after_n(self):
+        calls = []
+
+        def rpc(url, m, p, timeout=10):
+            calls.append(url)
+            return self._ok() if url == A.CHAINS["bsc"]["rpcFallbacks"][0] else None
+
+        leg, _ = self._run(rpc, "run-fb2")
+        self.assertIsNotNone(leg["hkL3Ms"])
+        bsc = [u for u in calls if u in A._receipt_rpcs(A.CHAINS["bsc"])]
+        self.assertEqual(bsc[:3], [A.CHAINS["bsc"]["rpc"]] * 3, "连续 N 次未见后才换端点")
+        self.assertEqual(bsc[3], A.CHAINS["bsc"]["rpcFallbacks"][0])
+
+    def test_all_endpoints_fail_keeps_timeout_reason(self):
+        import io, contextlib, urllib.error
+
+        def rpc(url, m, p, timeout=10):
+            raise urllib.error.URLError("down")
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            leg, _ = self._run(rpc, "run-fb3", timeout=0.4)
+        self.assertIsNone(leg["hkL3Ms"])
+        self.assertEqual(leg["incomplete"], "receipt poll timeout")
+        self.assertIn("errors=", err.getvalue())
+
+
+class TestR24ReceiptIdentity(unittest.TestCase):
+    def setUp(self):
+        fresh()
+
+    def test_evm_receipt_transaction_hash_checked(self):
+        """R24：EVM receipt 必须 transactionHash≡本腿 hash 才采纳——不核身份的回执
+        不得 settle（轮询至超时 → incomplete）。"""
+        A.STORE.mark_open("run-ri")
+        orig = A._jsonrpc
+        to, iv = A.RECEIPT_POLL_TIMEOUT_S, A.RECEIPT_POLL_INTERVAL_S
+        A.RECEIPT_POLL_TIMEOUT_S = 0.5
+        A.RECEIPT_POLL_INTERVAL_S = 0.1
+        A._jsonrpc = lambda url, m, p, timeout=10: {
+            "status": "0x1",
+            "blockNumber": "0x1",
+            "transactionHash": "0x" + "00" * 32,
+        }
+        try:
+            f = FakeFlow(
+                "web3.okx.com",
+                "/priapi/v6/dx/trade/multi/broadcast",
+                "POST",
+                resp_body=json.dumps(
+                    {
+                        "code": "0",
+                        "data": {"transactionHash": "0x" + "ab" * 32, "orderId": "o1"},
+                    }
+                ),
+            )
+            A.addons[0].request(f)
+            A.addons[0].response(f)
+            time.sleep(0.9)
+        finally:
+            A._jsonrpc = orig
+            A.RECEIPT_POLL_TIMEOUT_S, A.RECEIPT_POLL_INTERVAL_S = to, iv
+        leg = A.STORE.timeline("run-ri")["legs"][0]
+        self.assertIsNone(leg["hkL3Ms"], "transactionHash 不匹配的回执不得 settle")
+        self.assertEqual(leg["incomplete"], "receipt poll timeout")
+
+
+# ── R25：Store 有界 retention ──
+
+
+class TestR25BoundedStore(unittest.TestCase):
+    def setUp(self):
+        fresh()
+
+    def _mk_run(self, rid):
+        A.STORE.mark_open(rid)
+        A.addons[0].request(
+            FakeFlow(
+                "web3.okx.com", "/priapi/v6/dx/trade/multi/broadcast", "POST", "{}"
+            )
+        )
+        A.STORE.mark_close(rid)
+
+    def test_bounded_retention_with_gone_marker(self):
+        """R25：marks/legs/events 有界——超 retention 的已完成 run 回收，timeline
+        返回明确 gone 标记而非空完整 timeline。"""
+        orig_n = A.RETENTION_RUNS
+        A.RETENTION_RUNS = 3
+        try:
+            for i in range(6):
+                self._mk_run(f"run-rr{i}")
+            # 保留最近 3 个已完成 run（rr3/rr4/rr5）；rr0/rr1/rr2 依序回收
+            # （prune 在 mark_open 触发，rr2 在最后一次 open 时恰好仍是倒数第 4 个——
+            # 保留窗为 rr3..rr5，故 gone 的是 rr0..rr2 中最老两个 + 再开一个触发）
+            self._mk_run("run-rr6")
+            self.assertTrue(
+                A.STORE.timeline("run-rr0").get("gone"), "最老 run 须标 gone"
+            )
+            self.assertTrue(A.STORE.timeline("run-rr2").get("gone"))
+            self.assertIsNone(A.STORE.timeline("run-rr6").get("gone"))
+            self.assertEqual(
+                len(A.STORE.timeline("run-rr6")["legs"]), 1, "最近 run 数据完整"
+            )
+            # 未见过的 run：保持空 timeline 形状（向后兼容），不标 gone
+            tl = A.STORE.timeline("run-never")
+            self.assertIsNone(tl.get("gone"))
+            self.assertEqual(tl["legs"], [])
+        finally:
+            A.RETENTION_RUNS = orig_n
+
+    def test_retention_pins_active_poller(self):
+        """R25：有活动 poller 的腿 pin 住不回收；poller 结束后可被回收。"""
+        orig_n = A.RETENTION_RUNS
+        A.RETENTION_RUNS = 1
+        try:
+            A.STORE.mark_open("run-pin")
+            leg = A.STORE.new_leg("run-pin", "okx", "bsc", {"t": 1.0, "tw": "x"})
+            leg["receiptPolling"] = True  # 模拟 inflight poller
+            A.STORE.mark_close("run-pin")
+            for i in range(3):
+                self._mk_run(f"run-q{i}")
+            self.assertIsNone(
+                A.STORE.timeline("run-pin").get("gone"), "活动 poller 腿须 pin 住"
+            )
+            leg["receiptPolling"] = False  # poller 结束
+            self._mk_run("run-q3")
+            self.assertTrue(
+                A.STORE.timeline("run-pin").get("gone"), "poller 结束后可回收"
+            )
+        finally:
+            A.RETENTION_RUNS = orig_n
+
+
+# ── R07①：padre 成功/hash/id 必须同一 DONE 节点（跨节点拼接拒收）──
+
+
+class TestR07SameEntryPadre(unittest.TestCase):
+    def setUp(self):
+        fresh()
+
+    def test_padre_hash_from_done_node_not_sibling(self):
+        """合成帧 done:{DONE,txnHash=B,creationTime=now} + 兄弟 other:{txnHash=A}：
+        成功判定节点的 hash 是 B——腿 hash 与 poller 目标都必须是 B（bug：ws_ids 整帧
+        深度遍历先撞见兄弟节点的 A 并挂载，成功节点却是 B → 跨交易拼接出 L1a'）。
+        R07 加严：B 还须正向匹配请求/响应建立的独立锚（响应抽取 txnHash=B）。"""
+        import msgpack
+
+        hb = "0x" + "cd" * 32
+        ha = "0x" + "ef" * 32
+        polled = []
+        orig = A._poll_receipt
+        A._poll_receipt = lambda *a, **k: polled.append(a)
+        try:
+            padre_sign_leg("run-p7", anchor_hash=hb)  # r8：锚注入（生产无 Padre 锚源）
+            frame = msgpack.packb(
+                [
+                    373,
+                    200,
+                    {
+                        "done": {
+                            "txnStatus": "DONE",
+                            "txnHash": hb,
+                            "creationTime": int(time.time() * 1000),
+                        },
+                        "other": {"txnHash": ha},
+                    },
+                ]
+            )
+            A.addons[0].websocket_message(ws_frame("backend3.padre.gg", frame))
+            time.sleep(0.1)
+        finally:
+            A._poll_receipt = orig
+        leg = A.STORE.timeline("run-p7")["legs"][0]
+        self.assertIsNotNone(
+            leg["hkL1aMs"], "DONE 节点同节点锚匹配 hash+新鲜时间戳 → 成功"
+        )
+        self.assertEqual(
+            leg["txHash"],
+            "0xcdcdcdcd…cdcdcd",
+            "hash 必须取自 DONE 节点本身，不得跨节点拼接",
+        )
+        self.assertEqual(len(polled), 1)
+        self.assertEqual(polled[0][3], hb, "receipt poller 必须轮询 DONE 节点的 hash")
+
+    def test_padre_no_done_node_no_ids(self):
+        """无 DONE 节点的帧不提供任何 id/hash（含同层 orderId/hash）——非 DONE 帧
+        的 hash 不得挂载、不得触发 receipt 轮询。"""
+        import msgpack
+
+        padre_sign_leg("run-p7b")
+        frame = msgpack.packb(
+            [
+                373,
+                200,
+                {
+                    "txnStatus": "FILLED",
+                    "txnHash": "0x" + "55" * 32,
+                    "orderId": "po-1",
+                    "creationTime": int(time.time() * 1000),
+                },
+            ]
+        )
+        self.assertEqual(
+            A._padre_ws_ids(frame),
+            {},
+            "非 DONE 帧不提供任何 id/hash（含同层 orderId/hash）",
+        )
+        A.addons[0].websocket_message(ws_frame("backend3.padre.gg", frame))
+        leg = A.STORE.timeline("run-p7b")["legs"][0]
+        self.assertIsNone(leg["hkL1aMs"])
+        self.assertIsNone(leg["txHash"], "非 DONE 帧的 hash 不得挂载")
+
+    def test_padre_done_without_anchor_rejected(self):
+        """R07 加严负例：腿无独立锚（响应未抽取到 id）——哪怕 DONE 帧同节点带合法
+        hash + 新鲜时间戳也不得产 L1a'、不得挂载 hash、不得起 receipt 轮询
+        （帧自带 id 先写腿再自证不算数；缺锚 → 缺失 HK 成功/hash 证据）。"""
+        import msgpack
+
+        polled = []
+        orig = A._poll_receipt
+        A._poll_receipt = lambda *a, **k: polled.append(a)
+        try:
+            padre_sign_leg("run-p7c")  # 真实 Turnkey 响应 = 无锚（生产路径）
+            frame = msgpack.packb(
+                [
+                    373,
+                    200,
+                    {
+                        "txnStatus": "DONE",
+                        "txnHash": "0x" + "ab" * 32,
+                        "creationTime": int(time.time() * 1000),
+                    },
+                ]
+            )
+            A.addons[0].websocket_message(ws_frame("backend3.padre.gg", frame))
+            time.sleep(0.1)
+        finally:
+            A._poll_receipt = orig
+        leg = A.STORE.timeline("run-p7c")["legs"][0]
+        self.assertIsNone(leg["hkL1aMs"], "无锚 DONE 不得算成功")
+        self.assertIsNone(leg["txHash"], "无锚帧 hash 不得挂载")
+        self.assertEqual(polled, [], "无锚帧不得触发 receipt 轮询")
+
+    def test_padre_done_anchor_mismatch_rejected(self):
+        """R07 加严负例：锚=H1 的腿收到 H2 的新鲜 DONE——关联门拒收：不得算成功、
+        不得覆盖锚 hash；poller 始终只轮询锚锁定的 H1。"""
+        import msgpack
+
+        h1 = "0x" + "ab" * 32
+        h2 = "0x" + "cd" * 32
+        polled = []
+        orig = A._poll_receipt
+        A._poll_receipt = lambda *a, **k: polled.append(a)
+        try:
+            leg_int = padre_sign_leg(
+                "run-p7d", anchor_hash=h1
+            )  # r8：锚注入（生产无 Padre 锚源）
+            # 锚注入不经 response() 的闩锁——按 R08 由 HTTP 入口同款闩锁起 poller（轮询锚 hash）
+            ph = A.STORE.claim_receipt_poll(leg_int)
+            if ph:
+                A._poll_receipt(
+                    "run-p7d", leg_int, leg_int.get("chain"), ph, A._jsonrpc
+                )
+            frame = msgpack.packb(
+                [
+                    373,
+                    200,
+                    {
+                        "txnStatus": "DONE",
+                        "txnHash": h2,
+                        "creationTime": int(time.time() * 1000),
+                    },
+                ]
+            )
+            A.addons[0].websocket_message(ws_frame("backend3.padre.gg", frame))
+            time.sleep(0.1)
+        finally:
+            A._poll_receipt = orig
+        leg = A.STORE.timeline("run-p7d")["legs"][0]
+        self.assertIsNone(leg["hkL1aMs"], "锚不匹配的新鲜 DONE 不得算成功")
+        self.assertEqual(leg["txHash"], "0xabababab…ababab", "冲突帧不得覆盖锚 hash")
+        self.assertEqual(len(polled), 1)
+        self.assertEqual(polled[0][3], h1, "poller 只轮询锚锁定的 hash")
+
+
+# ── R07②：binance 同 entry 多 hash 字段归一不一致 → 整帧拒收 ──
+
+
+class TestR07BinanceHashConsistency(unittest.TestCase):
+    PO = "/bapi/defi/v2/private/wallet-direct/web-dex/place-order"
+
+    def setUp(self):
+        fresh()
+
+    def _fin(self, oid, cid, **content_kw):
+        c = {"status": "FINISHED", "orderId": oid, "clientOrderId": cid}
+        c.update(content_kw)
+        return ws_frame(
+            "web3-stream.binance.com",
+            json.dumps(
+                {"stream": "w3pc:x", "data": {"bizKey": "DEX_ALL_ORDER", "content": c}}
+            ),
+        )
+
+    def test_same_entry_hash_mismatch_rejects_whole_frame(self):
+        """同一 content entry orderTxId=A/txHash=B 归一不一致 → 整帧拒收（hash 不挂载、
+        FINISHED 不算成功、不起 receipt 轮询）——与 scripts/lib/binance-ws.mjs
+        anchorMatchVerdict/extractOrderHistoryHash 的同节点归一 fail-closed 同律。"""
+        A.STORE.mark_open("run-b7")
+        rpc_calls = []
+        orig = A._jsonrpc
+        A._jsonrpc = lambda *a, **k: rpc_calls.append(a) and None
+        try:
+            f = FakeFlow(
+                "web3.binance.com",
+                self.PO,
+                "POST",
+                req_body=json.dumps({"clientOrderId": "c7", "chain": "BSC"}),
+                resp_body=json.dumps(
+                    {
+                        "code": "000000",
+                        "data": {"orderId": "oid-7", "clientOrderId": "c7"},
+                    }
+                ),
+            )
+            A.addons[0].request(f)
+            A.addons[0].response(f)
+            A.addons[0].websocket_message(
+                self._fin(
+                    "oid-7", "c7", orderTxId="0x" + "aa" * 32, txHash="0x" + "bb" * 32
+                )
+            )
+            time.sleep(0.3)
+            leg = A.STORE.timeline("run-b7")["legs"][0]
+            self.assertIsNone(
+                leg["txHash"], "归一不一致帧的 hash 不得挂载（bug：先选 orderTxId=A）"
+            )
+            self.assertIsNone(leg["hkL1aMs"], "归一不一致帧不得算成功")
+            self.assertEqual(rpc_calls, [], "整帧拒收——不得起 receipt 轮询")
+            # 正向控制：同 entry 多 hash 字段归一一致（大小写变体同值）→ 采纳+成功+轮询
+            A._jsonrpc = lambda url, m, p, timeout=10: {
+                "status": "0x1",
+                "blockNumber": "0x1",
+                "blockHash": "0x" + "99" * 32,
+                "transactionHash": p[0],
+            }
+            A.addons[0].websocket_message(
+                self._fin(
+                    "oid-7",
+                    "c7",
+                    orderTxId="0x" + "cc" * 32,
+                    txHash="0x" + "cC" * 16 + "cc" * 16,
+                )
+            )
+            time.sleep(0.3)
+        finally:
+            A._jsonrpc = orig
+        leg = A.STORE.timeline("run-b7")["legs"][0]
+        self.assertIsNotNone(leg["hkL1aMs"], "归一一致帧正常采纳")
+        self.assertIsNotNone(leg["hkL3Ms"], "归一一致帧 hash → receipt 轮询")
+
+
+# ── R09：建腿原子临界区（rid 选取+开窗复验+建腿同锁）──
+
+
+class TestR09AtomicLegCreation(unittest.TestCase):
+    def setUp(self):
+        fresh()
+
+    def test_leg_creation_rejected_after_close(self):
+        """hook 解析期间窗口被关（模拟控制线程 interleave）——关窗后到达的下单请求
+        一律拒绝：不得给已关窗 run 建新腿，并计诊断计数。"""
+        A.STORE.mark_open("run-r9")
+        orig = A.RULES["okx"]["extract_chain"]
+
+        def closing_extract(b):
+            A.STORE.mark_close("run-r9")  # 控制线程在 get_text/解析期间关窗
+            return "bsc"
+
+        A.RULES["okx"]["extract_chain"] = closing_extract
+        try:
+            f = FakeFlow(
+                "web3.okx.com",
+                "/priapi/v6/dx/trade/multi/broadcast",
+                "POST",
+                req_body=json.dumps({"data": {"chainId": "56"}}),
+            )
+            A.addons[0].request(f)
+        finally:
+            A.RULES["okx"]["extract_chain"] = orig
+        self.assertEqual(A.STORE.timeline("run-r9")["legs"], [], "关窗后不得创建新腿")
+        self.assertEqual(A.STORE.diag.get("orderReqNoWindow"), 1, "拒绝须计诊断计数")
+
+    def test_inflight_request_rejected_when_window_replaced(self):
+        """R09 二轮（r4）：hook 入口捕获不可变窗口身份（runId+epoch），解析后只复验——
+        解析期间旧窗被新窗顶掉 → 该请求一律拒绝（绝不重新选窗、不得借新窗建腿）；
+        新窗只接纳其后到达的请求。"""
+        A.STORE.mark_open("run-r9a")
+        orig = A.RULES["okx"]["extract_chain"]
+
+        def swapping_extract(b):
+            A.STORE.mark_open("run-r9b")  # 新窗顶旧窗（旧窗关闭+冻结）
+            return "bsc"
+
+        A.RULES["okx"]["extract_chain"] = swapping_extract
+        try:
+            f = FakeFlow(
+                "web3.okx.com",
+                "/priapi/v6/dx/trade/multi/broadcast",
+                "POST",
+                req_body=json.dumps({"data": {"chainId": "56"}}),
+            )
+            A.addons[0].request(f)
+        finally:
+            A.RULES["okx"]["extract_chain"] = orig
+        self.assertEqual(
+            A.STORE.timeline("run-r9a")["legs"], [], "旧窗（已关）不得接新腿"
+        )
+        self.assertEqual(
+            A.STORE.timeline("run-r9b")["legs"], [], "失效请求不得借新窗建腿"
+        )
+        self.assertEqual(A.STORE.diag.get("orderReqNoWindow"), 1, "拒绝须计诊断计数")
+        # 新窗开后到达的请求正常入窗
+        A.addons[0].request(
+            FakeFlow(
+                "web3.okx.com",
+                "/priapi/v6/dx/trade/multi/broadcast",
+                "POST",
+                req_body=json.dumps({"data": {"chainId": "56"}}),
+            )
+        )
+        self.assertEqual(
+            len(A.STORE.timeline("run-r9b")["legs"]), 1, "新窗只接纳其后到达的请求"
+        )
+
+    def test_same_runid_reopen_invalidates_inflight_request(self):
+        """R09 二轮（r4）：同 runId 关窗重开 → window_epoch+1——旧窗身份捕获的
+        在飞请求解析后复验 epoch 失败，不得向重开后的窗建腿；重开后的新请求正常。"""
+        A.STORE.mark_open("run-r9c")
+        orig = A.RULES["okx"]["extract_chain"]
+
+        def reopen_extract(b):
+            A.STORE.mark_close("run-r9c")
+            A.STORE.mark_open("run-r9c")  # 同 runId 重开 → epoch 递增
+            return "bsc"
+
+        A.RULES["okx"]["extract_chain"] = reopen_extract
+        try:
+            f = FakeFlow(
+                "web3.okx.com",
+                "/priapi/v6/dx/trade/multi/broadcast",
+                "POST",
+                req_body=json.dumps({"data": {"chainId": "56"}}),
+            )
+            A.addons[0].request(f)
+        finally:
+            A.RULES["okx"]["extract_chain"] = orig
+        self.assertEqual(
+            A.STORE.timeline("run-r9c")["legs"],
+            [],
+            "旧 epoch 捕获的请求不得借重开窗建腿",
+        )
+        self.assertEqual(
+            A.STORE.diag.get("orderReqNoWindow"), 1, "epoch 失效拒绝须计诊断计数"
+        )
+        A.addons[0].request(
+            FakeFlow(
+                "web3.okx.com",
+                "/priapi/v6/dx/trade/multi/broadcast",
+                "POST",
+                req_body=json.dumps({"data": {"chainId": "56"}}),
+            )
+        )
+        self.assertEqual(
+            len(A.STORE.timeline("run-r9c")["legs"]), 1, "重开后到达的请求正常入窗"
+        )
+
+
+# ── R18：热重载跨实例 Store 交接（dropped 标记 + health 暴露）──
+
+
+class TestR18StoreHandover(unittest.TestCase):
+    def setUp(self):
+        fresh()
+
+    def test_takeover_marks_dropped_runs(self):
+        """旧实例活动 run 不随热重载交接——新实例对「曾存在但本地没有」的 run 须标
+        gone+droppedInReload（区别于 retention 回收与从未见过）；/health 暴露接管事实。"""
+        code, _ = _http_json("POST", "http://127.0.0.1:8072/mark", {"runId": "run-ho1"})
+        self.assertEqual(code, 200)
+        A.addons[0].request(
+            FakeFlow(
+                "web3.okx.com", "/priapi/v6/dx/trade/multi/broadcast", "POST", "{}"
+            )
+        )
+        self.assertEqual(len(A.STORE.timeline("run-ho1")["legs"]), 1)
+        # 模拟热重载：注册表留下旧实例（不同 instanceId）的 knownRuns；新实例 = 空 Store
+        reg = A._ctrl_registry()
+        reg["knownRuns"] = {
+            "instanceId": "old-instance-x",
+            "runs": ["run-ho1"],
+            "at": "t",
+        }
+        fresh()
+        A._start_ctrl()  # 接管：停旧控制面 + rebind + 捕获 droppedRuns
+        try:
+            tl = A.STORE.timeline("run-ho1")
+            self.assertTrue(tl.get("gone"), "旧实例 run 应标 gone")
+            self.assertTrue(
+                tl.get("droppedInReload"),
+                "须区分 dropped（重载丢失）与从未见过/retention 回收",
+            )
+            self.assertIsNone(
+                A.STORE.timeline("run-never").get("droppedInReload"),
+                "从未见过的 run 不标 dropped",
+            )
+            code, body = _http_json("GET", "http://127.0.0.1:8072/health")
+            self.assertEqual(code, 200)
+            tk = body.get("takeover")
+            self.assertTrue(
+                tk and tk.get("droppedRuns") >= 1,
+                "/health 须暴露「接管自旧实例，N 个 run 被丢弃」",
+            )
+            self.assertIn("run-ho1", tk.get("runIds") or [])
+        finally:
+            reg["takeover"] = None  # 不污染后续测试
+
+
+# ── R20：gmgn https-warm 须真 keep-alive 热样本（与 EU httpsWarmRtt 同口径）──
+
+
+class TestR20GmgnWarmProbe(unittest.TestCase):
+    def test_https_warm_keepalive_second_request_not_halved(self):
+        """同一 keep-alive 连接预热 1 次 + 第 2 次热请求整 RTT（ms=rttMs 不减半）——
+        此前 urllib 单次冷连接请求冒充 https-warm，名不副实。"""
+        import time as _t
+
+        class FakeConn:
+            instances = 0
+
+            def __init__(self, host, timeout=None):
+                FakeConn.instances += 1
+                self.requests = 0
+
+            def request(self, method, path, headers=None):
+                self.requests += 1
+                _t.sleep(0.1)
+
+            def getresponse(self):
+                return types.SimpleNamespace(read=lambda *a: b"{}")
+
+            def close(self):
+                pass
+
+        FakeConn.instances = 0
+        holder = {}
+
+        def factory(host, timeout=None):
+            c = FakeConn(host, timeout=timeout)
+            holder["conn"] = c
+            return c
+
+        r = A._probe_https_warm(
+            "gmgn.ai", "/defi/quotation/v1/chains", conn_cls=factory
+        )
+        self.assertIsNotNone(r)
+        self.assertEqual(r["method"], "https-warm")
+        self.assertEqual(FakeConn.instances, 1, "预热+热样本须同一连接")
+        self.assertEqual(
+            holder["conn"].requests, 2, "1 预热 + 1 热样本（EU httpsWarmRtt 同口径）"
+        )
+        self.assertEqual(r["ms"], r["rttMs"], "https-warm 整 RTT 不减半")
+        self.assertGreaterEqual(
+            r["rttMs"], 80, "单次 0.1s → 热样本 ~100ms；减半/冷样本口径给不出"
+        )
+
+
+# ── R21/R29：timeline 方法版本 + 采集环境身份（vantage 推导）──
+
+
+class TestR21R29TimelineIdentity(unittest.TestCase):
+    def setUp(self):
+        fresh()
+
+    def test_timeline_method_and_identity(self):
+        """timeline 自带 method=hook-observed@v2 + 五件采集环境身份（vantage/
+        instanceId/addonVersion/mitmproxyVersion/pythonVersion——client
+        hkTimingEnvironment 取 timeline 优先）；vantage 由 /egress 实测 countryCode
+        推导，未知不发明（unknown-proxy），timeline 拉取路径不得为打标签发网。"""
+        import platform as _pf
+
+        orig_get = A.get_egress
+        A.get_egress = lambda: (_ for _ in ()).throw(
+            AssertionError("timeline 不得为 vantage 发网")
+        )
+        try:
+            A.STORE.mark_open("run-id1")
+            tl = A.STORE.timeline("run-id1")
+            self.assertEqual(tl["method"], "hook-observed@v2")
+            self.assertEqual(tl["instanceId"], A.INSTANCE_ID)
+            self.assertEqual(tl["addonVersion"], A.ADDON_VERSION)
+            self.assertEqual(
+                tl["pythonVersion"],
+                _pf.python_version(),
+                "与 /health build manifest 同源",
+            )
+            self.assertEqual(
+                tl["mitmproxyVersion"],
+                A._mitmproxy_version(),
+                "键必须存在（离线环境值可为 null）",
+            )
+            self.assertEqual(
+                tl["vantage"], "unknown-proxy", "无实测 egress → unknown-proxy"
+            )
+            A._EGRESS_CACHE["data"] = {"countryCode": "SG", "label": "Singapore"}
+            A._EGRESS_CACHE["at"] = time.monotonic()
+            self.assertEqual(
+                A.STORE.timeline("run-id1")["vantage"],
+                "sg-proxy",
+                "实测 countryCode → 小写-proxy",
+            )
+            # gone 响应同样带身份字段
+            A.STORE.gone.append("run-gone1")
+            gl = A.STORE.timeline("run-gone1")
+            self.assertEqual(gl["method"], "hook-observed@v2")
+            self.assertEqual(gl["vantage"], "sg-proxy")
+            self.assertEqual(gl["pythonVersion"], _pf.python_version())
+            self.assertIn("mitmproxyVersion", gl)
+        finally:
+            A.get_egress = orig_get
+            A._EGRESS_CACHE["data"] = None
+            A._EGRESS_CACHE["at"] = 0
+
+    def test_latency_vantage_derived_from_egress(self):
+        """/latency vantage 不再硬编码 hk-local——由 /egress countryCode 推导。"""
+        orig_get = A.get_egress
+        saved = {}
+        for fn in (
+            "_probe_https_warm",
+            "_probe_okx_ws",
+            "_probe_padre_ws",
+            "_probe_http_ping",
+            "_probe_fomo_ws",
+        ):
+            saved[fn] = getattr(A, fn)
+            setattr(A, fn, lambda *a, **k: None)
+        try:
+            A.get_egress = lambda: {"countryCode": "HK", "label": "Hong Kong"}
+            self.assertEqual(A._collect_latency()["vantage"], "hk-proxy")
+            A.get_egress = lambda: None
+            self.assertEqual(A._collect_latency()["vantage"], "unknown-proxy")
+        finally:
+            A.get_egress = orig_get
+            for fn, v in saved.items():
+                setattr(A, fn, v)
+
+    def test_egress_country_code_cached(self):
+        """get_egress 必须缓存 countryCode（vantage 推导源；文档保留网段地址）。"""
+
+        class R:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "status": "success",
+                        "query": "203.0.113.7",
+                        "country": "Hong Kong",
+                        "countryCode": "HK",
+                        "regionName": "HK",
+                        "city": "HK",
+                        "isp": "doc-test-net",
+                    }
+                ).encode()
+
+        orig = A.urllib.request.urlopen
+        A.urllib.request.urlopen = lambda *a, **k: R()
+        A._EGRESS_CACHE["data"] = None
+        A._EGRESS_CACHE["at"] = 0
+        try:
+            eg = A.get_egress()
+            self.assertEqual(eg["countryCode"], "HK")
+            self.assertEqual(A._vantage(), "hk-proxy")
+        finally:
+            A.urllib.request.urlopen = orig
+            A._EGRESS_CACHE["data"] = None
+            A._EGRESS_CACHE["at"] = 0
+
+
+# ── R22：fomo 预览腿 anchorRole + attempted 口径 + 单窗预算 ──
+
+
+class TestR22PreviewRoleAndBudgets(unittest.TestCase):
+    def setUp(self):
+        fresh()
+
+    def test_fomo_preview_leg_not_attempted_until_executed(self):
+        """FOMO /swaps/v2 = 点击前预览（L7 路径/体不可区分执行）——腿先标
+        anchorRole=preview：不计 attempted、不消费 manifest 占位；Relay success 帧
+        正向匹配 requestId≡relaySwapId（=执行证据，Relay 只对已执行请求推 success）
+        才原子晋升 order 并计 attempted。"""
+        A.STORE.mark_open("run-fp", manifest={"rounds": 1})
+        rid = "0x" + "9a" * 32
+        orig = A._jsonrpc
+        A._jsonrpc = lambda url, m, p, timeout=10: {
+            "status": "0x1",
+            "blockNumber": "0x1",
+            "blockHash": "0x" + "99" * 32,
+            "transactionHash": p[0],
+        }
+        try:
+            # 两次预览（键入/报价刷新页面自发）——均不得计 attempted
+            for _ in range(2):
+                f = FakeFlow(
+                    "prod-api.fomo.family",
+                    "/swaps/v2",
+                    "POST",
+                    resp_body=json.dumps(
+                        {
+                            "success": True,
+                            "responseObject": {
+                                "v2Swap": {
+                                    "relaySwapId": rid,
+                                    "destinationChainId": 4663,
+                                }
+                            },
+                        }
+                    ),
+                )
+                A.addons[0].request(f)
+                A.addons[0].response(f)
+            tl = A.STORE.timeline("run-fp")
+            self.assertEqual(
+                tl["counts"]["attempted"],
+                0,
+                "预览不计 attempted（bug：每个预览 POST 都当下单 attempt）",
+            )
+            previews = [x for x in tl["legs"] if x["platform"] == "fomo"]
+            self.assertTrue(
+                previews and all(x.get("anchorRole") == "preview" for x in previews),
+                "fomo 腿须标 anchorRole=preview",
+            )
+            self.assertEqual(
+                len(tl["legs"]), 3, "2 预览腿 + 1 manifest 占位（预览不消费授权轮次）"
+            )
+            # 执行证据：Relay success 正向匹配最新预览腿 → 晋升 order + L1a'
+            A.addons[0].websocket_message(
+                ws_frame(
+                    "ws.relay.link",
+                    json.dumps(
+                        {
+                            "event": "request.status.updated",
+                            "data": {
+                                "status": "success",
+                                "requestId": rid,
+                                "txHashes": ["0x" + "12" * 32],
+                                "destinationChainId": 4663,
+                            },
+                        }
+                    ),
+                )
+            )
+            time.sleep(0.3)
+        finally:
+            A._jsonrpc = orig
+        tl = A.STORE.timeline("run-fp")
+        self.assertEqual(tl["counts"]["attempted"], 1, "执行证据落地后计 1 次下单")
+        self.assertEqual(tl["counts"]["observed"], 1)
+        exec_legs = [x for x in tl["legs"] if x.get("anchorRole") == "order"]
+        self.assertEqual(len(exec_legs), 1)
+        self.assertIsNotNone(exec_legs[0]["hkL1aMs"])
+        self.assertEqual(len(tl["legs"]), 2, "晋升后 manifest 占位被 order 腿消费")
+
+    def test_window_budgets_legs_and_events(self):
+        """单 run 腿/事件预算——超限截断并标 overflow（内存有界；防预览风暴）。"""
+        orig_l, orig_e = A.MAX_LEGS_PER_RUN, A.MAX_EVENTS_PER_RUN
+        try:
+            A.MAX_LEGS_PER_RUN, A.MAX_EVENTS_PER_RUN = 3, 100
+            A.STORE.mark_open("run-bud")
+            for _ in range(5):
+                A.addons[0].request(
+                    FakeFlow(
+                        "web3.okx.com",
+                        "/priapi/v6/dx/trade/multi/broadcast",
+                        "POST",
+                        "{}",
+                    )
+                )
+            tl = A.STORE.timeline("run-bud")
+            self.assertEqual(len(tl["legs"]), 3, "腿按预算截断")
+            self.assertEqual(
+                (tl.get("overflow") or {}).get("legs"), 2, "超出腿数如实标 overflow"
+            )
+            A.MAX_LEGS_PER_RUN, A.MAX_EVENTS_PER_RUN = 100, 2
+            A.STORE.mark_open("run-bud2")
+            for _ in range(4):
+                A.addons[0].request(
+                    FakeFlow(
+                        "web3.okx.com",
+                        "/priapi/v6/dx/trade/multi/broadcast",
+                        "POST",
+                        "{}",
+                    )
+                )
+            tl2 = A.STORE.timeline("run-bud2")
+            self.assertEqual(
+                (tl2.get("overflow") or {}).get("events"),
+                2,
+                "超出事件数如实标 overflow",
+            )
+        finally:
+            A.MAX_LEGS_PER_RUN, A.MAX_EVENTS_PER_RUN = orig_l, orig_e
+
+
+# ── R22 三轮：授权槽绑定 / unbound 诊断 / padre sign 角色 / 关窗缺失补写 ──
+
+
+class TestR22SlotBinding(unittest.TestCase):
+    def setUp(self):
+        fresh()
+
+    def test_duplicate_same_order_request_merges_into_slot(self):
+        """B/R22 复现：Binance/BSC 授权 1 槽、同订单两次 place-order 请求。
+        旧→新断言映射（R22 四轮①，r6）：r5 时同单第二次请求落 unbound=1；r6 起
+        正向同单（clientOrderId/orderId 匹配已绑槽腿）归入同一授权槽——重复请求标
+        dup 诊断（round=None，不占新槽、不新增 attempted、不计 unbound），
+        diag.orderReqDuplicate 计数。「身份缺失/冲突的重复保持 unbound 不猜」由
+        TestR22OrderIdentityDedup 保留。安全性质不变：attempted 恒为 1。"""
+        po = "/bapi/defi/v2/private/wallet-direct/web-dex/place-order"
+        A.STORE.mark_open(
+            "run-dup",
+            manifest={
+                "version": 1,
+                "runId": "run-dup",
+                "rounds": 1,
+                "legs": [{"platform": "binance", "chain": "bsc", "rounds": 1}],
+            },
+        )
+        for _ in range(2):  # 同订单两次请求（产品重试/重复派发）
+            f = FakeFlow(
+                "web3.binance.com",
+                po,
+                "POST",
+                req_body=json.dumps({"clientOrderId": "cid-dup", "chain": "BSC"}),
+                resp_body=json.dumps(
+                    {
+                        "code": "000000",
+                        "data": {"orderId": "oid-dup", "clientOrderId": "cid-dup"},
+                    }
+                ),
+            )
+            A.addons[0].request(f)
+            A.addons[0].response(f)
+        tl = A.STORE.timeline("run-dup")
+        self.assertEqual(
+            tl["counts"],
+            {"requested": 1, "attempted": 1, "observed": 0, "unbound": 0},
+            "同单重复请求归入同一授权槽——不冒充第二次授权尝试（更早旧 bug：attempted=2）",
+        )
+        real = [x for x in tl["legs"] if x["anchorRole"] is not None]
+        self.assertEqual(len(real), 2, "两条请求腿都留作证据")
+        bound = [x for x in real if not x["dup"]]
+        dup = [x for x in real if x["dup"]]
+        self.assertEqual(len(bound), 1)
+        self.assertEqual(
+            bound[0]["round"],
+            None,
+            "r7：绑定只证明槽容量——授权轮号不由槽位序推导（null=未知）",
+        )
+        self.assertIsNotNone(bound[0]["observationIndex"], "到达序照常记录")
+        self.assertIsNone(dup[0]["round"], "重复腿无授权轮次（不占新槽）")
+        self.assertFalse(dup[0]["unbound"], "正向同单不是 unbound——是 dup 诊断")
+        self.assertEqual(
+            len([x for x in tl["legs"] if x["incomplete"] == "no-order-observed"]),
+            0,
+            "槽已被首请求消费——不再有缺失占位",
+        )
+        self.assertEqual(
+            A.STORE.diag.get("orderReqDuplicate", 0), 1, "同单重复须留诊断计数"
+        )
+        self.assertEqual(
+            A.STORE.diag.get("orderReqUnbound", 0), 0, "正向同单不再误记 unbound 诊断"
+        )
+
+    def test_unknown_chain_request_cannot_claim_chain_slot(self):
+        """B/R22：chain 未知的请求不得吞掉某链的缺失占位（旧贪心配对会把 chain=None
+        的腿配给任一 chain spec）。binance 授权 bsc/solana 各 1 槽，只来 1 个 chain
+        不可解析的请求 → unbound 诊断，两个授权槽均保留缺失占位。"""
+        po = "/bapi/defi/v2/private/wallet-direct/web-dex/place-order"
+        A.STORE.mark_open(
+            "run-uc",
+            manifest={
+                "version": 1,
+                "runId": "run-uc",
+                "rounds": 1,
+                "legs": [
+                    {"platform": "binance", "chain": "bsc", "rounds": 1},
+                    {"platform": "binance", "chain": "solana", "rounds": 1},
+                ],
+            },
+        )
+        f = FakeFlow(
+            "web3.binance.com",
+            po,
+            "POST",
+            req_body=json.dumps({"clientOrderId": "cid-x"}),  # 无 chain 字段
+            resp_body=json.dumps(
+                {
+                    "code": "000000",
+                    "data": {"orderId": "oid-x", "clientOrderId": "cid-x"},
+                }
+            ),
+        )
+        A.addons[0].request(f)
+        A.addons[0].response(f)
+        self.assertTrue(A.STORE.legs["run-uc"][0]["pendingBind"])
+        A.STORE.mark_close("run-uc")
+        tl = A.STORE.timeline("run-uc")
+        self.assertEqual(
+            tl["counts"],
+            {"requested": 2, "attempted": 0, "observed": 0, "unbound": 1},
+            "chain 未证明——不计任何链槽的 attempted",
+        )
+        ph = [x for x in tl["legs"] if x["incomplete"] == "no-order-observed"]
+        self.assertEqual(len(ph), 2, "chain 未知的请求不得吞占位——两槽均如实缺失")
+        self.assertEqual({x["chain"] for x in ph}, {"bsc", "solana"})
+
+    def test_padre_sign_role_not_attempted_until_done(self):
+        """B/R22：Padre sign_raw_payload 未证明与 order 一一对应——腿先标
+        anchorRole=sign（不计 attempted、不占授权槽）；同 DONE 节点合法 hash +
+        独立锚正向匹配 + 新鲜源时间 = 执行证据 → 原子晋升 order 并绑槽。"""
+        import msgpack
+
+        h = "0x" + "cd" * 32
+        orig = A._jsonrpc
+        A._jsonrpc = lambda url, m, p, timeout=10: (
+            None
+        )  # 本例不验 receipt——成功推送即 observed
+        try:
+            # r8：锚注入（生产今日无 Padre 锚源——真实 Turnkey 响应无身份，见 test_padre_msgpack_done）
+            padre_sign_leg(
+                "run-sign",
+                anchor_hash=h,
+                req_body=json.dumps({"data": {"chainId": "56"}}),
+                manifest={
+                    "version": 1,
+                    "runId": "run-sign",
+                    "rounds": 1,
+                    "legs": [{"platform": "padre", "chain": "bsc", "rounds": 1}],
+                },
+            )
+            tl0 = A.STORE.timeline("run-sign")
+            self.assertEqual(
+                tl0["legs"][0]["anchorRole"],
+                "sign",
+                "签名调用先标 sign（未证明一一对应 order）",
+            )
+            self.assertEqual(
+                tl0["counts"],
+                {"requested": 1, "attempted": 0, "observed": 0, "unbound": 0},
+                "sign 腿不计 attempted",
+            )
+            self.assertEqual(len(tl0["legs"]), 2, "sign 腿不消费槽位——缺失占位保留")
+            frame = msgpack.packb(
+                [
+                    373,
+                    200,
+                    {
+                        "txnStatus": "DONE",
+                        "txnHash": h,
+                        "creationTime": int(time.time() * 1000),
+                    },
+                ]
+            )
+            A.addons[0].websocket_message(ws_frame("backend3.padre.gg", frame))
+        finally:
+            A._jsonrpc = orig
+        tl = A.STORE.timeline("run-sign")
+        self.assertEqual(
+            tl["counts"],
+            {"requested": 1, "attempted": 1, "observed": 1, "unbound": 0},
+            "DONE 执行证据落地后计 1 次下单",
+        )
+        leg = [x for x in tl["legs"] if x["anchorRole"] == "order"][0]
+        self.assertEqual(
+            leg["round"],
+            None,
+            "r7：晋升绑槽不写授权轮号（到达序≠授权轮；唯一关联由 EU 侧回配 authorizedRound）",
+        )
+        self.assertFalse(leg["unbound"])
+        self.assertEqual(len(tl["legs"]), 1, "晋升消费槽位——占位归零")
+        self.assertIsNotNone(leg["hkL1aMs"])
+
+    def test_padre_sign_without_done_gets_no_execution_proof(self):
+        """sign 腿始终无 DONE 执行证据 → 关窗后 incomplete=no-execution-proof，
+        授权槽占位保留（no-order-observed），attempted 恒 0。"""
+        padre_sign_leg(
+            "run-sx",
+            manifest={
+                "version": 1,
+                "runId": "run-sx",
+                "rounds": 1,
+                "legs": [{"platform": "padre", "chain": "bsc", "rounds": 1}],
+            },
+        )
+        A.STORE.mark_close("run-sx")
+        tl = A.STORE.timeline("run-sx")
+        self.assertEqual(
+            tl["counts"], {"requested": 1, "attempted": 0, "observed": 0, "unbound": 0}
+        )
+        sign_leg = tl["legs"][0]
+        self.assertEqual(sign_leg["anchorRole"], "sign")
+        self.assertEqual(
+            sign_leg["incomplete"],
+            "no-execution-proof",
+            "无执行证据的 sign 腿关窗后须如实标注（旧 bug：incomplete=null）",
+        )
+        self.assertEqual(
+            tl["legs"][1]["incomplete"], "no-order-observed", "授权槽占位仍在"
+        )
+
+    def test_window_close_backfills_missing_states(self):
+        """B/R22 复现②：关窗不补缺失状态（无结果腿 L1a/L3=null 而 incomplete=null）。
+        现：关窗后 order 腿无成功观察 → no-success-observed；有成功无 receipt →
+        no-receipt-observed；未晋升 preview 腿 → no-execution-proof。开窗中不补
+        （仍在采集——incomplete=null 是正确的进行态）。"""
+        A.STORE.mark_open(
+            "run-ms",
+            manifest={
+                "version": 1,
+                "runId": "run-ms",
+                "rounds": 2,
+                "legs": [{"platform": "okx", "chain": "bsc", "rounds": 2}],
+            },
+        )
+        h1 = "0x" + "ab" * 32
+        orig = A._jsonrpc
+        A._jsonrpc = lambda url, m, p, timeout=10: None  # 无 receipt——poller 落空
+        try:
+            # 腿1：无任何结果
+            A.addons[0].request(
+                FakeFlow(
+                    "web3.okx.com",
+                    "/priapi/v6/dx/trade/multi/broadcast",
+                    "POST",
+                    req_body=json.dumps({"data": {"chainId": "56"}}),
+                    resp_body="{}",
+                )
+            )
+            # 腿2：有成功无 receipt
+            f2 = FakeFlow(
+                "web3.okx.com",
+                "/priapi/v6/dx/trade/multi/broadcast",
+                "POST",
+                req_body=json.dumps({"data": {"chainId": "56"}}),
+                resp_body=json.dumps(
+                    {"code": "0", "data": {"transactionHash": h1, "orderId": "o2"}}
+                ),
+            )
+            A.addons[0].request(f2)
+            A.addons[0].response(f2)
+            A.addons[0].websocket_message(
+                ws_frame(
+                    "wsdexpri.okx.com",
+                    json.dumps(
+                        {
+                            "arg": {"channel": "dex-swap-order-info"},
+                            "data": {
+                                "dexData": {
+                                    "status": "1",
+                                    "orderId": "o2",
+                                    "transactionHash": h1,
+                                }
+                            },
+                        }
+                    ),
+                )
+            )
+            open_tl = A.STORE.timeline("run-ms")
+            self.assertIsNone(
+                open_tl["legs"][0]["incomplete"], "开窗中仍在采集——不补缺失状态"
+            )
+            A.STORE.mark_close("run-ms")
+        finally:
+            A._jsonrpc = orig
+        tl = A.STORE.timeline("run-ms")
+        self.assertEqual(
+            tl["legs"][0]["incomplete"],
+            "no-success-observed",
+            "关窗后无结果腿须补 no-success",
+        )
+        self.assertEqual(
+            tl["legs"][1]["incomplete"],
+            "no-receipt-observed",
+            "有成功无 receipt 须补 no-receipt",
+        )
+        self.assertIsNotNone(tl["legs"][1]["hkL1aMs"], "成功观察不受影响")
+        self.assertEqual(
+            tl["counts"], {"requested": 2, "attempted": 2, "observed": 1, "unbound": 0}
+        )
+
+    def test_unpromoted_preview_close_marked_no_execution_proof(self):
+        """fomo 预览腿未获 Relay 执行证据 → 关窗后 no-execution-proof（含 F-SOL
+        同链腿 known limitation 的如实出口）；预览仍不消费授权槽。"""
+        A.STORE.mark_open(
+            "run-pv",
+            manifest={
+                "version": 1,
+                "runId": "run-pv",
+                "rounds": 1,
+                "legs": [{"platform": "fomo", "chain": "robinhood", "rounds": 1}],
+            },
+        )
+        A.addons[0].request(
+            FakeFlow("prod-api.fomo.family", "/swaps/v2", "POST", "", "{}")
+        )
+        A.STORE.mark_close("run-pv")
+        tl = A.STORE.timeline("run-pv")
+        self.assertEqual(tl["legs"][0]["anchorRole"], "preview")
+        self.assertEqual(tl["legs"][0]["incomplete"], "no-execution-proof")
+        self.assertEqual(
+            tl["counts"], {"requested": 1, "attempted": 0, "observed": 0, "unbound": 0}
+        )
+        self.assertEqual(
+            tl["legs"][1]["incomplete"], "no-order-observed", "预览不占槽——占位保留"
+        )
+
+    def test_freeze_backfill_is_terminal(self):
+        """关窗补写在输出层确定性成立：重复拉取一致；已有 incomplete（poll 失败写入）
+        不被补写覆盖；内部腿态不被 timeline 修改（R25 pin 语义不受影响）。"""
+        A.STORE.mark_open("run-tm", manifest={"rounds": 1})
+        A.addons[0].request(
+            FakeFlow(
+                "web3.okx.com",
+                "/priapi/v6/dx/trade/multi/broadcast",
+                "POST",
+                "{}",
+                "{}",
+            )
+        )
+        leg = A.STORE.legs["run-tm"][0]
+        A._settle_incomplete(leg, "receipt poll timeout")  # 先写入的 poll 失败原因
+        A.STORE.mark_close("run-tm")
+        tl1 = A.STORE.timeline("run-tm")
+        tl2 = A.STORE.timeline("run-tm")
+        self.assertEqual(
+            tl1["legs"][0]["incomplete"],
+            "receipt poll timeout",
+            "已有 incomplete 不被补写覆盖",
+        )
+        self.assertEqual(
+            tl1["legs"][0]["incomplete"],
+            tl2["legs"][0]["incomplete"],
+            "重复拉取补写一致",
+        )
+        self.assertEqual(leg.get("incomplete"), "receipt poll timeout")
+        # 对照：无既有 incomplete 的冻结腿补写在输出层，内部态不变
+        A.STORE.mark_open("run-tm2")
+        A.addons[0].request(
+            FakeFlow(
+                "web3.okx.com",
+                "/priapi/v6/dx/trade/multi/broadcast",
+                "POST",
+                "{}",
+                "{}",
+            )
+        )
+        leg2 = A.STORE.legs["run-tm2"][0]
+        A.STORE.mark_close("run-tm2")
+        self.assertEqual(
+            A.STORE.timeline("run-tm2")["legs"][0]["incomplete"], "no-success-observed"
+        )
+        self.assertIsNone(leg2.get("incomplete"), "输出层补写不改内部腿态")
+
+
+# ── R24：块身份证据门（缺 blockHash/blockNumber/slot → L3 null + incomplete）──
+
+
+class TestR24BlockIdentityGate(unittest.TestCase):
+    def setUp(self):
+        fresh()
+
+    def test_evm_receipt_missing_block_identity_incomplete(self):
+        """EVM：status=1 + transactionHash 匹配但缺 blockHash/blockNumber = 证据不足
+        ——L3 留 null + incomplete='receipt-missing-block-identity'（不猜）。"""
+        A.STORE.mark_open("run-r24")
+        orig = A._jsonrpc
+        to, iv = A.RECEIPT_POLL_TIMEOUT_S, A.RECEIPT_POLL_INTERVAL_S
+        A.RECEIPT_POLL_TIMEOUT_S = 1.0
+        A.RECEIPT_POLL_INTERVAL_S = 0.1
+        A._jsonrpc = lambda url, m, p, timeout=10: {
+            "status": "0x1",
+            "transactionHash": p[0],
+        }  # 无块身份
+        try:
+            f = FakeFlow(
+                "web3.okx.com",
+                "/priapi/v6/dx/trade/multi/broadcast",
+                "POST",
+                resp_body=json.dumps(
+                    {
+                        "code": "0",
+                        "data": {"transactionHash": "0x" + "ab" * 32, "orderId": "o1"},
+                    }
+                ),
+            )
+            A.addons[0].request(f)
+            A.addons[0].response(f)
+            time.sleep(0.6)
+        finally:
+            A._jsonrpc = orig
+            A.RECEIPT_POLL_TIMEOUT_S, A.RECEIPT_POLL_INTERVAL_S = to, iv
+        leg = A.STORE.timeline("run-r24")["legs"][0]
+        self.assertIsNone(leg["hkL3Ms"], "缺块身份的 receipt 不得 settle L3")
+        self.assertEqual(leg["incomplete"], "receipt-missing-block-identity")
+
+    def test_sol_status_missing_slot_incomplete(self):
+        """Sol：confirmed+err=null 但缺 slot = 缺块身份——同门。"""
+        A.STORE.mark_open("run-r24s")
+        orig = A._jsonrpc
+        A._jsonrpc = lambda url, m, p, timeout=10: {
+            "value": [{"confirmationStatus": "confirmed", "err": None}]
+        }  # 无 slot
+        sig = "5" * 88
+        try:
+            f = FakeFlow(
+                "gmgn.ai",
+                "/tapi/v1/swap_batch_order",
+                "POST",
+                resp_body=json.dumps({"data": {"hash": sig, "orderId": "g1"}}),
+            )
+            A.addons[0].request(f)
+            A.addons[0].response(f)
+            time.sleep(0.6)
+        finally:
+            A._jsonrpc = orig
+        leg = A.STORE.timeline("run-r24s")["legs"][0]
+        self.assertIsNone(leg["hkL3Ms"], "缺 slot 的 Sol 状态不得 settle L3")
+        self.assertEqual(leg["incomplete"], "receipt-missing-block-identity")
+
+
+# ── P3 清理：padre 死分支 / _classify_ws 点边界 ──
+
+
+class TestP3Cleanup(unittest.TestCase):
+    def setUp(self):
+        fresh()
+
+    def test_padre_done_node_strict_only(self):
+        """宽松终态词表（_PADRE_DONE_EQ/filled/completed/…）无生产调用且会让非 DONE
+        帧冒充成功——已删除；_padre_done_node 只剩严格 txnStatus=='DONE'。"""
+        node = A._padre_done_node({"txnStatus": "DONE", "txnHash": "0x" + "ab" * 32})
+        self.assertIsNotNone(node)
+        self.assertIsNone(
+            A._padre_done_node({"orderStatus": "filled"}),
+            "宽松词表反例：filled 不得当 DONE",
+        )
+        self.assertFalse(hasattr(A, "_PADRE_DONE_EQ"), "死词表已删除")
+        with self.assertRaises(TypeError):
+            A._padre_done_node({}, strict=False)  # 宽松分支参数已随死代码删除
+
+    def test_classify_ws_dot_boundary(self):
+        """_classify_ws = exact host 或 '.'+host 后缀边界——裸 endswith 会把
+        notnbstream.binance.com 这类同后缀异主机误分类进 binance。"""
+        self.assertIsNone(A._classify_ws("notnbstream.binance.com"), "无点边界误分类")
+        self.assertIsNone(A._classify_ws("evilwsdexpri.okx.com"))
+        self.assertEqual(A._classify_ws("nbstream.binance.com"), "binance")
+        self.assertEqual(A._classify_ws("x.wsdexpri.okx.com"), "okx", "合法子域仍命中")
+
+
+# ── §7.3：Padre fresh DONE 脱敏真实帧夹具（两路径区分 + 父/子时间字段 DONE 子树边界）──
+
+
+class TestP3PadreFreshDoneFixture(unittest.TestCase):
+    """§7.3 证据补足：按文档化的真实帧形状做脱敏离线夹具——msgpack _multiplex
+    信封 [373, 200, payload]，payload[2] 即直接交易节点（runner-core.mjs 帧形状注释、
+    docs/hk-proxy-timing.md「准确性硬门」）；重放帧时间字段 creationTime/firstUserClickMs
+    见 k2x54 复盘。两道门各自独立、缺一不可：①请求/响应独立锚的 ID 正相关；
+    ②同一 DONE 节点子树内的新鲜源时间。「时间兜底」路径不存在——无锚帧仅凭新鲜
+    时间不得自证关联。父/子时间字段只在同一 DONE 节点子树内生效（根/父节点的
+    新鲜 timestamp 不给 DONE 子树背书）。hash 全合成，无真实批数据。
+    N=1 实批属另行授权采集，本夹具不覆盖。"""
+
+    def setUp(self):
+        fresh()
+        self.polled = []
+        self._orig_poll = A._poll_receipt
+        A._poll_receipt = lambda *a, **k: self.polled.append(a)
+
+    def tearDown(self):
+        A._poll_receipt = self._orig_poll
+
+    @staticmethod
+    def _frame(payload):
+        import msgpack
+
+        return ws_frame("backend3.padre.gg", msgpack.packb([373, 200, payload]))
+
+    @staticmethod
+    def _open_leg(run, anchor_hash):
+        """Turnkey sign 请求 + 真实形状响应（无锚）；anchor_hash 非空时直接注入独立锚
+        （r8：生产今日无 Padre 锚源，注入只为覆盖 DONE 门边界）；None = 生产现状（无锚）。"""
+        padre_sign_leg(run, anchor_hash=anchor_hash)
+
+    def test_first_user_click_ms_fresh_accept_stale_reject(self):
+        """k2x54 重放帧字段 firstUserClickMs 与 creationTime 同为新鲜源时间：
+        锚正相关 + 新鲜 firstUserClickMs → 采纳；锚正相关 + 6.7h 前（fszyx 重放量级）
+        → 拒（正相关不绕过陈旧门，两路径都过时间门）。"""
+        h = "0x" + "ab" * 32
+        now_ms = int(time.time() * 1000)
+        # 锚正相关 + 陈旧 firstUserClickMs → 拒
+        self._open_leg("run-f1", h)
+        A.addons[0].websocket_message(
+            self._frame(
+                {
+                    "txnStatus": "DONE",
+                    "txnHash": h,
+                    "firstUserClickMs": now_ms - 6.7 * 3600_000,
+                }
+            )
+        )
+        self.assertIsNone(
+            A.STORE.timeline("run-f1")["legs"][0]["hkL1aMs"],
+            "陈旧 firstUserClickMs 重放不得算成功",
+        )
+        A.STORE.mark_close("run-f1")
+        # 锚正相关 + 新鲜 firstUserClickMs → 采纳
+        self._open_leg("run-f2", h)
+        A.addons[0].websocket_message(
+            self._frame({"txnStatus": "DONE", "txnHash": h, "firstUserClickMs": now_ms})
+        )
+        leg = A.STORE.timeline("run-f2")["legs"][0]
+        self.assertIsNotNone(leg["hkL1aMs"], "锚正相关+新鲜 firstUserClickMs 正常采纳")
+        self.assertEqual(leg["txHash"], "0xabababab…ababab")
+
+    def test_no_time_fallback_without_anchor(self):
+        """「时间兜底」路径不存在的钉死：腿无独立锚（响应未抽取 id）——DONE 帧同节点
+        合法 hash + 新鲜 firstUserClickMs 也整帧拒收；新鲜时间永不自证关联。"""
+        self._open_leg("run-f3", None)
+        now_ms = int(time.time() * 1000)
+        A.addons[0].websocket_message(
+            self._frame(
+                {
+                    "txnStatus": "DONE",
+                    "txnHash": "0x" + "cd" * 32,
+                    "firstUserClickMs": now_ms,
+                }
+            )
+        )
+        leg = A.STORE.timeline("run-f3")["legs"][0]
+        self.assertIsNone(leg["hkL1aMs"], "无锚：新鲜时间兜底不得充关联")
+        self.assertIsNone(leg["txHash"])
+        self.assertEqual(self.polled, [], "无锚帧不得触发 receipt 轮询")
+
+    def test_time_fields_scoped_to_done_subtree(self):
+        """父/子时间字段只在同一 DONE 节点子树内生效：
+        ①子生效——新鲜 creationTime 在 DONE 节点的嵌套子节点内 → 采纳；
+        ②父不生效——DONE 子树无时间字段、仅根/父节点带新鲜 timestamp → 拒
+        （根新 timestamp 不得给无源时间的 DONE 子树背书）。"""
+        h = "0x" + "88" * 32
+        now_ms = int(time.time() * 1000)
+        # ①DONE 节点自身无时间字段、嵌套子节点 exec.creationTime 新鲜 → 采纳
+        self._open_leg("run-f4", h)
+        A.addons[0].websocket_message(
+            self._frame(
+                {"txnStatus": "DONE", "txnHash": h, "exec": {"creationTime": now_ms}}
+            )
+        )
+        leg = A.STORE.timeline("run-f4")["legs"][0]
+        self.assertIsNotNone(leg["hkL1aMs"], "DONE 子树内嵌套子节点的新鲜时间字段生效")
+        A.STORE.mark_close("run-f4")
+        # ②根节点新鲜 timestamp + DONE 子树全无时间字段 → 拒
+        self._open_leg("run-f5", h)
+        A.addons[0].websocket_message(
+            self._frame(
+                {"timestamp": now_ms, "sub": {"txnStatus": "DONE", "txnHash": h}}
+            )
+        )
+        leg = A.STORE.timeline("run-f5")["legs"][0]
+        self.assertIsNone(
+            leg["hkL1aMs"], "DONE 子树外（根/父）的新鲜 timestamp 不得背书"
+        )
+        # 腿 txHash 是响应锚合法写入，不能据此区分帧挂载——「拒收帧不挂 hash」由
+        # test_no_time_fallback_without_anchor（无锚腿）钉死
+
+    def test_creation_time_seconds_epoch_converted(self):
+        """creationTime 秒级 epoch（>1e9 且 <1e12）按 ×1000 归一——新鲜秒级帧正常采纳。"""
+        h = "0x" + "99" * 32
+        self._open_leg("run-f6", h)
+        A.addons[0].websocket_message(
+            self._frame(
+                {"txnStatus": "DONE", "txnHash": h, "creationTime": int(time.time())}
+            )
+        )
+        leg = A.STORE.timeline("run-f6")["legs"][0]
+        self.assertIsNotNone(
+            leg["hkL1aMs"], "秒级 epoch creationTime ×1000 后判新鲜 → 采纳"
+        )
+
+
+# ── R22 四轮（2026-09-07 r6）①：N>1 订单身份去重 ──
+
+
+class TestR22OrderIdentityDedup(unittest.TestCase):
+    """槽绑定先做订单身份去重：同 run 内与已绑槽腿 orderId/clientOrderId 正向匹配
+    （至少一个共同身份键且全部共同键相等）的请求归入同一授权槽——dup 诊断，不占新槽、
+    不新增 attempted、不计 unbound；不同订单各占其槽；身份缺失/冲突不猜（保持容量
+    判定与 unbound 旧律）。旧→新映射：r5「同单重复 → unbound」→ r6「同单重复 → dup」
+    （见 TestR22SlotBinding.test_duplicate_same_order_request_merges_into_slot）。"""
+
+    PO = "/bapi/defi/v2/private/wallet-direct/web-dex/place-order"
+
+    def setUp(self):
+        fresh()
+        orig = A._poll_receipt
+        A._poll_receipt = lambda *a, **k: None  # 不验 receipt——只考去重与槽位语义
+        self.addCleanup(setattr, A, "_poll_receipt", orig)
+
+    def _binance(self, cid=None, oid=None, chain="BSC"):
+        req = {"chain": chain}
+        if cid:
+            req["clientOrderId"] = cid
+        data = {}
+        if oid:
+            data["orderId"] = oid
+        if cid:
+            data["clientOrderId"] = cid
+        f = FakeFlow(
+            "web3.binance.com",
+            self.PO,
+            "POST",
+            req_body=json.dumps(req),
+            resp_body=json.dumps({"code": "000000", "data": data}) if data else "{}",
+        )
+        A.addons[0].request(f)
+        A.addons[0].response(f)
+
+    def _okx(self, oid, h):
+        f = FakeFlow(
+            "web3.okx.com",
+            "/priapi/v6/dx/trade/multi/broadcast",
+            "POST",
+            req_body=json.dumps({"data": {"chainId": "56"}}),
+            resp_body=json.dumps(
+                {"code": "0", "data": {"transactionHash": h, "orderId": oid}}
+            ),
+        )
+        A.addons[0].request(f)
+        A.addons[0].response(f)
+
+    def test_n2_same_order_repeat_merges(self):
+        """N=2 同订单请求两次：第二请求归入同一授权槽——attempted=1/unbound=0，
+        第二槽保留为缺失占位（旧 bug：两请求占 round 1/2 两槽、attempted=2）。"""
+        A.STORE.mark_open(
+            "run-d2",
+            manifest={
+                "version": 1,
+                "runId": "run-d2",
+                "rounds": 2,
+                "legs": [{"platform": "binance", "chain": "bsc", "rounds": 2}],
+            },
+        )
+        self._binance("cid-A", "oid-A")
+        self._binance("cid-A", "oid-A")
+        tl = A.STORE.timeline("run-d2")
+        self.assertEqual(
+            tl["counts"], {"requested": 2, "attempted": 1, "observed": 0, "unbound": 0}
+        )
+        internal = A.STORE.legs["run-d2"]
+        self.assertEqual((internal[0]["slot"], internal[0]["round"]), (0, None))
+        self.assertIsNone(internal[1]["slot"])
+        self.assertTrue(internal[1]["dup"])
+        self.assertEqual([x["round"] for x in tl["legs"][:2]], [None, None])
+        self.assertTrue(tl["legs"][1]["dup"])
+        self.assertFalse(tl["legs"][1]["unbound"])
+        ph = [x for x in tl["legs"] if x["incomplete"] == "no-order-observed"]
+        self.assertEqual(len(ph), 1, "重复请求不消费第二槽——该槽仍为缺失占位")
+        self.assertEqual(A.STORE.diag.get("orderReqDuplicate"), 1)
+        self.assertEqual(A.STORE.diag.get("orderReqUnbound", 0), 0)
+
+    def test_n2_two_distinct_orders_take_own_slots(self):
+        """N=2 两不同订单：各占其槽——attempted=2/unbound=0，无占位。"""
+        A.STORE.mark_open(
+            "run-dd",
+            manifest={
+                "version": 1,
+                "runId": "run-dd",
+                "rounds": 2,
+                "legs": [{"platform": "binance", "chain": "bsc", "rounds": 2}],
+            },
+        )
+        self._binance("cid-A", "oid-A")
+        self._binance("cid-B", "oid-B")
+        tl = A.STORE.timeline("run-dd")
+        self.assertEqual(
+            tl["counts"], {"requested": 2, "attempted": 2, "observed": 0, "unbound": 0}
+        )
+        self.assertEqual(
+            [x["round"] for x in tl["legs"]],
+            [None, None],
+            "r7：各占其槽（容量绑定），授权轮号不由到达序推导",
+        )
+        self.assertEqual(
+            [x["observationIndex"] for x in tl["legs"]], [1, 2], "到达序连续"
+        )
+        self.assertFalse(any(x["dup"] for x in tl["legs"]))
+        self.assertEqual(A.STORE.diag.get("orderReqDuplicate", 0), 0)
+
+    def test_n2_repeat_then_distinct_binds_released_slot(self):
+        """重复+不同混合（okx——身份在响应才建立）：第二请求建腿时身份未知先占槽，
+        响应揭示同单 → 释放槽位并改记 dup；随后真正的第二订单绑上释放出的槽。
+        attempted=2/unbound=0（旧 bug：attempted=2 全是同单、第三请求反而 unbound）。"""
+        A.STORE.mark_open(
+            "run-dm",
+            manifest={
+                "version": 1,
+                "runId": "run-dm",
+                "rounds": 2,
+                "legs": [{"platform": "okx", "chain": "bsc", "rounds": 2}],
+            },
+        )
+        h1, h2 = "0x" + "ab" * 32, "0x" + "cd" * 32
+        self._okx("ord-A1", h1)
+        self._okx("ord-A1", h1)  # 同单重复：响应 orderId=ord-A1 正向匹配已绑槽腿
+        internal = A.STORE.legs["run-dm"]
+        self.assertIsNone(internal[1]["slot"], "响应去重后重复腿须释放占用槽")
+        self.assertTrue(internal[1]["dup"])
+        self._okx("ord-B1", h2)  # 真正的第二订单
+        tl = A.STORE.timeline("run-dm")
+        self.assertEqual(
+            tl["counts"], {"requested": 2, "attempted": 2, "observed": 0, "unbound": 0}
+        )
+        self.assertEqual(
+            [x["round"] for x in tl["legs"]],
+            [None, None, None],
+            "去重释放的槽归真正的第二订单（容量绑定）；r7 起轮号不由到达序推导",
+        )
+        self.assertEqual(A.STORE.diag.get("orderReqDuplicate"), 1)
+        self.assertEqual(A.STORE.diag.get("orderReqUnbound", 0), 0)
+
+    def test_identity_from_response_converts_unbound_to_dup(self):
+        """N=1 okx 同单两次：第二请求建腿时容量已满先标 unbound；响应身份正向同单 →
+        改判 dup（unbound 计数与诊断同步改记，不留假 unbound）。"""
+        A.STORE.mark_open(
+            "run-dc",
+            manifest={
+                "version": 1,
+                "runId": "run-dc",
+                "rounds": 1,
+                "legs": [{"platform": "okx", "chain": "bsc", "rounds": 1}],
+            },
+        )
+        h1 = "0x" + "ab" * 32
+        self._okx("ord-A1", h1)
+        self._okx("ord-A1", h1)
+        tl = A.STORE.timeline("run-dc")
+        self.assertEqual(
+            tl["counts"], {"requested": 1, "attempted": 1, "observed": 0, "unbound": 0}
+        )
+        internal = A.STORE.legs["run-dc"]
+        self.assertTrue(internal[1]["dup"])
+        self.assertFalse(internal[1]["unbound"])
+        self.assertEqual(
+            A.STORE.diag.get("orderReqUnbound", 0), 0, "改判 dup 后不留假 unbound 诊断"
+        )
+        self.assertEqual(A.STORE.diag.get("orderReqDuplicate"), 1)
+
+    def test_repeat_without_identity_stays_unbound(self):
+        """身份缺失不猜：N=1、两次请求都无 clientOrderId/orderId —— 无法证明同单，
+        第二请求保持容量判定的 unbound 诊断（r5 安全性质保留）。"""
+        A.STORE.mark_open(
+            "run-dn",
+            manifest={
+                "version": 1,
+                "runId": "run-dn",
+                "rounds": 1,
+                "legs": [{"platform": "binance", "chain": "bsc", "rounds": 1}],
+            },
+        )
+        self._binance()  # 无 clientOrderId，响应无 id
+        self._binance()
+        tl = A.STORE.timeline("run-dn")
+        self.assertEqual(
+            tl["counts"], {"requested": 1, "attempted": 1, "observed": 0, "unbound": 1}
+        )
+        internal = A.STORE.legs["run-dn"]
+        self.assertFalse(internal[1].get("dup", False), "身份缺失不得猜同单")
+        self.assertTrue(internal[1]["unbound"])
+        self.assertEqual(A.STORE.diag.get("orderReqUnbound"), 1)
+        self.assertEqual(A.STORE.diag.get("orderReqDuplicate", 0), 0)
+
+    def test_conflicting_identity_not_deduped(self):
+        """身份冲突不猜：同 orderId 但 clientOrderId 不同 —— 共同键一同一异 =
+        无法证明同单，不归并；容量已满 → 保持 unbound 诊断。（r8 起 ack 的 orderId /
+        clientOrderId 由 data.* 结构化分键抽取——两键都参与匹配）"""
+        A.STORE.mark_open(
+            "run-dx",
+            manifest={
+                "version": 1,
+                "runId": "run-dx",
+                "rounds": 1,
+                "legs": [{"platform": "binance", "chain": "bsc", "rounds": 1}],
+            },
+        )
+        self._binance("cid-AA", "oid-001")
+        self._binance("cid-BB", "oid-001")  # orderId 同、clientOrderId 冲突
+        tl = A.STORE.timeline("run-dx")
+        self.assertEqual(
+            tl["counts"],
+            {"requested": 1, "attempted": 1, "observed": 0, "unbound": 1},
+            "身份冲突不归并——保持 unbound 诊断，不猜",
+        )
+        internal = A.STORE.legs["run-dx"]
+        self.assertEqual(
+            internal[1].get("orderId"), "oid-001", "响应身份已建立——确为冲突而非缺失"
+        )
+        self.assertFalse(internal[1].get("dup", False))
+        self.assertTrue(internal[1]["unbound"])
+
+    def test_fomo_duplicate_execution_not_rebound(self):
+        """fomo：preview 晋升绑槽后，同 relaySwapId 的再次预览/再次 success 帧
+        （路由到最新预览腿）不再消费第二个槽——attempted 恒 1。"""
+        rid = "0x" + "9a" * 32
+        A.STORE.mark_open(
+            "run-fd",
+            manifest={
+                "version": 1,
+                "runId": "run-fd",
+                "rounds": 1,
+                "legs": [{"platform": "fomo", "chain": "robinhood", "rounds": 1}],
+            },
+        )
+
+        def preview():
+            f = FakeFlow(
+                "prod-api.fomo.family",
+                "/swaps/v2",
+                "POST",
+                resp_body=json.dumps(
+                    {
+                        "success": True,
+                        "responseObject": {
+                            "v2Swap": {"relaySwapId": rid, "destinationChainId": 4663}
+                        },
+                    }
+                ),
+            )
+            A.addons[0].request(f)
+            A.addons[0].response(f)
+
+        def success():
+            A.addons[0].websocket_message(
+                ws_frame(
+                    "ws.relay.link",
+                    json.dumps(
+                        {
+                            "event": "request.status.updated",
+                            "data": {
+                                "status": "success",
+                                "requestId": rid,
+                                "txHashes": ["0x" + "12" * 32],
+                                "destinationChainId": 4663,
+                            },
+                        }
+                    ),
+                )
+            )
+
+        preview()
+        success()  # 晋升腿1并绑槽
+        preview()  # 同 relaySwapId 的重复预览——响应身份正向同单 → dup
+        success()  # 重复执行证据路由到腿2——晋升但不再占新槽
+        tl = A.STORE.timeline("run-fd")
+        self.assertEqual(
+            tl["counts"], {"requested": 1, "attempted": 1, "observed": 1, "unbound": 0}
+        )
+        internal = A.STORE.legs["run-fd"]
+        self.assertEqual((internal[0]["slot"], internal[0]["round"]), (0, None))
+        self.assertTrue(internal[1]["dup"], "同单重复预览腿须标 dup")
+        self.assertIsNone(internal[1]["slot"])
+        self.assertEqual(A.STORE.diag.get("orderReqDuplicate"), 1)
+
+
+# ── R22 四轮（2026-09-07 r6）②：Padre DONE·receipt 乱序补绑 ──
+
+
+class TestR22DoneReceiptOutOfOrder(unittest.TestCase):
+    """请求链未知、响应带独立 hash 的 padre 腿：新鲜 DONE 与有效 RH receipt 到齐时，
+    两种事件顺序必须产出相同计数与相同腿身份。receipt 实证链（R24 门已过的轮询
+    胜出候选）回写时回填 leg.chain 并按 manifest 槽补绑；DONE 先到 → pendingBind
+    等 receipt；不猜链（receipt 实证链是唯一合法来源）；既有关联/新鲜度门不变。"""
+
+    RH_RECEIPT = {
+        "rpc": "https://rpc.mainnet.chain.robinhood.com",
+        "chain": "robinhood",
+        "pollIntervalMs": 800,
+        "status": 1,
+        "blockHash": "0x" + "99" * 32,
+        "blockNumber": "0x1",
+    }
+
+    def setUp(self):
+        fresh()
+        orig = A._poll_receipt
+        A._poll_receipt = lambda *a, **k: (
+            None
+        )  # receipt 由测试手动 settle——事件顺序确定性
+        self.addCleanup(setattr, A, "_poll_receipt", orig)
+
+    def _padre_sign_leg(self, run, manifest_chain, h):
+        """chain 未知的 sign 腿（body "{}"）+ 注入独立 hash 锚（r8：生产无 Padre 锚源）。"""
+        return padre_sign_leg(
+            run,
+            anchor_hash=h,
+            manifest={
+                "version": 1,
+                "runId": run,
+                "rounds": 1,
+                "legs": [{"platform": "padre", "chain": manifest_chain, "rounds": 1}],
+            },
+        )
+
+    @staticmethod
+    def _done(h):
+        import msgpack
+
+        return ws_frame(
+            "backend3.padre.gg",
+            msgpack.packb(
+                [
+                    373,
+                    200,
+                    {
+                        "txnStatus": "DONE",
+                        "txnHash": h,
+                        "creationTime": int(time.time() * 1000),
+                    },
+                ]
+            ),
+        )
+
+    def _assert_final(self, tl):
+        self.assertEqual(
+            tl["counts"], {"requested": 1, "attempted": 1, "observed": 1, "unbound": 0}
+        )
+        self.assertEqual(len(tl["legs"]), 1, "授权槽被补绑消费——无占位")
+        leg = tl["legs"][0]
+        self.assertEqual(
+            (leg["chain"], leg["anchorRole"], leg["round"], leg["unbound"]),
+            ("robinhood", "order", None, False),
+        )
+        self.assertFalse(leg["pendingBind"])
+        self.assertIsNotNone(leg["hkL1aMs"])
+        self.assertIsNotNone(leg["hkL3Ms"])
+
+    def test_okx_unknown_chain_waits_for_receipt_before_manifest_binding(self):
+        run = "okx-unknown-chain"
+        A.STORE.mark_open(
+            run,
+            manifest={
+                "version": 1,
+                "runId": run,
+                "rounds": 1,
+                "legs": [{"platform": "okx", "chain": "solana", "rounds": 1}],
+            },
+        )
+        with A.STORE.lock:
+            leg = A.STORE._new_leg_locked(
+                run, "okx", None, {"t": time.monotonic() * 1000, "tw": "synthetic"}
+            )
+        self.assertTrue(leg["pendingBind"])
+        self.assertFalse(leg["unbound"])
+        A._settle_receipt(leg, {"chain": "solana", "status": 1, "slot": 123})
+        self.assertEqual(leg["chain"], "solana")
+        self.assertIsNotNone(leg["slot"])
+        self.assertFalse(leg["pendingBind"])
+        self.assertFalse(leg["unbound"])
+        # Capacity is still enforced for another independent order.
+        with A.STORE.lock:
+            extra = A.STORE._new_leg_locked(
+                run, "okx", None, {"t": time.monotonic() * 1000, "tw": "synthetic"}
+            )
+        A._settle_receipt(extra, {"chain": "solana", "status": 1, "slot": 124})
+        self.assertTrue(extra["unbound"])
+        self.assertIsNone(extra["slot"])
+
+    def test_done_then_receipt_and_reverse_same_outcome(self):
+        """DONE→receipt 与 receipt→DONE 产出相同计数与相同腿身份（旧 bug：前者
+        1/0/0/1、后者 1/1/1/0 且 leg.chain=null——相同证据不同统计）。"""
+        h1, h2 = "0x" + "ab" * 32, "0x" + "cd" * 32
+        # 顺序 1：DONE 先到——链未实证 → pendingBind（不即判 unbound），receipt 补绑
+        leg1 = self._padre_sign_leg("run-o1", "robinhood", h1)
+        A.addons[0].websocket_message(self._done(h1))
+        self.assertTrue(
+            leg1.get("pendingBind"),
+            "链未实证——等 receipt 实证链补绑（旧 bug：直接 unbound）",
+        )
+        mid = A.STORE.timeline("run-o1")
+        self.assertEqual(
+            mid["counts"],
+            {"requested": 1, "attempted": 0, "observed": 0, "unbound": 0},
+            "pendingBind 腿开窗中暂不计 attempted/unbound",
+        )
+        self.assertTrue(mid["legs"][0]["pendingBind"])
+        A._settle_receipt(leg1, dict(self.RH_RECEIPT))
+        A.STORE.mark_close("run-o1")
+        tl1 = A.STORE.timeline("run-o1")
+        # 顺序 2：receipt 先到——实证链立即回填；DONE 后补晋升+绑槽
+        leg2 = self._padre_sign_leg("run-o2", "robinhood", h2)
+        A._settle_receipt(leg2, dict(self.RH_RECEIPT))
+        self.assertEqual(
+            leg2.get("chain"),
+            "robinhood",
+            "receipt 实证链立即回填（旧 bug：leg.chain 恒 null）",
+        )
+        mid2 = A.STORE.timeline("run-o2")
+        self.assertEqual(
+            mid2["counts"]["observed"], 0, "sign 腿 receipt 不单独计 observed（③门槛）"
+        )
+        A.addons[0].websocket_message(self._done(h2))
+        A.STORE.mark_close("run-o2")
+        tl2 = A.STORE.timeline("run-o2")
+        self._assert_final(tl1)
+        self._assert_final(tl2)
+
+    def test_done_without_receipt_settles_unbound_at_close(self):
+        """DONE 先到但 receipt 始终未实证链：开窗中 pendingBind 不猜链；关窗落定
+        unbound（计 diag.orderReqUnbound），授权槽占位保留。"""
+        h = "0x" + "ef" * 32
+        leg = self._padre_sign_leg("run-o3", "robinhood", h)
+        A.addons[0].websocket_message(self._done(h))
+        self.assertTrue(leg.get("pendingBind"))
+        self.assertEqual(
+            A.STORE.diag.get("orderReqUnbound", 0), 0, "开窗中不提前判 unbound"
+        )
+        A.STORE.mark_close("run-o3")
+        tl = A.STORE.timeline("run-o3")
+        self.assertEqual(
+            tl["counts"],
+            {"requested": 1, "attempted": 0, "observed": 0, "unbound": 1},
+            "关窗仍无实证链——执行观察按 unbound 落定（不猜链）",
+        )
+        lego = tl["legs"][0]
+        self.assertIsNone(lego["chain"])
+        self.assertTrue(lego["unbound"])
+        self.assertFalse(lego["pendingBind"])
+        self.assertEqual(lego["incomplete"], "no-receipt-observed")
+        self.assertEqual(A.STORE.diag.get("orderReqUnbound"), 1)
+        self.assertEqual(
+            tl["legs"][1]["incomplete"], "no-order-observed", "授权槽未被消费——占位保留"
+        )
+
+    def test_receipt_chain_without_manifest_slot_not_bound(self):
+        """receipt 实证链无对应 manifest 槽（授权 bsc、实证 robinhood）——不猜不占
+        别的链槽：回填 chain 如实记录，补绑失败落定 unbound。"""
+        h = "0x" + "77" * 32
+        leg = self._padre_sign_leg("run-o4", "bsc", h)
+        A.addons[0].websocket_message(self._done(h))
+        self.assertTrue(leg.get("pendingBind"))
+        A._settle_receipt(leg, dict(self.RH_RECEIPT))
+        tl = A.STORE.timeline("run-o4")
+        self.assertEqual(
+            tl["counts"],
+            {"requested": 1, "attempted": 0, "observed": 0, "unbound": 1},
+            "实证链无授权槽——不得吞掉 bsc 槽",
+        )
+        lego = tl["legs"][0]
+        self.assertEqual(lego["chain"], "robinhood", "实证链如实回填")
+        self.assertTrue(lego["unbound"])
+        self.assertEqual(tl["legs"][1]["chain"], "bsc")
+        self.assertEqual(
+            tl["legs"][1]["incomplete"],
+            "no-order-observed",
+            "bsc 授权槽不被实证 robinhood 的腿消费",
+        )
+
+
+# ── R22 四轮（2026-09-07 r6）③：observed 只计绑槽 order 腿 ──
+
+
+class TestR22ObservedBoundOrderGate(unittest.TestCase):
+    """observed ⊆ attempted（绑槽 order 腿）：sign/preview 腿的 receipt 只作诊断与
+    晋升依据，晋升失败不单独计入 observed；绑槽 order 腿的 receipt 仍计 observed。"""
+
+    RH_RECEIPT = TestR22DoneReceiptOutOfOrder.RH_RECEIPT
+
+    def setUp(self):
+        fresh()
+        orig = A._poll_receipt
+        A._poll_receipt = lambda *a, **k: None
+        self.addCleanup(setattr, A, "_poll_receipt", orig)
+
+    def test_sign_leg_receipt_alone_not_observed(self):
+        """只有有效 receipt、没有 DONE 的 sign 腿：关窗 counts.requested=1/
+        attempted=0/observed=0（旧 bug：observed=1——observed 未要求 order+绑槽）。
+        receipt 证据保留在腿上（诊断/晋升依据），incomplete=no-execution-proof。"""
+        h = "0x" + "ab" * 32
+        leg = padre_sign_leg(
+            "run-ob",
+            anchor_hash=h,
+            manifest={
+                "version": 1,
+                "runId": "run-ob",
+                "rounds": 1,
+                "legs": [{"platform": "padre", "chain": "robinhood", "rounds": 1}],
+            },
+        )
+        A._settle_receipt(leg, dict(self.RH_RECEIPT))
+        A.STORE.mark_close("run-ob")
+        tl = A.STORE.timeline("run-ob")
+        self.assertEqual(
+            tl["counts"],
+            {"requested": 1, "attempted": 0, "observed": 0, "unbound": 0},
+            "未晋升 sign 腿的 receipt 不单独计 observed（旧 bug：observed=1）",
+        )
+        lego = tl["legs"][0]
+        self.assertEqual(lego["anchorRole"], "sign")
+        self.assertEqual(lego["chain"], "robinhood", "receipt 实证链如实回填（诊断）")
+        self.assertIsNotNone(lego["hkL3Ms"], "receipt 证据保留在腿上")
+        self.assertEqual(lego["incomplete"], "no-execution-proof")
+        self.assertEqual(
+            tl["legs"][1]["incomplete"], "no-order-observed", "授权槽占位保留"
+        )
+
+    def test_preview_leg_receipt_alone_not_observed(self):
+        """fomo preview 腿同律：只有 receipt 没有 Relay success → observed=0。"""
+        rid = "0x" + "9a" * 32
+        A.STORE.mark_open(
+            "run-op",
+            manifest={
+                "version": 1,
+                "runId": "run-op",
+                "rounds": 1,
+                "legs": [{"platform": "fomo", "chain": "robinhood", "rounds": 1}],
+            },
+        )
+        f = FakeFlow(
+            "prod-api.fomo.family",
+            "/swaps/v2",
+            "POST",
+            resp_body=json.dumps(
+                {
+                    "success": True,
+                    "responseObject": {
+                        "v2Swap": {"relaySwapId": rid, "destinationChainId": 4663}
+                    },
+                }
+            ),
+        )
+        A.addons[0].request(f)
+        A.addons[0].response(f)
+        leg = A.STORE.legs["run-op"][0]
+        A._settle_receipt(leg, dict(self.RH_RECEIPT))
+        A.STORE.mark_close("run-op")
+        tl = A.STORE.timeline("run-op")
+        self.assertEqual(
+            tl["counts"], {"requested": 1, "attempted": 0, "observed": 0, "unbound": 0}
+        )
+        self.assertEqual(tl["legs"][0]["anchorRole"], "preview")
+        self.assertEqual(tl["legs"][0]["incomplete"], "no-execution-proof")
+
+    def test_bound_order_leg_receipt_counts_observed(self):
+        """超集语义的另一端：绑槽 order 腿只有 receipt（无成功推送）仍计 observed
+        ——observed = 绑槽 order 腿中有成功推送或 receipt 观察的子集。"""
+        h = "0x" + "ab" * 32
+        A.STORE.mark_open(
+            "run-oo",
+            manifest={
+                "version": 1,
+                "runId": "run-oo",
+                "rounds": 1,
+                "legs": [{"platform": "okx", "chain": "bsc", "rounds": 1}],
+            },
+        )
+        f = FakeFlow(
+            "web3.okx.com",
+            "/priapi/v6/dx/trade/multi/broadcast",
+            "POST",
+            req_body=json.dumps({"data": {"chainId": "56"}}),
+            resp_body=json.dumps(
+                {"code": "0", "data": {"transactionHash": h, "orderId": "o1"}}
+            ),
+        )
+        A.addons[0].request(f)
+        A.addons[0].response(f)
+        leg = A.STORE.legs["run-oo"][0]
+        A._settle_receipt(
+            leg,
+            {
+                "rpc": "https://bsc-dataseed1.binance.org",
+                "chain": "bsc",
+                "pollIntervalMs": 800,
+                "status": 1,
+                "blockHash": "0x" + "99" * 32,
+                "blockNumber": "0x1",
+            },
+        )
+        A.STORE.mark_close("run-oo")
+        tl = A.STORE.timeline("run-oo")
+        self.assertEqual(
+            tl["counts"], {"requested": 1, "attempted": 1, "observed": 1, "unbound": 0}
+        )
+        self.assertEqual(tl["legs"][0]["incomplete"], "no-success-observed")
+
+
+# ── r7（RH-T04，2026-09-07）：观测序号 vs 授权轮号；padre WS 新 host 分类 ──
+
+
+class TestR7ObservationVsAuthorizedRound(unittest.TestCase):
+    """round=授权轮号只在唯一关联时写——manifest 只带 platform×chain×rounds 数量、
+    请求不带轮号，addon 无法从请求得知授权轮次（ji2fj：首轮未广播时 r6 按到达序
+    写的 round 1-4 实为授权第 2-5 轮）。r7：腿 round 恒 null，到达序记
+    observationIndex；授权轮由 EU 侧精确 tx/订单身份唯一回配 authorizedRound。"""
+
+    PO = "/bapi/defi/v2/private/wallet-direct/web-dex/place-order"
+
+    def setUp(self):
+        fresh()
+        orig = A._poll_receipt
+        A._poll_receipt = lambda *a, **k: None  # 不验 receipt——只考轮号/序号语义
+        self.addCleanup(setattr, A, "_poll_receipt", orig)
+
+    def _binance(self, cid, chain="Robinhood"):
+        f = FakeFlow(
+            "web3.binance.com",
+            self.PO,
+            "POST",
+            req_body=json.dumps({"clientOrderId": cid, "chain": chain}),
+            resp_body=json.dumps(
+                {
+                    "code": "000000",
+                    "data": {"orderId": "oid-" + cid, "clientOrderId": cid},
+                }
+            ),
+        )
+        A.addons[0].request(f)
+        A.addons[0].response(f)
+
+    def test_first_round_missing_no_round_impersonation(self):
+        """ji2fj 复现：授权 5 轮、首轮未广播，观察到 4 腿——r6 按到达序写
+        round 1-4（冒充授权轮，实为第 2-5 轮）；r7 起 round 全 null、
+        observationIndex 1-4 连续，counts/占位口径不变。"""
+        A.STORE.mark_open(
+            "run-r7",
+            manifest={
+                "version": 1,
+                "runId": "run-r7",
+                "rounds": 5,
+                "legs": [{"platform": "binance", "chain": "robinhood", "rounds": 5}],
+            },
+        )
+        for cid in ("cid-r2", "cid-r3", "cid-r4", "cid-r5"):  # 授权 r1 未广播
+            self._binance(cid)
+        tl = A.STORE.timeline("run-r7")
+        real = [x for x in tl["legs"] if x["anchorRole"] is not None]
+        self.assertEqual(
+            [x["round"] for x in real], [None] * 4, "授权轮未知——不按到达序冒充"
+        )
+        self.assertEqual(
+            [x["observationIndex"] for x in real],
+            [1, 2, 3, 4],
+            "到达序连续编号（纯观察事实）",
+        )
+        self.assertEqual(
+            tl["counts"],
+            {"requested": 5, "attempted": 4, "observed": 0, "unbound": 0},
+            "槽绑定/计数口径不变",
+        )
+        ph = [x for x in tl["legs"] if x["incomplete"] == "no-order-observed"]
+        self.assertEqual(len(ph), 1, "未观测轮次仍出占位")
+        self.assertIsNone(ph[0]["observationIndex"], "占位腿无到达观察")
+
+    def test_observation_index_covers_dup_and_unbound(self):
+        """到达序是纯观察事实：dup 重复腿与 unbound 诊断腿同样按到达编号。"""
+        A.STORE.mark_open(
+            "run-oi",
+            manifest={
+                "version": 1,
+                "runId": "run-oi",
+                "rounds": 1,
+                "legs": [{"platform": "binance", "chain": "bsc", "rounds": 1}],
+            },
+        )
+        for cid in (
+            "cid-a",
+            "cid-a",
+            "cid-b",
+        ):  # 第二次同单 → dup；第三次容量已满 → unbound
+            self._binance(cid, chain="BSC")
+        legs = A.STORE.timeline("run-oi")["legs"]
+        self.assertEqual([x["observationIndex"] for x in legs], [1, 2, 3])
+        self.assertEqual([bool(x["dup"]) for x in legs], [False, True, False])
+        self.assertEqual([bool(x["unbound"]) for x in legs], [False, False, True])
+        self.assertEqual([x["round"] for x in legs], [None] * 3)
+
+    def test_full_mode_exposes_anchor_identity(self):
+        """full=1（loopback 证据恢复）暴露请求/响应建立的锚身份（EU 侧
+        authorizedRound 唯一关联用）；缺省不暴露。"""
+        A.STORE.mark_open("run-fid", manifest={"rounds": 1})
+        self._binance("cid-idc")
+        short = A.STORE.timeline("run-fid", full=False)["legs"][0]
+        full = A.STORE.timeline("run-fid", full=True)["legs"][0]
+        self.assertIsNone(short["orderId"])
+        self.assertIsNone(short["clientOrderId"])
+        self.assertEqual(full["orderId"], "oid-cid-idc")
+        self.assertEqual(full["clientOrderId"], "cid-idc")
+
+    def test_padre_done_new_hosts_classified(self):
+        """RH-T04②：backend2.padre.gg / txn-service.padre.gg 纳入 padre WS 分类
+        （生产实证出现）；DONE 严格门/新鲜度/锚纪律不变，只扩 host 匹配。"""
+        import msgpack
+
+        for host in ("backend2.padre.gg", "txn-service.padre.gg"):
+            self.assertEqual(A._classify_ws(host), "padre")
+        self.assertIsNone(
+            A._classify_ws("nottxn-service.padre.gg"), "点边界——同后缀异主机不误分类"
+        )
+        # 端到端：新 host 的 DONE 帧走同一份锚+新鲜度门 → 晋升 order 成功
+        # （r8：锚注入——生产今日无 Padre 锚源，见 test_padre_msgpack_done）
+        h = "0x" + "cd" * 32
+        padre_sign_leg(
+            "run-b2",
+            anchor_hash=h,
+            req_body=json.dumps({"data": {"chainId": "56"}}),
+            manifest={
+                "version": 1,
+                "runId": "run-b2",
+                "rounds": 1,
+                "legs": [{"platform": "padre", "chain": "bsc", "rounds": 1}],
+            },
+        )
+        frame = msgpack.packb(
+            [
+                373,
+                200,
+                {
+                    "txnStatus": "DONE",
+                    "txnHash": h,
+                    "creationTime": int(time.time() * 1000),
+                },
+            ]
+        )
+        A.addons[0].websocket_message(ws_frame("txn-service.padre.gg", frame))
+        leg = A.STORE.timeline("run-b2")["legs"][0]
+        self.assertEqual(
+            leg["anchorRole"], "order", "新 host DONE 正向匹配 = 执行证据 → 晋升 order"
+        )
+        self.assertIsNotNone(leg["hkL1aMs"])
+
+
+# ── r8（2026-09-07 复审 PX-02 + B/R22 同根因）：结构化锚抽取 + WS 帧按身份路由 ──
+
+
+class TestR8StructuredAnchors(unittest.TestCase):
+    """响应锚只从 schema-known 字段结构化抽取；旧整-body 正则仅诊断。单元级覆盖各平台
+    extract_ids（binance 分键/数字 id/嵌套 id 不取/歧义 fail-closed；okx/gmgn 键白名单；
+    padre Turnkey 恒无锚；fomo 结构化路径）。"""
+
+    def test_binance_resp_ids_separate_keys_key_order_numeric_nested_id(self):
+        """PX-02 案例 B/C/E：clientOrderId 先于 orderId、orderId 无引号数字、嵌套 "id"
+        ——结构化抽取给出 orderId/clientOrderId **分键**且值正确；失败 ack 无 data.orderId
+        → 不提供身份（请求体 clientOrderId 仍是锚）。"""
+        cid = "c0ffee00-0000-4000-8000-0000000000b1"
+        body_b = (
+            '{"code":"000000","success":true,"data":{"clientOrderId":"%s","orderId":"oid-B-0001","message":"Waiting for Signing"}}'
+            % cid
+        )
+        self.assertEqual(
+            A._binance_resp_ids(body_b), {"orderId": "oid-B-0001", "clientOrderId": cid}
+        )
+        body_c = (
+            '{"code":"000000","success":true,"data":{"orderId":1234567890123456789,"clientOrderId":"%s"}}'
+            % cid
+        )
+        self.assertEqual(
+            A._binance_resp_ids(body_c),
+            {"orderId": "1234567890123456789", "clientOrderId": cid},
+            "数字 orderId 归一为字串（旧正则要求引号 → 漏配 → clientOrderId 值冒充 orderId）",
+        )
+        body_e = (
+            '{"code":"000000","success":true,"data":{"wallet":{"id":"wallet-000001"},"orderId":"oid-E-0001","clientOrderId":"%s"}}'
+            % cid
+        )
+        self.assertEqual(
+            A._binance_resp_ids(body_e)["orderId"], "oid-E-0001", '嵌套 "id" 不是订单号'
+        )
+        self.assertEqual(
+            A._binance_resp_ids('{"code":"100001005","success":false,"message":"x"}'),
+            {},
+            "失败 ack 无身份",
+        )
+        self.assertEqual(
+            A._binance_resp_ids('{"code":"000000","data":{"orderId":true}}'),
+            {},
+            "bool 不是身份",
+        )
+        self.assertEqual(A._binance_resp_ids("not json"), {})
+        # 旧正则对同一 body 的分歧（诊断口径）：案例 B 把 clientOrderId 值写成 orderId
+        self.assertEqual(A._legacy_regex_ids_diag(body_b).get("orderId"), cid)
+
+    def test_binance_resp_ids_same_node_hash_normalized_or_ambiguous(self):
+        """data 同节点 schema hash 字段（orderTxId/txHash/signature/txId）归一一致 → 取唯一 hash；
+        >1 个不同值 → 不取 hash（_ambiguous 记 txHash，fail-closed）。Sol data.signature 亦取。"""
+        h = "0x" + "ab" * 32
+        out = A._binance_resp_ids(
+            json.dumps(
+                {
+                    "code": "000000",
+                    "data": {
+                        "orderId": "o1",
+                        "orderTxId": h,
+                        "txHash": h.upper().replace("0X", "0x"),
+                    },
+                }
+            )
+        )
+        self.assertEqual(out["txHash"], h, "大小写变体同值 → 归一后取 hash")
+        amb = A._binance_resp_ids(
+            json.dumps(
+                {
+                    "code": "000000",
+                    "data": {
+                        "orderId": "o1",
+                        "orderTxId": h,
+                        "txHash": "0x" + "cd" * 32,
+                    },
+                }
+            )
+        )
+        self.assertNotIn("txHash", amb)
+        self.assertEqual(amb["_ambiguous"], ["txHash"])
+        sig = "5" * 88
+        self.assertEqual(
+            A._binance_resp_ids(
+                json.dumps(
+                    {"code": "000000", "data": {"orderId": "o2", "signature": sig}}
+                )
+            )["txHash"],
+            sig,
+        )
+
+    def test_okx_gmgn_resp_ids_whitelist_and_ambiguity(self):
+        """OKX：键白名单 orderId / transactionHash|txHash（docs/okx.md §2.1），忽略 id /
+        clientOrderId；同键多个不同值 → 歧义不取。GMGN：oi/orderId/order_id + hash/tx_hash/
+        signature… 白名单，hash 须合法形状。"""
+        h = "0x" + "ab" * 32
+        okx = A._okx_resp_ids(
+            json.dumps(
+                {
+                    "code": "0",
+                    "data": {
+                        "id": "row-000001",
+                        "clientOrderId": "not-okx",
+                        "orderId": "ord-1",
+                        "transactionHash": h,
+                        "isSuccess": True,
+                    },
+                }
+            )
+        )
+        self.assertEqual(okx, {"orderId": "ord-1", "txHash": h})
+        okx_amb = A._okx_resp_ids(
+            json.dumps({"data": [{"orderId": "ord-1"}, {"orderId": "ord-2"}]})
+        )
+        self.assertNotIn("orderId", okx_amb)
+        self.assertEqual(okx_amb["_ambiguous"], ["orderId"])
+        self.assertEqual(
+            A._okx_resp_ids(json.dumps({"data": {"id": "row-000001"}})),
+            {},
+            "id 不是订单号",
+        )
+        sig = "5" * 88
+        gm = A._gmgn_resp_ids(
+            json.dumps({"code": 0, "data": {"hash": sig, "orderId": "g1"}})
+        )
+        self.assertEqual(gm, {"orderId": "g1", "txHash": sig})
+        self.assertEqual(
+            A._gmgn_resp_ids(json.dumps({"data": {"hash": "0xshort", "oi": "g2"}})),
+            {"orderId": "g2"},
+            "非法 hash 形状不取",
+        )
+
+    def test_padre_turnkey_response_has_no_anchor_legacy_regex_diverged(self):
+        """PX-01：真实 Turnkey ActivityResponse → 结构化抽取恒 {}（activity.id 非订单号、
+        intent.payload 非 tx hash、r/s/v 非身份）；旧正则会把 activity.id 当 orderId（分歧）。"""
+        body = turnkey_sign_response()
+        self.assertEqual(A._padre_resp_ids(body), {})
+        self.assertEqual(
+            A._legacy_regex_ids_diag(body),
+            {"orderId": TURNKEY_ACTIVITY_ID},
+            "旧正则误锚：activity.id → orderId",
+        )
+
+    def test_fomo_resp_ids_structured_path(self):
+        rid = "0x" + "9a" * 32
+        out = A._fomo_resp_ids(
+            json.dumps(
+                {
+                    "success": True,
+                    "responseObject": {
+                        "v2Swap": {"relaySwapId": rid, "destinationChainId": 4663}
+                    },
+                }
+            )
+        )
+        self.assertEqual(out, {"orderId": rid, "chain": "robinhood"})
+        self.assertEqual(
+            A._fomo_resp_ids(
+                json.dumps({"responseObject": {"v2Swap": {"relaySwapId": "nope"}}})
+            ),
+            {},
+            "非 EVM 形状不取",
+        )
+        self.assertEqual(
+            A._fomo_resp_ids(
+                json.dumps({"statusCode": 200, "message": "Successful v2 swap"})
+            ),
+            {},
+            "同链 DFlow 预览无 v2Swap → 无锚",
+        )
+
+
+class TestR8IdentityRouting(unittest.TestCase):
+    """入站 WS 帧按锚身份路由到所有开窗腿（不只平台最新腿）；dup 腿命中归 formal 腿；
+    成功永不留在 dup 腿；无腿可归属/锚冲突计 diag（缺失可见）。"""
+
+    PO = "/bapi/defi/v2/private/wallet-direct/web-dex/place-order"
+
+    def setUp(self):
+        fresh()
+        orig = A._poll_receipt
+        A._poll_receipt = lambda *a, **k: None  # 不验 receipt——只考路由/归属/计数
+        self.addCleanup(setattr, A, "_poll_receipt", orig)
+
+    def _manifest(self, run, rounds=1, platform="binance", chain="bsc"):
+        return {
+            "version": 1,
+            "runId": run,
+            "rounds": rounds,
+            "legs": [{"platform": platform, "chain": chain, "rounds": rounds}],
+        }
+
+    def _place(self, cid, resp_body, chain="BSC"):
+        f = FakeFlow(
+            "web3.binance.com",
+            self.PO,
+            "POST",
+            req_body=json.dumps({"clientOrderId": cid, "chain": chain}),
+            resp_body=resp_body,
+        )
+        A.addons[0].request(f)
+        A.addons[0].response(f)
+        return f
+
+    @staticmethod
+    def _fin(oid, cid, h=None, status="FINISHED"):
+        c = {"status": status}
+        if oid is not None:
+            c["orderId"] = oid
+        if cid is not None:
+            c["clientOrderId"] = cid
+        if h:
+            c["orderTxId"] = h
+        return ws_frame(
+            "web3-stream.binance.com",
+            json.dumps(
+                {"stream": "w3pc:x", "data": {"bizKey": "DEX_ALL_ORDER", "content": c}}
+            ),
+        )
+
+    def test_key_order_finished_attributed(self):
+        """案例 B：ack 里 clientOrderId 先于 orderId——旧正则把 cid 值写成 orderId → FINISHED
+        「冲突」整帧丢弃（hkL1aMs=None 静默）。r8：分键锚 → observed=1，L1a′ 落腿，
+        evidence.anchor 键名/旧正则分歧/成功命中键可审计。"""
+        run = "run-r8b"
+        A.STORE.mark_open(run, manifest=self._manifest(run))
+        cid = "c0ffee00-0000-4000-8000-000000000b01"
+        self._place(
+            cid,
+            '{"code":"000000","success":true,"data":{"clientOrderId":"%s","orderId":"oid-B-0001"}}'
+            % cid,
+        )
+        A.addons[0].websocket_message(self._fin("oid-B-0001", cid, "0x" + "b1" * 32))
+        tl = A.STORE.timeline(run, full=True)
+        self.assertEqual(
+            tl["counts"], {"requested": 1, "attempted": 1, "observed": 1, "unbound": 0}
+        )
+        leg = tl["legs"][0]
+        self.assertIsNotNone(leg["hkL1aMs"])
+        self.assertEqual(
+            (leg["orderId"], leg["clientOrderId"]), ("oid-B-0001", cid), "分键锚"
+        )
+        self.assertEqual(
+            leg["evidence"]["anchor"]["keys"],
+            ["clientOrderId", "orderId"],
+            "WS 学得的 hash 不是锚（腿字段有、锚键无）",
+        )
+        self.assertEqual(
+            leg["txHash"], "0x" + "b1" * 32, "正向匹配帧的 hash 挂载为腿字段"
+        )
+        self.assertTrue(
+            leg["evidence"]["anchor"]["legacyRegexDiverged"],
+            "旧正则在此 body 上会误锚——分歧如实记录",
+        )
+        self.assertEqual(
+            leg["evidence"]["successAnchorKeys"], ["orderId", "clientOrderId"]
+        )
+        self.assertEqual(tl["diag"], {}, "无静默丢弃")
+
+    def test_numeric_order_id_finished_attributed(self):
+        """案例 C：ack orderId 为无引号数字（帧里可为数字或字串）——旧正则漏配 → cid 值冒充
+        orderId → 冲突丢帧。r8：数字/字串同值比较 → observed=1。"""
+        run = "run-r8c"
+        A.STORE.mark_open(run, manifest=self._manifest(run))
+        cid = "c0ffee00-0000-4000-8000-000000000c01"
+        self._place(
+            cid,
+            '{"code":"000000","success":true,"data":{"orderId":1234567890123456789,"clientOrderId":"%s"}}'
+            % cid,
+        )
+        # 帧 orderId 为数字
+        A.addons[0].websocket_message(
+            self._fin(1234567890123456789, cid, "0x" + "c1" * 32)
+        )
+        tl = A.STORE.timeline(run, full=True)
+        self.assertEqual(tl["counts"]["observed"], 1)
+        self.assertEqual(tl["legs"][0]["orderId"], "1234567890123456789")
+        # 第二腿：帧 orderId 为字串 —— 同值
+        A.STORE.mark_open("run-r8c2", manifest=self._manifest("run-r8c2"))
+        self._place(
+            cid + "-2",
+            '{"code":"000000","success":true,"data":{"orderId":987654321,"clientOrderId":"%s-2"}}'
+            % cid,
+        )
+        A.addons[0].websocket_message(
+            self._fin("987654321", cid + "-2", "0x" + "c2" * 32)
+        )
+        self.assertEqual(A.STORE.timeline("run-r8c2")["counts"]["observed"], 1)
+
+    def test_platform_resend_success_lands_on_formal_leg(self):
+        """案例 A（docs/binance.md §90：平台自身 ~2.2s 后重发 place-order，首 ack 100001005
+        → 次 ack 000000）：同 clientOrderId 两请求 + FINISHED。旧：成功落最新腿（dup），
+        formal 腿 no-success-observed、observed=0。r8：dup 的 ack 身份并入 formal 锚，
+        FINISHED 按身份归 formal → observed=1，L1a′ 以**首次**下单请求为起点（EU
+        order_http_out 同义，含平台重试）；dup 腿无成功、关窗标 duplicate-of-bound-leg
+        并指向 formal（evidence.mergedIntoFlowId）。"""
+        run = "run-r8a"
+        A.STORE.mark_open(run, manifest=self._manifest(run))
+        cid = "c0ffee00-0000-4000-8000-000000000a01"
+        f1 = self._place(cid, '{"code":"100001005","success":false,"message":"err"}')
+        f2 = self._place(
+            cid,
+            '{"code":"000000","success":true,"data":{"orderId":"oid-A-0001","clientOrderId":"%s"}}'
+            % cid,
+        )
+        internal = A.STORE.legs[run]
+        self.assertEqual(
+            (internal[0]["slot"], internal[0]["dup"]),
+            (0, False),
+            "首请求 = formal（绑槽）",
+        )
+        self.assertTrue(internal[1]["dup"])
+        self.assertIs(internal[1]["_dupOf"], internal[0])
+        self.assertEqual(
+            internal[0]["_anchor"].get("orderId"),
+            "oid-A-0001",
+            "dup 腿 ack 的 orderId 并入 formal 锚（独立锚，非 WS 学得）",
+        )
+        A.addons[0].websocket_message(self._fin("oid-A-0001", cid, "0x" + "a1" * 32))
+        A.STORE.mark_close(run)
+        tl = A.STORE.timeline(run, full=True)
+        self.assertEqual(
+            tl["counts"], {"requested": 1, "attempted": 1, "observed": 1, "unbound": 0}
+        )
+        formal, dup = tl["legs"][0], tl["legs"][1]
+        self.assertFalse(formal["dup"])
+        self.assertIsNotNone(formal["hkL1aMs"], "L1a′ 落 formal 腿")
+        self.assertEqual(
+            formal["tOrderOutMs"], internal[0]["tOrderOutMs"], "起点 = 首次下单请求"
+        )
+        self.assertEqual(formal["txHash"], "0x" + "a1" * 32, "hash 挂 formal")
+        self.assertEqual(formal["incomplete"], "no-receipt-observed")
+        self.assertEqual(
+            formal["evidence"]["successAnchorKeys"], ["orderId", "clientOrderId"]
+        )
+        self.assertTrue(dup["dup"])
+        self.assertIsNone(dup["hkL1aMs"], "成功永不留在 dup 腿")
+        self.assertEqual(
+            dup["incomplete"],
+            "duplicate-of-bound-leg",
+            "dup 腿关窗如实标注（非 no-success-observed）",
+        )
+        self.assertEqual(
+            dup["evidence"]["mergedIntoFlowId"], formal["evidence"]["orderFlowId"]
+        )
+        self.assertEqual(dup["evidence"]["mergedIntoFlowId"], f1.id)
+        self.assertEqual(dup["evidence"]["orderFlowId"], f2.id)
+        self.assertEqual(
+            len([x for x in tl["legs"] if x["incomplete"] == "no-order-observed"]), 0
+        )
+        self.assertEqual(A.STORE.diag.get("orderReqDuplicate"), 1)
+
+    def test_nested_id_key_not_order_anchor(self):
+        """案例 E：data 内嵌套对象的 "id" 先于 orderId——旧正则把它当 orderId。r8：observed=1。"""
+        run = "run-r8e"
+        A.STORE.mark_open(run, manifest=self._manifest(run))
+        cid = "c0ffee00-0000-4000-8000-000000000e01"
+        self._place(
+            cid,
+            '{"code":"000000","success":true,"data":{"wallet":{"id":"wallet-000001"},"orderId":"oid-E-0001","clientOrderId":"%s"}}'
+            % cid,
+        )
+        A.addons[0].websocket_message(self._fin("oid-E-0001", cid, "0x" + "e1" * 32))
+        tl = A.STORE.timeline(run, full=True)
+        self.assertEqual(tl["counts"]["observed"], 1)
+        self.assertEqual(tl["legs"][0]["orderId"], "oid-E-0001")
+
+    def test_dup_with_conflicting_order_id_not_attributed(self):
+        """多订单疑似：同 clientOrderId 两次成功 ack 但 orderId 不同（docs/binance.md：
+        一轮 >1 distinct orderId = multiOrderSuspect）。旧→新映射（r9，RHF-10③）：
+        r8 时 dup 腿身份与 formal 冲突仍永久扣在 dup 上——FINISHED(oid-2) 命中 dup 但
+        formal 冲突 → 整帧拒收（wsFrameAnchorConflict），第二订单的执行证据被吞；
+        r9 起同单证明被响应身份推翻 → dup 腿重开为独立候选（计 orderDupReopened；
+        rounds=1 无空槽 → unbound 诊断如实），FINISHED(oid-2) 落该腿（unbound 有执行
+        观察但不计 attempted/observed），FINISHED(oid-1) 落 formal。"""
+        run = "run-r8f"
+        A.STORE.mark_open(run, manifest=self._manifest(run))
+        cid = "c0ffee00-0000-4000-8000-000000000f01"
+        self._place(
+            cid,
+            '{"code":"000000","success":true,"data":{"orderId":"oid-F-0001","clientOrderId":"%s"}}'
+            % cid,
+        )
+        self._place(
+            cid,
+            '{"code":"000000","success":true,"data":{"orderId":"oid-F-0002","clientOrderId":"%s"}}'
+            % cid,
+        )
+        internal = A.STORE.legs[run]
+        self.assertFalse(
+            internal[1].get("dup"), "r9：冲突身份推翻 dup 判定——重开为独立候选"
+        )
+        self.assertIsNone(internal[1].get("_dupOf"))
+        self.assertTrue(
+            internal[1].get("unbound"), "无空槽——重开后按容量判定落 unbound（计数如实）"
+        )
+        self.assertTrue(
+            internal[1].get("_multiOrderSuspect"), "multi-order-suspect 内部审计标记"
+        )
+        self.assertEqual(
+            A.STORE.diag.get("orderReqDuplicate", 0), 0, "重开后 dup 计数同步改记"
+        )
+        self.assertEqual(A.STORE.diag.get("orderDupReopened"), 1)
+        A.addons[0].websocket_message(self._fin("oid-F-0002", cid, "0x" + "f2" * 32))
+        A.addons[0].websocket_message(self._fin("oid-F-0001", cid, "0x" + "f1" * 32))
+        A.STORE.mark_close(run)
+        tl = A.STORE.timeline(run, full=True)
+        self.assertEqual(
+            tl["counts"],
+            {"requested": 1, "attempted": 1, "observed": 1, "unbound": 1},
+            "formal 计 attempted/observed；重开腿 unbound 诊断不计",
+        )
+        self.assertIsNotNone(
+            tl["legs"][1]["hkL1aMs"], "第二订单的执行证据落重开腿（旧码：整帧吞掉）"
+        )
+        self.assertIsNotNone(tl["legs"][0]["hkL1aMs"])
+        self.assertEqual(
+            tl["legs"][0]["orderId"],
+            "oid-F-0001",
+            "formal 锚不被 dup 的冲突 orderId 覆盖",
+        )
+        self.assertIn("orderId", tl["legs"][1]["evidence"]["anchor"]["conflicts"])
+        self.assertGreaterEqual(tl["diag"].get("anchorConflict", 0), 1)
+        self.assertEqual(
+            tl["diag"].get("orderDupReopened"), 1, "重开如实可见（multi-order-suspect）"
+        )
+        self.assertNotIn("wsFrameAnchorConflict", tl["diag"], "两帧各归其腿——无拒收")
+
+    def test_late_success_for_previous_round_routed_by_identity(self):
+        """N=2 两不同订单：r1 的 FINISHED 迟到——在 r2 下单请求之后才抵达。旧：只看平台最新腿
+        （r2）→ orderId 冲突 → 整帧静默丢弃 → r1 no-success-observed。r8：按身份路由到 r1 腿。"""
+        run = "run-r8g"
+        A.STORE.mark_open(run, manifest=self._manifest(run, rounds=2))
+        self._place(
+            "cid-g1",
+            '{"code":"000000","success":true,"data":{"orderId":"oid-G-0001","clientOrderId":"cid-g1"}}',
+        )
+        self._place(
+            "cid-g2",
+            '{"code":"000000","success":true,"data":{"orderId":"oid-G-0002","clientOrderId":"cid-g2"}}',
+        )
+        A.addons[0].websocket_message(
+            self._fin("oid-G-0001", "cid-g1", "0x" + "91" * 32)
+        )  # r1 迟到成功
+        mid = A.STORE.timeline(run)
+        self.assertIsNotNone(
+            mid["legs"][0]["hkL1aMs"], "迟到成功帧按身份落 r1 腿（旧 bug：整帧丢弃）"
+        )
+        self.assertIsNone(mid["legs"][1]["hkL1aMs"])
+        A.addons[0].websocket_message(
+            self._fin("oid-G-0002", "cid-g2", "0x" + "92" * 32)
+        )
+        tl = A.STORE.timeline(run)
+        self.assertEqual(
+            tl["counts"], {"requested": 2, "attempted": 2, "observed": 2, "unbound": 0}
+        )
+        self.assertEqual(tl["diag"], {})
+
+    def test_ws_frame_without_leg_match_is_counted_not_silent(self):
+        """带身份却无腿可归属的成功帧不归属任何腿，但计入 timeline.diag 与 /health diag
+        ——缺失可见；无身份键的帧（行情噪声）不计。词汇与 binance-ws.mjs anchorMatchVerdict
+        同：共同键**全不等** = 他单 miss（wsFrameNoLegMatch）；一等一不等 = 同单身份自相
+        矛盾 conflict（wsFrameAnchorConflict）。"""
+        run = "run-r8n"
+        A.STORE.mark_open(run, manifest=self._manifest(run))
+        self._place(
+            "cid-n1",
+            '{"code":"000000","success":true,"data":{"orderId":"oid-N-0001","clientOrderId":"cid-n1"}}',
+        )
+        A.addons[0].websocket_message(
+            self._fin("oid-OTHER", "cid-other", "0x" + "77" * 32)
+        )  # 他单：全不等
+        A.addons[0].websocket_message(
+            ws_frame(
+                "web3-stream.binance.com",
+                json.dumps(
+                    {
+                        "stream": "w3pc:x",
+                        "data": {"bizKey": "ticker", "content": {"p": "1.0"}},
+                    }
+                ),
+            )
+        )
+        tl = A.STORE.timeline(run)
+        self.assertEqual(tl["counts"]["observed"], 0)
+        self.assertEqual(tl["diag"], {"wsFrameNoLegMatch": 1})
+        self.assertEqual(A.STORE.diag.get("wsFrameNoLegMatch"), 1)
+        self.assertIsNone(tl["legs"][0]["txHash"], "他单 hash 不得挂载")
+        A.addons[0].websocket_message(
+            self._fin("oid-OTHER", "cid-n1", "0x" + "78" * 32)
+        )  # 一等一不等：冲突
+        tl = A.STORE.timeline(run)
+        self.assertEqual(
+            tl["diag"], {"wsFrameNoLegMatch": 1, "wsFrameAnchorConflict": 1}
+        )
+        self.assertIsNone(tl["legs"][0]["hkL1aMs"])
+        self.assertIsNone(tl["legs"][0]["txHash"])
+
+    def test_no_manifest_resend_earliest_order_leg_wins(self):
+        """无 manifest（无槽、不做 dup 归并）下同身份两腿：成功归**最早**出站的 order 腿
+        （首次下单请求 = formal 语义），不再取最新腿。"""
+        run = "run-r8nm"
+        A.STORE.mark_open(run)
+        cid = "c0ffee00-0000-4000-8000-0000000000aa"
+        self._place(cid, '{"code":"100001005","success":false}')
+        self._place(
+            cid,
+            '{"code":"000000","success":true,"data":{"orderId":"oid-NM-1","clientOrderId":"%s"}}'
+            % cid,
+        )
+        A.addons[0].websocket_message(self._fin("oid-NM-1", cid, "0x" + "aa" * 32))
+        legs = A.STORE.timeline(run)["legs"]
+        self.assertIsNotNone(legs[0]["hkL1aMs"], "最早腿（首请求）得成功")
+        self.assertIsNone(legs[1]["hkL1aMs"])
+
+    def test_fomo_same_relay_id_prefers_latest_preview(self):
+        """fomo 预览/执行 L7 不可区分：同 relaySwapId 多个 preview 腿时成功归**最晚**的
+        preview（最接近执行 POST——沿用 r7 前「最新腿」近似，不放大预览提前量）。"""
+        rid = "0x" + "9a" * 32
+        A.STORE.mark_open(
+            "run-r8fo",
+            manifest=self._manifest("run-r8fo", platform="fomo", chain="robinhood"),
+        )
+        for _ in range(2):
+            f = FakeFlow(
+                "prod-api.fomo.family",
+                "/swaps/v2",
+                "POST",
+                resp_body=json.dumps(
+                    {
+                        "success": True,
+                        "responseObject": {
+                            "v2Swap": {"relaySwapId": rid, "destinationChainId": 4663}
+                        },
+                    }
+                ),
+            )
+            A.addons[0].request(f)
+            A.addons[0].response(f)
+        A.addons[0].websocket_message(
+            ws_frame(
+                "ws.relay.link",
+                json.dumps(
+                    {
+                        "event": "request.status.updated",
+                        "data": {
+                            "status": "success",
+                            "requestId": rid,
+                            "txHashes": ["0x" + "12" * 32],
+                            "destinationChainId": 4663,
+                        },
+                    }
+                ),
+            )
+        )
+        internal = A.STORE.legs["run-r8fo"]
+        self.assertIsNone(internal[0]["tSuccessPushMs"])
+        self.assertEqual(internal[1]["anchorRole"], "order", "最晚 preview 腿晋升")
+        self.assertIsNotNone(internal[1]["tSuccessPushMs"])
+        self.assertEqual(
+            A.STORE.timeline("run-r8fo")["counts"],
+            {"requested": 1, "attempted": 1, "observed": 1, "unbound": 0},
+        )
+
+    def test_timeline_schema_additions_backward_compatible(self):
+        """r8 输出只做**新增**：顶层 diag（dict）、evidence.anchor/successAnchorKeys/
+        mergedIntoFlowId；既有键与占位腿形状不变；缺省模式不暴露身份值。"""
+        run = "run-r8s"
+        A.STORE.mark_open(run, manifest=self._manifest(run, rounds=2))
+        self._place(
+            "cid-s1",
+            '{"code":"000000","success":true,"data":{"orderId":"oid-S-0001","clientOrderId":"cid-s1"}}',
+        )
+        tl = A.STORE.timeline(run)
+        self.assertEqual(tl["schemaVersion"], 2)
+        self.assertIsInstance(tl["diag"], dict)
+        leg, ph = tl["legs"]
+        for k in (
+            "chain",
+            "platform",
+            "round",
+            "observationIndex",
+            "anchorRole",
+            "unbound",
+            "dup",
+            "pendingBind",
+            "tOrderOutMs",
+            "tFirstRespMs",
+            "tSuccessPushMs",
+            "tReceiptMs",
+            "hkL1aMs",
+            "hkL3Ms",
+            "txHash",
+            "orderId",
+            "clientOrderId",
+            "evidence",
+            "incomplete",
+            "atWall",
+        ):
+            self.assertIn(k, leg)
+        self.assertEqual(
+            set(leg["evidence"]),
+            {
+                "orderFlowId",
+                "wsFrameSha",
+                "success",
+                "receipt",
+                "anchor",
+                "successAnchorKeys",
+                "mergedIntoFlowId",
+            },
+        )
+        self.assertEqual(
+            set(leg["evidence"]["anchor"]),
+            {"keys", "legacyRegexDiverged", "conflicts", "ambiguous"},
+        )
+        self.assertIsNone(leg["orderId"], "缺省模式不暴露身份值")
+        self.assertNotIn(
+            "oid-S-0001", json.dumps(leg["evidence"]), "evidence 不含身份值"
+        )
+        self.assertEqual(ph["evidence"]["anchor"], None)
+        self.assertEqual(ph["incomplete"], "no-order-observed")
+        self.assertNotIn("_dupOf", leg)
+        self.assertNotIn("_anchor", leg)
+
+
+# ── r9（2026-09-08）：RHF-09 锚身份冲突否决 / RHF-10 去重边界 ──
+
+
+class TestR9AnchorConflictVeto(unittest.TestCase):
+    """RHF-09：身份冲突 = 否决条件。fomo 页面出站 subscribe 按到达时序绑到最新腿——
+    A 的迟到 subscribe 挂到 B 后，B 自己的响应明确另一 relayId → 锚自相矛盾 → B 降级
+    diagnostic（_anchorVeto + incomplete=anchor-conflict 首写）：冲突帧不得驱动其
+    晋升/成功、不起 receipt 轮询、observed 不增加；A 的成功只匹配 A 的腿（成功腿起点
+    按独立请求/响应证据）。旧码（r8）只记 conflict 不否决——success(A) 落在 B 且
+    起点按 B 的较晚请求（HK-L1a′ 假性偏小）。"""
+
+    RELAY_A = "0x" + "a1" * 32
+    RELAY_B = "0x" + "b2" * 32
+
+    def setUp(self):
+        fresh()
+        orig = A._poll_receipt
+        self.polls = []
+        A._poll_receipt = lambda *a, **k: self.polls.append(a)
+        self.addCleanup(setattr, A, "_poll_receipt", orig)
+
+    def _manifest(self, run, rounds=2):
+        return {
+            "version": 1,
+            "runId": run,
+            "rounds": rounds,
+            "legs": [{"platform": "fomo", "chain": "robinhood", "rounds": rounds}],
+        }
+
+    def _preview(self, relay=None, respond=True):
+        body = "{}"
+        if relay:
+            body = json.dumps(
+                {
+                    "success": True,
+                    "responseObject": {
+                        "v2Swap": {"relaySwapId": relay, "destinationChainId": 4663}
+                    },
+                }
+            )
+        f = FakeFlow("prod-api.fomo.family", "/swaps/v2", "POST", resp_body=body)
+        A.addons[0].request(f)
+        if respond:
+            A.addons[0].response(f)
+        return f
+
+    def _respond(self, f, relay):
+        f.response = FakeResp(
+            json.dumps(
+                {
+                    "success": True,
+                    "responseObject": {
+                        "v2Swap": {"relaySwapId": relay, "destinationChainId": 4663}
+                    },
+                }
+            )
+        )
+        A.addons[0].response(f)
+
+    def _subscribe(self, rid):
+        A.addons[0].websocket_message(
+            ws_frame(
+                "ws.relay.link",
+                json.dumps(
+                    {
+                        "type": "subscribe",
+                        "event": "request.status.updated",
+                        "filters": {"id": rid},
+                    }
+                ),
+                from_client=True,
+            )
+        )
+
+    def _status(self, rid, status, txh=None):
+        d = {"status": status, "requestId": rid, "destinationChainId": 4663}
+        if txh:
+            d["txHashes"] = [txh]
+        A.addons[0].websocket_message(
+            ws_frame(
+                "ws.relay.link",
+                json.dumps({"event": "request.status.updated", "data": d}),
+            )
+        )
+
+    def test_interleaved_ab_cross_bound_subscribe_vetoed(self):
+        """报告反例（A/B 交错）：A preview→relayA；B preview 请求；A 的 subscribe 挂到
+        B；B 响应明确 relayB；success(A) 不得落 B、B 不得晋升/计 observed。"""
+        run = "run-r9ab"
+        A.STORE.mark_open(run, manifest=self._manifest(run))
+        self._preview(self.RELAY_A)  # A 请求+响应（relayA 确证 A 的锚）
+        time.sleep(0.02)  # 保证 B 更晚出站
+        fb = self._preview(respond=False)  # B 请求（响应稍后）
+        self._subscribe(self.RELAY_A)  # A 的 subscribe 迟到 → 挂到最新腿 B
+        self._respond(fb, self.RELAY_B)  # B 响应明确 relayB → 锚自相矛盾 → 否决
+        la, lb = A.STORE.legs[run]
+        self.assertTrue(
+            lb.get("_anchorVeto"), "B 锚自相矛盾 → 否决（旧码：只记 conflict 不动）"
+        )
+        self.assertEqual(
+            lb.get("incomplete"), "anchor-conflict", "否决即时落盘（首写）"
+        )
+        self.assertEqual(
+            (lb.get("_anchor") or {}).get("orderId"),
+            self.RELAY_A,
+            "锚首写冻结——冲突值不覆盖",
+        )
+        self.assertEqual(A.STORE.diag.get("anchorConflict"), 1)
+        self._status(self.RELAY_A, "success", "0x" + "12" * 32)  # A 的真实成功帧
+        self.assertEqual(la.get("anchorRole"), "order", "A 晋升（成功只匹配 A 的腿）")
+        self.assertIsNotNone(la.get("tSuccessPushMs"))
+        self.assertIsNone(
+            lb.get("tSuccessPushMs"), "冲突帧不得驱动 B 成功（旧码：落在 B）"
+        )
+        self.assertEqual(lb.get("anchorRole"), "preview", "被否决腿不晋升")
+        self.assertIsNone(lb.get("slot"))
+        self._status(
+            self.RELAY_B, "success", "0x" + "34" * 32
+        )  # B 的成功帧——B 锚冻结 relayA，正向不可达
+        self.assertIsNone(lb.get("tSuccessPushMs"))
+        A.STORE.mark_close(run)
+        tl = A.STORE.timeline(run)
+        self.assertEqual(
+            tl["counts"],
+            {"requested": 2, "attempted": 1, "observed": 1, "unbound": 0},
+            "只有 A 计 attempted/observed——observed 不因冲突帧增加",
+        )
+        out_a, out_b = tl["legs"][0], tl["legs"][1]
+        self.assertLess(la["tOrderOutMs"], lb["tOrderOutMs"])
+        self.assertEqual(
+            out_a["hkL1aMs"],
+            round(la["tSuccessPushMs"] - la["tOrderOutMs"], 1),
+            "成功腿起点 = A 自己的请求（独立请求/响应证据；旧码按 B 的较晚请求）",
+        )
+        self.assertEqual(out_b["incomplete"], "anchor-conflict")
+        self.assertEqual(out_b["evidence"]["anchor"]["conflicts"], ["orderId"])
+        self.assertEqual(
+            tl["diag"].get("wsFrameNoLegMatch"),
+            1,
+            "relayB 成功帧无腿可归属——如实计数不静默",
+        )
+        self.assertEqual(
+            [p[3] for p in self.polls],
+            ["0x" + "12" * 32],
+            "只有 A 的 hash 起 receipt 轮询；被否决腿/未命中帧不起 poller",
+        )
+
+    def test_subscribe_first_http_response_later(self):
+        """subscribe 先到、HTTP 后到：A/B 请求均未响应时 A 的 subscribe 挂到 B；
+        随后 A 响应 relayA、B 响应 relayB → B 否决；success(A) 落 A。"""
+        run = "run-r9sf"
+        A.STORE.mark_open(run, manifest=self._manifest(run))
+        fa = self._preview(respond=False)
+        fb = self._preview(respond=False)
+        self._subscribe(self.RELAY_A)  # 两腿都无锚 → 挂最新腿 B
+        self._respond(fa, self.RELAY_A)
+        self._respond(fb, self.RELAY_B)  # B 响应揭示冲突 → 否决
+        la, lb = A.STORE.legs[run]
+        self.assertTrue(lb.get("_anchorVeto"))
+        self.assertFalse(la.get("_anchorVeto", False), "A 锚一致——不误伤")
+        self._status(self.RELAY_A, "success", "0x" + "12" * 32)
+        self.assertIsNotNone(la.get("tSuccessPushMs"))
+        self.assertIsNone(lb.get("tSuccessPushMs"))
+        tl = A.STORE.timeline(run)
+        self.assertEqual(
+            tl["counts"], {"requested": 2, "attempted": 1, "observed": 1, "unbound": 0}
+        )
+
+    def test_late_subscribe_after_response_no_veto(self):
+        """对照：B 响应先于 A 的迟到 subscribe——B 已有确证锚，subscribe 静默不动
+        （时序绑定不构成冲突证据）；两单各自成功，无否决无误伤。"""
+        run = "run-r9ct"
+        A.STORE.mark_open(run, manifest=self._manifest(run))
+        self._preview(self.RELAY_A)  # A 请求+响应 relayA
+        self._preview(self.RELAY_B)  # B 请求+响应 relayB
+        self._subscribe(self.RELAY_A)  # A 的迟到 subscribe → B 已有锚 → 不动
+        lb = A.STORE.legs[run][1]
+        self.assertFalse(lb.get("_anchorVeto", False))
+        self.assertEqual((lb.get("_anchor") or {}).get("orderId"), self.RELAY_B)
+        self._status(self.RELAY_B, "success", "0x" + "34" * 32)
+        self._status(self.RELAY_A, "success", "0x" + "12" * 32)
+        tl = A.STORE.timeline(run)
+        self.assertEqual(
+            tl["counts"], {"requested": 2, "attempted": 2, "observed": 2, "unbound": 0}
+        )
+        self.assertEqual(tl["diag"], {}, "无冲突无否决无静默丢弃")
+        self.assertIsNotNone(tl["legs"][0]["hkL1aMs"])
+        self.assertIsNotNone(tl["legs"][1]["hkL1aMs"])
+
+    def test_cancel_repeat_success_ordering(self):
+        """重复/取消/成功多序：cancel 帧不算成功；同 relayId 重复预览后 success 归
+        最晚**未被否决**的 preview（既定口径不变——否决只剔除自相矛盾的腿）。"""
+        run = "run-r9cr"
+        rid = "0x" + "9a" * 32
+        A.STORE.mark_open(run, manifest=self._manifest(run, rounds=1))
+        self._preview(rid)  # P1
+        self._status(rid, "canceled")  # 取消帧 —— 非成功
+        self.assertIsNone(A.STORE.legs[run][0].get("tSuccessPushMs"))
+        time.sleep(0.02)
+        self._preview(rid)  # P2 同 relayId 重复预览
+        self._status(rid, "success", "0x" + "12" * 32)
+        p1, p2 = A.STORE.legs[run]
+        self.assertIsNone(p1.get("tSuccessPushMs"))
+        self.assertEqual(
+            p2.get("anchorRole"), "order", "最晚一致 preview 晋升（口径不变）"
+        )
+        self.assertIsNotNone(p2.get("tSuccessPushMs"))
+        A.STORE.mark_close(run)
+        tl = A.STORE.timeline(run)
+        self.assertEqual(
+            tl["counts"], {"requested": 1, "attempted": 1, "observed": 1, "unbound": 0}
+        )
+        self.assertEqual(tl["legs"][0]["incomplete"], "no-execution-proof")
+        self.assertEqual(tl["diag"], {})
+
+    def test_vetoed_leg_only_match_counted_visible(self):
+        """单腿自毒化（subscribe 与自身响应身份交叉）：帧只命中被否决腿 → 不归属且
+        计 wsFrameAnchorVeto（区别于锚值互斥的 wsFrameAnchorConflict）——缺失可见。"""
+        run = "run-r9vo"
+        A.STORE.mark_open(run, manifest=self._manifest(run, rounds=1))
+        f = self._preview(respond=False)
+        self._subscribe(self.RELAY_A)  # 绑到唯一腿
+        self._respond(f, self.RELAY_B)  # 自身响应揭示 relayB → 冲突 → 否决
+        leg = A.STORE.legs[run][0]
+        self.assertTrue(leg.get("_anchorVeto"))
+        self._status(self.RELAY_A, "success", "0x" + "12" * 32)  # 只命中被否决腿
+        self.assertIsNone(leg.get("tSuccessPushMs"))
+        self.assertEqual(A.STORE.diag.get("wsFrameAnchorVeto"), 1)
+        A.STORE.mark_close(run)
+        tl = A.STORE.timeline(run)
+        self.assertEqual(
+            tl["counts"], {"requested": 1, "attempted": 0, "observed": 0, "unbound": 0}
+        )
+        self.assertEqual(
+            tl["diag"].get("wsFrameAnchorVeto"), 1, "per-run diag 同步透出"
+        )
+        self.assertEqual(tl["legs"][0]["incomplete"], "anchor-conflict")
+        self.assertEqual(self.polls, [], "被否决腿不起 receipt 轮询")
+
+
+class TestR9OrderIdentityBoundaries(unittest.TestCase):
+    """RHF-10：同单去重边界。①请求无身份、身份由响应揭示时，后请求先响应不再独占
+    formal——formal 资格归最早请求（成功时刻按最早请求）；②同单查找加 platform
+    维度——同 orderId 跨平台不合并；③dup 腿收到冲突身份（或 formal 被否决）→
+    重开为独立候选（计 orderDupReopened，multi-order-suspect 如实可见），不再永久
+    扣在 dup 上吞掉后续帧。"""
+
+    PO = "/bapi/defi/v2/private/wallet-direct/web-dex/place-order"
+
+    def setUp(self):
+        fresh()
+        orig = A._poll_receipt
+        A._poll_receipt = lambda *a, **k: None  # 不验 receipt——只考归属/槽位/计数
+        self.addCleanup(setattr, A, "_poll_receipt", orig)
+
+    def _req(self, cid=None, chain="BSC"):
+        req = {"chain": chain}
+        if cid:
+            req["clientOrderId"] = cid
+        f = FakeFlow("web3.binance.com", self.PO, "POST", req_body=json.dumps(req))
+        A.addons[0].request(f)
+        return f
+
+    def _resp(self, f, oid, cid, h=None):
+        data = {"orderId": oid, "clientOrderId": cid}
+        if h:
+            data["txHash"] = h
+        f.response = FakeResp(json.dumps({"code": "000000", "data": data}))
+        A.addons[0].response(f)
+
+    @staticmethod
+    def _receipt_ok():
+        return {
+            "rpc": "https://rpc.invalid",
+            "chain": "bsc",
+            "pollIntervalMs": 800,
+            "status": 1,
+            "blockHash": "0x" + "11" * 32,
+            "blockNumber": 7,
+        }
+
+    @staticmethod
+    def _fin(oid, cid, h):
+        return ws_frame(
+            "web3-stream.binance.com",
+            json.dumps(
+                {
+                    "stream": "w3pc:x",
+                    "data": {
+                        "bizKey": "DEX_ALL_ORDER",
+                        "content": {
+                            "orderId": oid,
+                            "clientOrderId": cid,
+                            "status": "FINISHED",
+                            "orderTxId": h,
+                        },
+                    },
+                }
+            ),
+        )
+
+    def test_response_identity_earliest_request_becomes_formal(self):
+        """①X 先请求、Y 后请求（请求均无 clientOrderId）；Y 先响应揭示身份成 formal；
+        X 后响应揭示同身份 → formal 资格归 X（最早请求），Y 改判 dup 归并。
+        旧码（r8）：X 变 dup、成功起点按 Y（后请求先响应者），L1a′ 不含前段重试。"""
+        run = "run-r9e"
+        A.STORE.mark_open(
+            run,
+            manifest={
+                "version": 1,
+                "runId": run,
+                "rounds": 2,
+                "legs": [{"platform": "binance", "chain": "bsc", "rounds": 2}],
+            },
+        )
+        fx = self._req()
+        time.sleep(0.02)
+        fy = self._req()
+        self._resp(fy, "oid-E1", "cid-E1")  # 后请求先响应——旧码在此独占 formal
+        self._resp(fx, "oid-E1", "cid-E1")  # 最早请求身份揭示 → 接管 formal
+        lx, ly = A.STORE.legs[run]
+        self.assertEqual(lx.get("slot"), 0, "最早请求 = formal（保住自己的槽）")
+        self.assertFalse(lx.get("dup"))
+        self.assertTrue(ly.get("dup"), "后请求改判 dup 归并")
+        self.assertIs(ly.get("_dupOf"), lx)
+        self.assertIsNone(ly.get("slot"))
+        self.assertEqual(A.STORE.diag.get("orderReqDuplicate"), 1)
+        A.addons[0].websocket_message(self._fin("oid-E1", "cid-E1", "0x" + "e1" * 32))
+        self.assertIsNotNone(lx.get("tSuccessPushMs"))
+        self.assertIsNone(ly.get("tSuccessPushMs"), "成功永不留在 dup 腿")
+        A.STORE.mark_close(run)
+        tl = A.STORE.timeline(run)
+        self.assertEqual(
+            tl["counts"], {"requested": 2, "attempted": 1, "observed": 1, "unbound": 0}
+        )
+        self.assertLess(lx["tOrderOutMs"], ly["tOrderOutMs"])
+        self.assertEqual(
+            tl["legs"][0]["hkL1aMs"],
+            round(lx["tSuccessPushMs"] - lx["tOrderOutMs"], 1),
+            "成功时刻按最早请求（平台重发含在 L1a′ 内，docs/binance.md §90 同口径）",
+        )
+        self.assertEqual(tl["legs"][1]["incomplete"], "duplicate-of-bound-leg")
+        self.assertEqual(
+            tl["legs"][1]["evidence"]["mergedIntoFlowId"],
+            fx.id,
+            "后请求 mergedIntoFlowId 指向最早腿",
+        )
+        self.assertEqual(tl["legs"][0]["evidence"]["orderFlowId"], fx.id)
+
+    def test_transfer_moves_settled_success_to_earliest_leg(self):
+        """①乱序残余：成功帧先到（落 Y）再揭示 X 的同身份——已落地成功随 formal 资格
+        移交 X（时长按最早请求），Y 清空成功改判 dup；成功时刻本身不变。"""
+        run = "run-r9t"
+        A.STORE.mark_open(
+            run,
+            manifest={
+                "version": 1,
+                "runId": run,
+                "rounds": 2,
+                "legs": [{"platform": "binance", "chain": "bsc", "rounds": 2}],
+            },
+        )
+        fx = self._req()
+        time.sleep(0.02)
+        fy = self._req()
+        self._resp(fy, "oid-T1", "cid-T1")
+        A.addons[0].websocket_message(
+            self._fin("oid-T1", "cid-T1", "0x" + "71" * 32)
+        )  # 成功先落 Y
+        ly = A.STORE.legs[run][1]
+        self.assertIsNotNone(ly.get("tSuccessPushMs"))
+        self._resp(fx, "oid-T1", "cid-T1")  # X 身份揭示 → 移交
+        lx, ly = A.STORE.legs[run]
+        self.assertIsNotNone(
+            lx.get("tSuccessPushMs"), "已落地成功随 formal 资格移交最早请求"
+        )
+        self.assertIsNotNone(lx.get("wsSha"))
+        self.assertIsNone(ly.get("tSuccessPushMs"), "成功永不留在 dup 腿（移交同律）")
+        self.assertIsNone(ly.get("wsSha"))
+        self.assertTrue(ly.get("dup"))
+        tl = A.STORE.timeline(run)
+        self.assertEqual(
+            tl["counts"], {"requested": 2, "attempted": 1, "observed": 1, "unbound": 0}
+        )
+        self.assertEqual(
+            tl["legs"][0]["hkL1aMs"], round(lx["tSuccessPushMs"] - lx["tOrderOutMs"], 1)
+        )
+        self.assertGreater(
+            tl["legs"][0]["hkL1aMs"], 15.0, "起点前移到最早请求——时长含 X→Y 间隔"
+        )
+
+    def test_cross_platform_same_order_id_not_merged(self):
+        """②同 orderId 跨平台不合并：binance 与 okx 腿同 orderId 各占其槽、各自成功；
+        旧码（r8）去重查找无 platform 范围——后到的 okx 腿被误判 dup（attempted 少计 1）。"""
+        run = "run-r9x"
+        A.STORE.mark_open(
+            run,
+            manifest={
+                "version": 1,
+                "runId": run,
+                "rounds": 2,
+                "legs": [
+                    {"platform": "binance", "chain": "bsc", "rounds": 1},
+                    {"platform": "okx", "chain": "bsc", "rounds": 1},
+                ],
+            },
+        )
+        fb = self._req("cid-X1")
+        self._resp(fb, "SAME-1", "cid-X1")
+        fo = FakeFlow(
+            "web3.okx.com",
+            "/priapi/v6/dx/trade/multi/broadcast",
+            "POST",
+            req_body=json.dumps({"data": {"chainId": "56"}}),
+            resp_body=json.dumps(
+                {
+                    "code": "0",
+                    "data": {"transactionHash": "0x" + "ab" * 32, "orderId": "SAME-1"},
+                }
+            ),
+        )
+        A.addons[0].request(fo)
+        A.addons[0].response(fo)
+        lb, lo = A.STORE.legs[run]
+        self.assertFalse(lo.get("dup"), "跨平台同 orderId 不合并")
+        self.assertEqual((lb.get("slot"), lo.get("slot")), (0, 1), "各占其平台槽")
+        self.assertEqual(A.STORE.diag.get("orderReqDuplicate", 0), 0)
+        A.addons[0].websocket_message(self._fin("SAME-1", "cid-X1", "0x" + "b1" * 32))
+        A.addons[0].websocket_message(
+            ws_frame(
+                "wsdexpri.okx.com",
+                json.dumps(
+                    {
+                        "arg": {"channel": "dex-swap-order-info"},
+                        "data": {
+                            "dexData": {
+                                "status": "1",
+                                "orderId": "SAME-1",
+                                "transactionHash": "0x" + "ab" * 32,
+                            }
+                        },
+                    }
+                ),
+            )
+        )
+        tl = A.STORE.timeline(run)
+        self.assertEqual(
+            tl["counts"],
+            {"requested": 2, "attempted": 2, "observed": 2, "unbound": 0},
+            "两平台各自 attempted/observed——互不吞并",
+        )
+        self.assertIsNotNone(tl["legs"][0]["hkL1aMs"])
+        self.assertIsNotNone(tl["legs"][1]["hkL1aMs"])
+
+    def test_dup_leg_conflicting_order_id_reopens_independent(self):
+        """③同 clientOrderId 两次成功 ack 但 orderId 不同（docs/binance.md：一轮 >1
+        distinct orderId = multiOrderSuspect）——dup 判定被响应身份推翻：重开为独立
+        候选、按自身身份重新绑槽（无空槽 → unbound 诊断如实），后续帧各归其腿。
+        旧码（r8）：永久 dup + FINISHED(oid-2) 整帧拒收——第二订单执行证据被吞。
+        （本用例与 TestR8IdentityRouting.test_dup_with_conflicting_order_id_not_attributed
+        互补：那边考帧归属/计数，这边考重开机制本身——含 formal 被否决时子腿重开）。"""
+        run = "run-r9m"
+        A.STORE.mark_open(
+            run,
+            manifest={
+                "version": 1,
+                "runId": run,
+                "rounds": 2,
+                "legs": [{"platform": "binance", "chain": "bsc", "rounds": 2}],
+            },
+        )
+        f1 = self._req("cid-M1")
+        self._resp(f1, "oid-M1", "cid-M1")
+        f2 = self._req("cid-M1")  # 建腿时 dup（请求侧 cid 正向同单）
+        lz = A.STORE.legs[run][1]
+        self.assertTrue(lz.get("dup"))
+        self.assertEqual(A.STORE.diag.get("orderReqDuplicate"), 1)
+        self._resp(f2, "oid-M2", "cid-M1")  # 冲突身份 → 同单证明被推翻 → 重开
+        self.assertFalse(lz.get("dup"), "冲突身份到达后重开为独立候选")
+        self.assertIsNone(lz.get("_dupOf"))
+        self.assertTrue(
+            lz.get("_multiOrderSuspect"), "multi-order-suspect 内部审计标记"
+        )
+        self.assertEqual(lz.get("slot"), 0, "有空槽——按自身身份重新绑槽")
+        self.assertEqual(
+            A.STORE.diag.get("orderReqDuplicate", 0), 0, "重开改记 dup 计数"
+        )
+        self.assertEqual(A.STORE.diag.get("orderDupReopened"), 1)
+        A.addons[0].websocket_message(self._fin("oid-M2", "cid-M1", "0x" + "2d" * 32))
+        A.addons[0].websocket_message(self._fin("oid-M1", "cid-M1", "0x" + "1d" * 32))
+        lf = A.STORE.legs[run][0]
+        self.assertIsNotNone(lz.get("tSuccessPushMs"), "重开腿收自己的成功帧")
+        self.assertIsNotNone(lf.get("tSuccessPushMs"))
+        tl = A.STORE.timeline(run)
+        self.assertEqual(
+            tl["counts"],
+            {"requested": 2, "attempted": 2, "observed": 2, "unbound": 0},
+            "两个 distinct order 各占其槽、各自 observed——计数如实",
+        )
+        self.assertEqual(tl["diag"].get("orderDupReopened"), 1, "per-run diag 透出重开")
+
+    def test_formal_veto_reopens_dup_children(self):
+        """③二态：dup 腿的 orderId 先并入 formal 锚（首写）；formal 自己的响应揭示
+        另一 orderId → formal 锚自相矛盾被否决 → 其 dup 子腿同单证明同失效，重开为
+        独立候选。formal 降级 anchor-conflict、observed 不增加；重开腿收自己的成功帧。"""
+        run = "run-r9v"
+        A.STORE.mark_open(
+            run,
+            manifest={
+                "version": 1,
+                "runId": run,
+                "rounds": 2,
+                "legs": [{"platform": "binance", "chain": "bsc", "rounds": 2}],
+            },
+        )
+        f1 = self._req("cid-V1")  # formal（请求侧锚只有 cid）
+        f2 = self._req("cid-V1")  # 建腿时 dup
+        self._resp(f2, "oid-V2", "cid-V1")  # dup 腿 orderId 并入 formal 锚（首写）
+        self._resp(f1, "oid-V1", "cid-V1")  # formal 自身响应冲突 → 否决 → 子腿重开
+        lf, lz = A.STORE.legs[run]
+        self.assertTrue(
+            lf.get("_anchorVeto"), "formal 锚（含 dup 并入值）与自身响应冲突 → 否决"
+        )
+        self.assertEqual(lf.get("incomplete"), "anchor-conflict")
+        self.assertEqual(
+            (lf.get("_anchor") or {}).get("orderId"),
+            "oid-V2",
+            "锚首写冻结——冲突值不覆盖",
+        )
+        self.assertFalse(lz.get("dup"), "formal 被否决 → dup 子腿重开为独立候选")
+        self.assertTrue(lz.get("_multiOrderSuspect"))
+        self.assertEqual(lz.get("slot"), 0, "重开后按容量补绑")
+        self.assertEqual(A.STORE.diag.get("orderDupReopened"), 1)
+        self.assertEqual(A.STORE.diag.get("orderReqDuplicate", 0), 0)
+        A.addons[0].websocket_message(self._fin("oid-V2", "cid-V1", "0x" + "2v" * 32))
+        self.assertIsNotNone(lz.get("tSuccessPushMs"), "重开腿收 oid-V2 成功帧")
+        self.assertIsNone(lf.get("tSuccessPushMs"), "被否决 formal 不写成功")
+        A.addons[0].websocket_message(self._fin("oid-V1", "cid-V1", "0x" + "1v" * 32))
+        self.assertIsNone(
+            lf.get("tSuccessPushMs"), "oid-V1 帧与两腿均冲突——不归属（不猜）"
+        )
+        tl = A.STORE.timeline(run)
+        self.assertEqual(
+            tl["counts"],
+            {"requested": 2, "attempted": 2, "observed": 1, "unbound": 0},
+            "被否决 formal 占 attempted（槽已消费）但不计 observed",
+        )
+        self.assertEqual(
+            tl["diag"].get("wsFrameAnchorConflict"), 1, "oid-V1 帧拒收可见"
+        )
+        self.assertEqual(tl["diag"].get("orderDupReopened"), 1)
+
+    def test_transfer_inflight_poller_receipt_redirects_to_new_formal(self):
+        """①闩锁残余（成功路径）：Y 先响应带 hash 成 formal 并起 poller；X 身份揭示
+        触发移交后，Y 的在飞 poller 成功回写必须经 dup→formal 重定向落 X，且闩锁是
+        **移交**不是复制——Y 闩锁释放，否则关窗后 run 被 R25 pin 死永不回收。"""
+        run = "run-r9p"
+        A.STORE.mark_open(
+            run,
+            manifest={
+                "version": 1,
+                "runId": run,
+                "rounds": 2,
+                "legs": [{"platform": "binance", "chain": "bsc", "rounds": 2}],
+            },
+        )
+        h = "0x" + "ab" * 32
+        fx = self._req()
+        time.sleep(0.02)
+        fy = self._req()
+        self._resp(fy, "oid-P1", "cid-P1", h)  # Y formal + txHash → 闩锁+poller（桩）
+        ly = A.STORE.legs[run][1]
+        self.assertTrue(ly.get("receiptPolling"))
+        self._resp(fx, "oid-P1", "cid-P1", h)  # X 身份揭示 → formal 资格移交
+        lx = A.STORE.legs[run][0]
+        self.assertTrue(lx.get("receiptPolling"), "闩锁随 formal 资格移交 X")
+        self.assertFalse(ly.get("receiptPolling"), "移交而非复制——Y 闩锁释放")
+        A._settle_receipt(ly, self._receipt_ok())  # Y 的在飞 poller 成功回写
+        self.assertIsNotNone(
+            lx.get("tReceiptMs"), "receipt 经 dup→formal 重定向落新 formal"
+        )
+        self.assertIsNone(ly.get("tReceiptMs"), "receipt 同成功一样永不留在 dup 腿")
+        A.STORE.mark_close(run)
+        with A.STORE.lock:
+            self.assertFalse(
+                A.STORE._run_pinned_locked(run), "无遗留闩锁——run 可正常回收（R25）"
+            )
+        tl = A.STORE.timeline(run)
+        self.assertEqual(
+            tl["counts"], {"requested": 2, "attempted": 1, "observed": 1, "unbound": 0}
+        )
+        self.assertEqual(
+            tl["legs"][0]["hkL3Ms"],
+            round(lx["tReceiptMs"] - lx["tOrderOutMs"], 1),
+            "L3′ 起点同样按最早请求",
+        )
+
+    def test_transfer_inflight_poller_timeout_redirects_to_new_formal(self):
+        """①闩锁残余（失败路径）：移交后 Y 的在飞 poller 超时——incomplete 同样重定向
+        到 X（receipt 路径归新 formal），Y 闩锁释放。旧码：超时记在 dup 腿 Y 上、
+        X 闩锁永挂（无 receipt 无 incomplete）→ run 被 R25 pin 死。"""
+        run = "run-r9pt"
+        A.STORE.mark_open(
+            run,
+            manifest={
+                "version": 1,
+                "runId": run,
+                "rounds": 2,
+                "legs": [{"platform": "binance", "chain": "bsc", "rounds": 2}],
+            },
+        )
+        h = "0x" + "ab" * 32
+        fx = self._req()
+        time.sleep(0.02)
+        fy = self._req()
+        self._resp(fy, "oid-PT1", "cid-PT1", h)
+        self._resp(fx, "oid-PT1", "cid-PT1", h)  # 移交
+        lx, ly = A.STORE.legs[run]
+        A._settle_incomplete(ly, "receipt poll timeout")  # Y 的在飞 poller 超时回写
+        self.assertEqual(
+            lx.get("incomplete"),
+            "receipt poll timeout",
+            "失败回写同样重定向到新 formal",
+        )
+        self.assertIsNone(ly.get("incomplete"))
+        self.assertFalse(ly.get("receiptPolling"))
+        A.STORE.mark_close(run)
+        with A.STORE.lock:
+            self.assertFalse(
+                A.STORE._run_pinned_locked(run),
+                "闩锁+incomplete/receipt 必居其一——不 pin 死",
+            )
+        tl = A.STORE.timeline(run)
+        self.assertEqual(
+            tl["counts"], {"requested": 2, "attempted": 1, "observed": 0, "unbound": 0}
+        )
+        self.assertEqual(tl["legs"][0]["incomplete"], "receipt poll timeout")
+        self.assertEqual(tl["legs"][1]["incomplete"], "duplicate-of-bound-leg")
+
+    def test_veto_after_receipt_excluded_from_observed(self):
+        """RHF-09 残余防线：receipt 先于否决落定的腿，observed 仍不增加（counts 层
+        排除）——腿级时间戳保留作诊断，incomplete=anchor-conflict 首写落盘。"""
+        run = "run-r9rv"
+        A.STORE.mark_open(
+            run,
+            manifest={
+                "version": 1,
+                "runId": run,
+                "rounds": 1,
+                "legs": [{"platform": "binance", "chain": "bsc", "rounds": 1}],
+            },
+        )
+        h = "0x" + "cd" * 32
+        f = self._req("cid-R1")
+        self._resp(f, "oid-R1", "cid-R1", h)  # 锚 + hash → 闩锁+poller（桩）
+        leg = A.STORE.legs[run][0]
+        A._settle_receipt(leg, self._receipt_ok())  # receipt 先落定
+        self.assertIsNotNone(leg.get("tReceiptMs"))
+        A.STORE.update_anchor(leg, {"orderId": "oid-R9"})  # 冲突身份后到 → 否决
+        self.assertTrue(leg.get("_anchorVeto"))
+        self.assertEqual(leg.get("incomplete"), "anchor-conflict")
+        A.STORE.mark_close(run)
+        tl = A.STORE.timeline(run)
+        self.assertEqual(tl["counts"]["attempted"], 1)
+        self.assertEqual(
+            tl["counts"]["observed"],
+            0,
+            "receipt 先于否决落定 → counts 层排除（observed 不增加）",
+        )
+        self.assertEqual(tl["legs"][0]["incomplete"], "anchor-conflict")
+
+
+# ── r10（2026-09-08）：RHF-09 残余 late veto 撤销 / RHF-17 休眠 parser 逐 entry + 早到帧缓冲 ──
+
+
+class TestR10LateVetoRevocation(unittest.TestCase):
+    """RHF-09 残余（r10）：success/promotion/receipt 先于否决落定的 late-veto 路径——
+    合格指标在 timeline 序列化层统一撤销（hkL1aMs/hkL3Ms → null，撤销值入
+    hkL1aMsVetoed/hkL3MsVetoed 诊断键，腿带 anchorVeto:true），内部腿的原始事件
+    时间保留（证据不删）；observed 不增加。报告反例：请求→subscribe A→success A
+    →HTTP 响应明确 B——旧码（r9）veto 后仍导出 hkL1aMs≈1000ms，页面照计
+    （「获证据 0 笔；推送 1000ms；推送 1/1」矛盾）。"""
+
+    RELAY_A = "0x" + "a1" * 32
+    RELAY_B = "0x" + "b2" * 32
+
+    def setUp(self):
+        fresh()
+        orig = A._poll_receipt
+        self.polls = []
+        A._poll_receipt = lambda *a, **k: self.polls.append(a)
+        self.addCleanup(setattr, A, "_poll_receipt", orig)
+
+    def test_success_then_conflict_revokes_qualified_metrics(self):
+        """报告残余形状（单腿）：B preview 请求（无响应）→ A 的 subscribe 挂到 B
+        → success(relayA) 帧落 B（晋升 order、绑槽、hkL1a 已有值）→ B 的迟到 HTTP
+        响应明确 relayB → 锚自相矛盾 → 否决。timeline 不得再导出合格时长。"""
+        run = "run-r10lv"
+        A.STORE.mark_open(
+            run,
+            manifest={
+                "version": 1,
+                "runId": run,
+                "rounds": 2,
+                "legs": [{"platform": "fomo", "chain": "robinhood", "rounds": 2}],
+            },
+        )
+        fb = FakeFlow(
+            "prod-api.fomo.family",
+            "/swaps/v2",
+            "POST",
+            req_body=json.dumps({"chainId": 4663}),
+        )
+        A.addons[0].request(fb)  # B 请求（响应稍后）
+        A.addons[0].websocket_message(
+            ws_frame(
+                "ws.relay.link",
+                json.dumps(
+                    {
+                        "type": "subscribe",
+                        "event": "request.status.updated",
+                        "filters": {"id": self.RELAY_A},
+                    }
+                ),
+                from_client=True,
+            )
+        )
+        A.addons[0].websocket_message(
+            ws_frame(
+                "ws.relay.link",
+                json.dumps(
+                    {
+                        "event": "request.status.updated",
+                        "data": {
+                            "status": "success",
+                            "requestId": self.RELAY_A,
+                            "txHashes": ["0x" + "12" * 32],
+                            "destinationChainId": 4663,
+                        },
+                    }
+                ),
+            )
+        )
+        leg = A.STORE.legs[run][0]
+        self.assertIsNotNone(
+            leg.get("tSuccessPushMs"), "成功先于否决落定（内部原始时间保留——证据不删）"
+        )
+        self.assertEqual(
+            leg.get("anchorRole"), "order", "已被成功帧晋升（内部事实保留）"
+        )
+        recorded = round(leg["tSuccessPushMs"] - leg["tOrderOutMs"], 1)
+        fb.response = FakeResp(
+            json.dumps(
+                {
+                    "success": True,
+                    "responseObject": {
+                        "v2Swap": {
+                            "relaySwapId": self.RELAY_B,
+                            "destinationChainId": 4663,
+                        }
+                    },
+                }
+            )
+        )
+        A.addons[0].response(fb)  # 迟到响应明确 relayB → 冲突 → 否决
+        self.assertTrue(leg.get("_anchorVeto"))
+        A.STORE.mark_close(run)
+        tl = A.STORE.timeline(run)
+        out = tl["legs"][0]
+        self.assertEqual(
+            out["anchorVeto"], True, "腿带 anchorVeto:true——不再以 bound/eligible 呈现"
+        )
+        self.assertIsNone(
+            out["hkL1aMs"], "合格 L1a′ 撤销（r9 残余：仍导出 1000ms 入页面统计）"
+        )
+        self.assertEqual(out["hkL1aMsVetoed"], recorded, "被撤销值保留在诊断键")
+        self.assertIsNone(out["hkL3Ms"])
+        self.assertIsNone(out["hkL3MsVetoed"], "无 receipt 落地 → 无撤销值")
+        self.assertEqual(
+            out["incomplete"], "anchor-conflict", "否决原因保留（首写落盘）"
+        )
+        self.assertIsNotNone(
+            out["tSuccessPushMs"], "原始事件时间仍在私有 raw（诊断用，不删证据）"
+        )
+        self.assertIsNotNone(out["evidence"]["wsFrameSha"])
+        self.assertEqual(
+            tl["counts"],
+            {"requested": 2, "attempted": 1, "observed": 0, "unbound": 0},
+            "槽已消费仍占 attempted；observed 不增加",
+        )
+        ph = tl["legs"][1]
+        self.assertEqual(
+            (ph["anchorVeto"], ph["hkL1aMsVetoed"], ph["hkL3MsVetoed"]),
+            (False, None, None),
+            "占位腿形状齐整",
+        )
+
+    def test_receipt_then_conflict_revokes_l3(self):
+        """receipt-already-latched-then-conflict：receipt 先落定（hkL3 有值），冲突身份
+        后到 → 否决 → hkL3Ms 撤销为 null、撤销值入 hkL3MsVetoed；observed 不增加。"""
+        run = "run-r10rv"
+        A.STORE.mark_open(
+            run,
+            manifest={
+                "version": 1,
+                "runId": run,
+                "rounds": 1,
+                "legs": [{"platform": "binance", "chain": "bsc", "rounds": 1}],
+            },
+        )
+        h = "0x" + "cd" * 32
+        f = FakeFlow(
+            "web3.binance.com",
+            "/bapi/defi/v2/private/wallet-direct/web-dex/place-order",
+            "POST",
+            req_body=json.dumps({"clientOrderId": "cid-R1", "chain": "BSC"}),
+            resp_body=json.dumps(
+                {
+                    "code": "000000",
+                    "data": {
+                        "orderId": "oid-R1",
+                        "clientOrderId": "cid-R1",
+                        "txHash": h,
+                    },
+                }
+            ),
+        )
+        A.addons[0].request(f)
+        A.addons[0].response(f)
+        leg = A.STORE.legs[run][0]
+        A._settle_receipt(
+            leg,
+            {
+                "rpc": "https://rpc.invalid",
+                "chain": "bsc",
+                "pollIntervalMs": 800,
+                "status": 1,
+                "blockHash": "0x" + "11" * 32,
+                "blockNumber": 7,
+            },
+        )
+        self.assertIsNotNone(leg.get("tReceiptMs"))
+        recorded_l3 = round(leg["tReceiptMs"] - leg["tOrderOutMs"], 1)
+        A.STORE.update_anchor(leg, {"orderId": "oid-R9"})  # 冲突身份后到 → 否决
+        self.assertTrue(leg.get("_anchorVeto"))
+        A.STORE.mark_close(run)
+        tl = A.STORE.timeline(run)
+        out = tl["legs"][0]
+        self.assertIsNone(out["hkL3Ms"], "合格 L3′ 撤销")
+        self.assertEqual(out["hkL3MsVetoed"], recorded_l3, "被撤销 L3′ 值保留在诊断键")
+        self.assertIsNotNone(out["tReceiptMs"], "原始 receipt 观察时间保留（诊断）")
+        self.assertIsNotNone(out["evidence"]["receipt"], "receipt 证据本体保留（诊断）")
+        self.assertEqual(tl["counts"]["observed"], 0)
+
+    def test_clean_leg_serialization_shape(self):
+        """非否决腿：anchorVeto=False、*Vetoed 键恒 null（新增键只增不改，形状稳定）。"""
+        run = "run-r10ok"
+        A.STORE.mark_open(
+            run,
+            manifest={
+                "version": 1,
+                "runId": run,
+                "rounds": 1,
+                "legs": [{"platform": "binance", "chain": "bsc", "rounds": 1}],
+            },
+        )
+        f = FakeFlow(
+            "web3.binance.com",
+            "/bapi/defi/v2/private/wallet-direct/web-dex/place-order",
+            "POST",
+            req_body=json.dumps({"clientOrderId": "cid-OK", "chain": "BSC"}),
+            resp_body=json.dumps(
+                {
+                    "code": "000000",
+                    "data": {"orderId": "oid-OK", "clientOrderId": "cid-OK"},
+                }
+            ),
+        )
+        A.addons[0].request(f)
+        A.addons[0].response(f)
+        A.addons[0].websocket_message(
+            ws_frame(
+                "web3-stream.binance.com",
+                json.dumps(
+                    {
+                        "stream": "w3pc:x",
+                        "data": {
+                            "bizKey": "DEX_ALL_ORDER",
+                            "content": {
+                                "orderId": "oid-OK",
+                                "clientOrderId": "cid-OK",
+                                "status": "FINISHED",
+                                "orderTxId": "0x" + "0a" * 32,
+                            },
+                        },
+                    }
+                ),
+            )
+        )
+        out = A.STORE.timeline(run)["legs"][0]
+        self.assertEqual(out["anchorVeto"], False)
+        self.assertIsNone(out["hkL1aMsVetoed"])
+        self.assertIsNone(out["hkL3MsVetoed"])
+        self.assertIsNotNone(out["hkL1aMs"], "非否决腿合格指标不受影响")
+
+
+class TestR10GmgnOkxPerEntry(unittest.TestCase):
+    """RHF-17a/b（r10）：GMGN/OKX 休眠 parser 逐 entry 化。①HTTP 响应：同一 entry 的
+    身份/hash 才可组合——跨 entry 拼接曾制造假锚（entry1 的 oi + entry2 的 hash），
+    真实成功帧随即「冲突」被拒/误否决（跨 entry 假冲突）；②WS 帧：data 列表逐
+    entry 独立路由/判定——目标在第二 entry 不再漏关联（旧码 data[0]-only）。"""
+
+    def setUp(self):
+        fresh()
+        orig = A._poll_receipt
+        A._poll_receipt = lambda *a, **k: None
+        self.addCleanup(setattr, A, "_poll_receipt", orig)
+
+    SIG_A = "5" * 88
+    SIG_B = "4" * 88
+
+    def _gmgn_order(self, run, resp_body):
+        f = FakeFlow(
+            "gmgn.ai",
+            "/tapi/v1/swap_batch_order",
+            "POST",
+            req_body=json.dumps({"chain": "sol"}),
+            resp_body=resp_body,
+        )
+        A.addons[0].request(f)
+        A.addons[0].response(f)
+        return f
+
+    def test_gmgn_cross_entry_no_manufactured_conflict(self):
+        """响应 data=[{"oi": ordA}, {"hash": hB}]（不同 entry 的 disjoint 字段）：
+        旧码整 body 归并 → 锚 {orderId: ordA, txHash: hB}——ordA 的真实成功帧（hA）
+        随即与锚「冲突」被拒（假冲突）。r10：跨 entry 不拼接 → 锚 fail-closed 为空
+        + ambiguous 可见；成功帧零命中如实计数；腿不否决、不冲突。"""
+        body = json.dumps({"code": 0, "data": [{"oi": "ordA"}, {"hash": self.SIG_B}]})
+        ids = A._gmgn_resp_ids(body)
+        self.assertNotIn(
+            "orderId", ids, "跨 entry 不拼接身份（旧码：oi(ordA)+hash(hB) 拼成同一锚）"
+        )
+        self.assertNotIn("txHash", ids)
+        self.assertEqual(
+            ids.get("_ambiguous"),
+            ["orderId", "txHash"],
+            "无法证明同单 → fail-closed + 歧义可见",
+        )
+        run = "run-r10xa"
+        A.STORE.mark_open(
+            run,
+            manifest={
+                "version": 1,
+                "runId": run,
+                "rounds": 1,
+                "legs": [{"platform": "gmgn", "chain": "solana", "rounds": 1}],
+            },
+        )
+        self._gmgn_order(run, body)
+        leg = A.STORE.legs[run][0]
+        self.assertEqual(
+            leg.get("_anchor") or {}, {}, "无锚——成功帧结构上不可能正向关联"
+        )
+        A.addons[0].websocket_message(
+            ws_frame(
+                "ws.gmgn.ai",
+                json.dumps(
+                    {
+                        "channel": "tg_processed_order_info",
+                        "data": [
+                            {
+                                "h": "3" * 88,
+                                "oi": "ordA",
+                                "st": "successful",
+                                "si": "buy",
+                                "ch": "sol",
+                            }
+                        ],
+                    }
+                ),
+            )
+        )
+        self.assertFalse(leg.get("_anchorVeto", False), "不制造假冲突/误否决")
+        self.assertIsNone(leg.get("tSuccessPushMs"))
+        A.STORE.mark_close(run)
+        tl = A.STORE.timeline(run)
+        self.assertNotIn(
+            "anchorConflict",
+            tl["diag"],
+            "无跨 entry 拼接 → 无锚冲突计数（旧码 wsFrameAnchorConflict）",
+        )
+        self.assertNotIn("wsFrameAnchorConflict", tl["diag"])
+        self.assertEqual(
+            tl["diag"].get("wsFrameNoLegMatch"), 1, "无锚腿的成功帧零命中——如实计数不吞"
+        )
+        self.assertEqual(tl["legs"][0]["incomplete"], "no-success-observed")
+        self.assertEqual(
+            tl["legs"][0]["evidence"]["anchor"]["ambiguous"], ["orderId", "txHash"]
+        )
+        self.assertEqual(tl["counts"]["observed"], 0)
+
+    def test_gmgn_second_entry_identity_associated(self):
+        """目标在第二 entry（RHF-17b）：响应 data=[{噪声}, {oi, hash}]——身份在第二
+        entry 也照常建锚（deferred binding，不再首-entry-only）；WS 帧目标条目在
+        data[1] 也照常路由/采纳（旧码 ids 只取 data[0] → 整帧漏关联）。"""
+        run = "run-r10x2"
+        A.STORE.mark_open(
+            run,
+            manifest={
+                "version": 1,
+                "runId": run,
+                "rounds": 1,
+                "legs": [{"platform": "gmgn", "chain": "solana", "rounds": 1}],
+            },
+        )
+        self._gmgn_order(
+            run,
+            json.dumps(
+                {
+                    "code": 0,
+                    "data": [{"note": "noise-entry"}, {"oi": "g1", "hash": self.SIG_A}],
+                }
+            ),
+        )
+        leg = A.STORE.legs[run][0]
+        self.assertEqual(
+            (leg.get("_anchor") or {}).get("orderId"),
+            "g1",
+            "第二 entry 的身份照常建立锚",
+        )
+        A.addons[0].websocket_message(
+            ws_frame(
+                "ws.gmgn.ai",
+                json.dumps(
+                    {
+                        "channel": "tg_order_info",
+                        "data": [
+                            {
+                                "h": self.SIG_B,
+                                "oi": "gOther",
+                                "st": "successful",
+                                "si": "buy",
+                                "ch": "sol",
+                            },  # 他单成功（entry 0）
+                            {
+                                "h": self.SIG_A,
+                                "oi": "g1",
+                                "st": "successful",
+                                "si": "buy",
+                                "ch": "sol",
+                            },
+                        ],
+                    }
+                ),
+            )
+        )  # 本单成功（entry 1）
+        self.assertIsNotNone(
+            leg.get("tSuccessPushMs"),
+            "目标在第二 entry 照常采纳（旧码：data[0]-only 漏报）",
+        )
+        self.assertEqual(
+            leg.get("txHash"), self.SIG_A, "hash 取本单 entry——不取 entry 0 的他单 hash"
+        )
+        tl = A.STORE.timeline(run)
+        self.assertEqual(tl["counts"]["observed"], 1)
+        self.assertEqual(
+            tl["diag"].get("wsFrameNoLegMatch"), 1, "他单 entry 零命中如实计数"
+        )
+        self.assertEqual(
+            tl["legs"][0]["evidence"]["successAnchorKeys"], ["orderId", "txHash"]
+        )
+
+    def test_okx_second_entry_associated(self):
+        """OKX 同律：data 列表逐 dexData entry——目标在第二 entry 照常关联；
+        HTTP 侧 batchBroadcast 的 data 列表同样逐 entry（身份/hash 同 entry 才组合）。"""
+        h1, h2 = "0x" + "ab" * 32, "0x" + "cd" * 32
+        # 单元级：跨 entry disjoint 字段不拼接
+        amb = A._okx_resp_ids(
+            json.dumps(
+                {"code": "0", "data": [{"orderId": "ord-1"}, {"transactionHash": h1}]}
+            )
+        )
+        self.assertNotIn("orderId", amb)
+        self.assertEqual(amb.get("_ambiguous"), ["orderId", "txHash"])
+        # 单元级：正向一致的多个 entry 并集（同单证据分散在多 entry 仍可关联）
+        same = A._okx_resp_ids(
+            json.dumps(
+                {
+                    "code": "0",
+                    "data": [
+                        {"orderId": "ord-1", "transactionHash": h1},
+                        {"orderId": "ord-1"},
+                    ],
+                }
+            )
+        )
+        self.assertEqual(
+            same, {"orderId": "ord-1", "txHash": h1}, "共同键全等的 entry 可并集"
+        )
+        run = "run-r10o2"
+        A.STORE.mark_open(
+            run,
+            manifest={
+                "version": 1,
+                "runId": run,
+                "rounds": 1,
+                "legs": [{"platform": "okx", "chain": "bsc", "rounds": 1}],
+            },
+        )
+        f = FakeFlow(
+            "web3.okx.com",
+            "/priapi/v6/dx/trade/multi/batchBroadcast",
+            "POST",
+            req_body=json.dumps({"data": {"chainId": "56"}}),
+            resp_body=json.dumps(
+                {"code": "0", "data": [{"orderId": "ord1", "transactionHash": h1}]}
+            ),
+        )
+        A.addons[0].request(f)
+        A.addons[0].response(f)
+        A.addons[0].websocket_message(
+            ws_frame(
+                "wsdexpri.okx.com",
+                json.dumps(
+                    {
+                        "arg": {"channel": "dex-across-order-info"},
+                        "data": [
+                            {
+                                "dexData": {
+                                    "status": "1",
+                                    "orderId": "ordOther",
+                                    "transactionHash": h2,
+                                    "chainId": "56",
+                                }
+                            },
+                            {
+                                "dexData": {
+                                    "status": "1",
+                                    "orderId": "ord1",
+                                    "transactionHash": h1,
+                                    "chainId": "56",
+                                }
+                            },
+                        ],
+                    }
+                ),
+            )
+        )
+        leg = A.STORE.legs[run][0]
+        self.assertIsNotNone(leg.get("tSuccessPushMs"), "目标在第二 entry 照常采纳")
+        self.assertEqual(leg.get("txHash"), h1, "hash 取本单 entry")
+        tl = A.STORE.timeline(run)
+        self.assertEqual(tl["counts"]["observed"], 1)
+        self.assertEqual(
+            tl["diag"].get("wsFrameNoLegMatch"), 1, "他单 entry 零命中如实计数"
+        )
+
+
+class TestR10EarlyWsBuffer(unittest.TestCase):
+    """RHF-17c（r10）：WS 成功帧先于其 HTTP 响应到达（docs/okx.md §2.4：Sol 的
+    /broadcast 常晚于 WS 确认）——缓冲保留单调源时间/窗口 epoch/方向，响应建立锚
+    后按实时帧同一管线重审采纳（成功时刻用源时间）；关窗/重放/冲突不采纳。"""
+
+    H1 = "0x" + "ab" * 32
+
+    def setUp(self):
+        fresh()
+        orig = A._jsonrpc
+        A._jsonrpc = lambda url, m, p, timeout=10: {
+            "status": "0x1",
+            "blockNumber": "0x1",
+            "blockHash": "0x" + "99" * 32,
+            "transactionHash": p[0],
+        }
+        self.addCleanup(setattr, A, "_jsonrpc", orig)
+
+    def _manifest(self, run):
+        return {
+            "version": 1,
+            "runId": run,
+            "rounds": 1,
+            "legs": [{"platform": "okx", "chain": "bsc", "rounds": 1}],
+        }
+
+    def _okx_req(self, resp_oid="ord1", resp_h=H1):
+        return FakeFlow(
+            "web3.okx.com",
+            "/priapi/v6/dx/trade/multi/broadcast",
+            "POST",
+            req_body=json.dumps({"data": {"chainId": "56"}}),
+            resp_body=json.dumps(
+                {"code": "0", "data": {"transactionHash": resp_h, "orderId": resp_oid}}
+            ),
+        )
+
+    def _okx_success(self, oid="ord1", h=H1):
+        return ws_frame(
+            "wsdexpri.okx.com",
+            json.dumps(
+                {
+                    "arg": {"channel": "dex-swap-order-info"},
+                    "data": {
+                        "dexData": {
+                            "status": "1",
+                            "orderId": oid,
+                            "transactionHash": h,
+                            "chainId": "56",
+                        }
+                    },
+                }
+            ),
+        )
+
+    def test_success_before_http_response_adopted_with_source_time(self):
+        """核心形状：请求 →（响应未到）WS 成功帧 → 缓冲（无成功、计 wsFrameBuffered）
+        → 响应建立锚 → 重审采纳，成功时刻 = 帧源时间（非重审时刻）。"""
+        run = "run-r10eb"
+        A.STORE.mark_open(run, manifest=self._manifest(run))
+        f = self._okx_req()
+        A.addons[0].request(f)
+        time.sleep(0.05)
+        A.addons[0].websocket_message(self._okx_success())  # 成功帧先于响应
+        leg = A.STORE.legs[run][0]
+        self.assertIsNone(
+            leg.get("tSuccessPushMs"), "锚未建立——早到帧不得直接采纳（缓冲待定）"
+        )
+        self.assertEqual(A.STORE.diag.get("wsFrameBuffered"), 1)
+        self.assertNotIn("wsFrameNoLegMatch", A.STORE.diag, "锚待定 → 零命中推迟计数")
+        time.sleep(0.05)
+        A.addons[0].response(f)  # 响应建立锚 → 重审
+        self.assertIsNotNone(leg.get("tSuccessPushMs"), "响应落地后早到帧被采纳")
+        self.assertLess(
+            leg["tSuccessPushMs"],
+            leg["tFirstRespMs"],
+            "成功时刻 = 帧源时间（先于响应）",
+        )
+        time.sleep(0.25)
+        tl = A.STORE.timeline(run)
+        out = tl["legs"][0]
+        self.assertEqual(
+            out["hkL1aMs"], round(leg["tSuccessPushMs"] - leg["tOrderOutMs"], 1)
+        )
+        self.assertGreaterEqual(
+            out["hkL1aMs"], 40.0, "L1a′ 含请求→成功帧真实间隔（不从响应起算）"
+        )
+        self.assertIsNotNone(out["hkL3Ms"], "hash 来自响应锚/帧一致 → receipt 轮询正常")
+        self.assertEqual(
+            tl["counts"], {"requested": 1, "attempted": 1, "observed": 1, "unbound": 0}
+        )
+        self.assertNotIn("wsFrameNoLegMatch", tl["diag"])
+
+    def test_early_frame_window_closed_not_adopted(self):
+        """关窗不采纳：缓冲后未等响应即关窗 → freeze 弃缓冲并按零命中终态计数；
+        迟到的响应（腿已冻结）不再建锚、不再重审。"""
+        run = "run-r10ec"
+        A.STORE.mark_open(run, manifest=self._manifest(run))
+        f = self._okx_req()
+        A.addons[0].request(f)
+        A.addons[0].websocket_message(self._okx_success())
+        self.assertEqual(A.STORE.diag.get("wsFrameBuffered"), 1)
+        A.STORE.mark_close(run)  # 关窗 → 弃缓冲
+        self.assertEqual(
+            A.STORE.diag.get("wsFrameNoLegMatch"),
+            1,
+            "缓冲单元零命中终态——如实计数不静默",
+        )
+        A.addons[0].response(f)  # 迟到响应不得复活
+        leg = A.STORE.legs[run][0]
+        self.assertIsNone(leg.get("tSuccessPushMs"))
+        self.assertEqual((leg.get("_anchor") or {}), {}, "冻结腿不再建锚")
+        tl = A.STORE.timeline(run)
+        self.assertEqual(tl["counts"]["observed"], 0)
+        self.assertEqual(tl["legs"][0]["incomplete"], "no-success-observed")
+
+    def test_early_frame_conflict_not_adopted(self):
+        """冲突不采纳：缓冲帧 {orderId: ord1, txHash: hWrong}；响应锚 {ord1, hRight}
+        → 重审路由判冲突（同单一等一不等）→ 终态拒收，不缓冲、不采纳、hash 不被覆盖。"""
+        orig_poll = A._poll_receipt
+        A._poll_receipt = lambda *a, **k: None  # 隔离 receipt 路径——只考冲突门
+        self.addCleanup(setattr, A, "_poll_receipt", orig_poll)
+        run = "run-r10ecf"
+        A.STORE.mark_open(run, manifest=self._manifest(run))
+        f = self._okx_req()
+        A.addons[0].request(f)
+        h_wrong = "0x" + "77" * 32
+        A.addons[0].websocket_message(self._okx_success(h=h_wrong))
+        self.assertEqual(A.STORE.diag.get("wsFrameBuffered"), 1)
+        A.addons[0].response(f)
+        leg = A.STORE.legs[run][0]
+        self.assertIsNone(leg.get("tSuccessPushMs"), "与响应锚冲突的缓冲帧不得采纳")
+        self.assertEqual(leg.get("txHash"), self.H1, "锚 hash 不被冲突帧覆盖")
+        self.assertEqual(
+            A.STORE.diag.get("wsFrameAnchorConflict"), 1, "冲突终态如实计数"
+        )
+        self.assertEqual(A.STORE.ws_buffer.get(run) or [], [], "冲突是终态——不回缓冲")
+        tl = A.STORE.timeline(run)
+        self.assertEqual(tl["counts"]["observed"], 0)
+
+    def test_early_frame_replay_not_double_adopted(self):
+        """重放不采纳第二份：两份相同成功帧先于响应到达 → 都缓冲 → 重审时第一份
+        采纳、第二份首写冻结拦截；采纳后实时重放同样不写。成功时刻 = 首帧源时间。"""
+        run = "run-r10er"
+        A.STORE.mark_open(run, manifest=self._manifest(run))
+        f = self._okx_req()
+        A.addons[0].request(f)
+        time.sleep(0.03)
+        A.addons[0].websocket_message(self._okx_success())  # 首帧
+        time.sleep(0.03)
+        A.addons[0].websocket_message(self._okx_success())  # 重放副本（同缓冲）
+        A.addons[0].response(f)
+        leg = A.STORE.legs[run][0]
+        t_first = leg.get("tSuccessPushMs")
+        witness = dict(leg["successEvidence"])
+        self.assertEqual(witness["status"], "1")
+        self.assertEqual(witness["observedAtMs"], t_first)
+        self.assertEqual(witness["txHash"], self.H1)
+        self.assertEqual(witness["frameSha"], leg["wsSha"])
+        self.assertIn("txHash", witness["matchedKeys"])
+        self.assertIsNotNone(t_first)
+        evs = [e for e in A.STORE.events[run] if e.get("kind") == "ws_success"]
+        self.assertEqual(len(evs), 1, "重放副本不产生第二次成功事件")
+        A.addons[0].websocket_message(self._okx_success())  # 采纳后实时重放
+        self.assertEqual(leg.get("tSuccessPushMs"), t_first, "首写冻结——重放不覆盖")
+        self.assertEqual(leg["successEvidence"], witness)
+        self.assertEqual(A.STORE.timeline(run, full=True)["legs"][0]["evidence"]["success"], witness)
+        self.assertNotEqual(A.STORE.timeline(run)["legs"][0]["evidence"]["success"]["txHash"], self.H1)
+        time.sleep(0.25)
+        tl = A.STORE.timeline(run)
+        self.assertEqual(tl["counts"]["observed"], 1)
+
+    def test_buffer_gate_requires_anchorless_leg(self):
+        """缓冲门：该平台开窗腿均已有锚（响应已到）→ 零命中即终态，不缓冲——
+        他单/陈旧帧不占用预算（与 r8/r9 实时帧计数口径一致）。"""
+        run = "run-r10eg"
+        A.STORE.mark_open(run, manifest=self._manifest(run))
+        f = self._okx_req()
+        A.addons[0].request(f)
+        A.addons[0].response(f)  # 锚已建立
+        A.addons[0].websocket_message(
+            self._okx_success(oid="ord-OTHER", h="0x" + "55" * 32)
+        )
+        self.assertNotIn("wsFrameBuffered", A.STORE.diag, "无锚待定腿 → 不缓冲")
+        self.assertEqual(
+            A.STORE.diag.get("wsFrameNoLegMatch"), 1, "零命中即终态计数（不推迟）"
+        )
+        self.assertEqual(A.STORE.ws_buffer.get(run) or [], [])
+
+
+# ── r10 续：控制面端口 env 覆盖 / 采集身份 captureIdentity 持久化 ──
+
+
+class _EnvGuard:
+    """具名 env 变量的保存/恢复（绝不 dump/打印 environ 内容）。"""
+
+    def __init__(self, test, *names):
+        self._saved = {n: os.environ.get(n) for n in names}
+        test.addCleanup(self.restore)
+
+    def restore(self):
+        for n, v in self._saved.items():
+            if v is None:
+                os.environ.pop(n, None)
+            else:
+                os.environ[n] = v
+
+
+class TestR10CtrlPortEnv(unittest.TestCase):
+    """r10：SPEEDEX_HK_CTRL_PORT 覆盖控制面监听端口（隔离实验 unit 与生产同机并存，
+    speedex-mitm-exp.service 设 18072）——缺省/非法一律 8072，绝不因坏 env 崩溃。"""
+
+    def setUp(self):
+        fresh()
+        self._env = _EnvGuard(self, "SPEEDEX_HK_CTRL_PORT")
+
+    def test_port_resolver_default_and_valid(self):
+        os.environ.pop("SPEEDEX_HK_CTRL_PORT", None)
+        self.assertEqual(A._ctrl_port(), 8072, "未设置 → 缺省 8072（逐字节旧行为）")
+        os.environ["SPEEDEX_HK_CTRL_PORT"] = "18072"
+        self.assertEqual(A._ctrl_port(), 18072)
+        os.environ["SPEEDEX_HK_CTRL_PORT"] = " 18072 "
+        self.assertEqual(A._ctrl_port(), 18072, "空白容忍")
+        os.environ["SPEEDEX_HK_CTRL_PORT"] = "1"
+        self.assertEqual(A._ctrl_port(), 1, "下界合法")
+        os.environ["SPEEDEX_HK_CTRL_PORT"] = "65535"
+        self.assertEqual(A._ctrl_port(), 65535, "上界合法")
+
+    def test_port_resolver_invalid_falls_back(self):
+        for bad in (
+            "",
+            "   ",
+            "abc",
+            "18072.5",
+            "0x46A8",
+            "-1",
+            "0",
+            "65536",
+            "99999",
+            "True",
+            "1e4",
+        ):
+            os.environ["SPEEDEX_HK_CTRL_PORT"] = bad
+            self.assertEqual(
+                A._ctrl_port(), 8072, f"非法值 {bad!r} → 回退 8072（不崩溃）"
+            )
+
+    def test_listener_follows_env_port(self):
+        """集成：env=18072 → 重绑后控制面在 18072 服务且 8072 不再监听；恢复 env
+        后回到 8072。takeover/bindError 注册表不残留污染。"""
+        os.environ["SPEEDEX_HK_CTRL_PORT"] = "18072"
+        A._start_ctrl()
+
+        def restore_8072():
+            os.environ.pop("SPEEDEX_HK_CTRL_PORT", None)
+            A._start_ctrl()
+
+        self.addCleanup(restore_8072)
+        code, body = _http_json("GET", "http://127.0.0.1:18072/health")
+        self.assertEqual((code, body["ok"]), (200, True))
+        self.assertEqual(
+            body["captureIdentity"]["ctrlPort"], 18072, "health 自报实际监听端口"
+        )
+        with self.assertRaises(urllib.error.URLError):
+            _http_json("GET", "http://127.0.0.1:8072/health")
+        reg = A._ctrl_registry()
+        self.assertIsNone(reg.get("bindError"))
+        self.assertFalse(reg.get("takeover"), "空 Store 重绑不制造 takeover 记录")
+
+
+class TestR10CaptureIdentity(unittest.TestCase):
+    """r10（RHF-15 持久化）：每批采集/解密身份 captureIdentity——实际生效的
+    allow_hosts 宿主模式集（mitmproxy ctx.options 真实生效值优先于 env 声明；
+    不可观测 → unavailable 不猜）+ 控制面端口；timeline 与 /health 同源。
+    只含 host 正则配置事实：有界（≤16 条、每条 ≤512 字符），不落凭据/env dump。"""
+
+    PAT = r"^(.*\.)?(turnkey\.com|padre\.gg|binance\.com|fomo\.family|relay\.link)(:\d+)?$"
+
+    def setUp(self):
+        fresh()
+        self._env = _EnvGuard(self, "SPEEDEX_HK_ALLOW_HOSTS", "SPEEDEX_HK_CTRL_PORT")
+        os.environ.pop("SPEEDEX_HK_ALLOW_HOSTS", None)
+        os.environ.pop("SPEEDEX_HK_CTRL_PORT", None)
+        # Explicitly model a missing dependency even on a deployment host with
+        # mitmproxy installed. Other tests may already have imported its ctx.
+        from unittest.mock import patch
+        guard = patch.dict(sys.modules, {"mitmproxy": None, "mitmproxy.ctx": None})
+        guard.start()
+        self.addCleanup(guard.stop)
+
+    def _fake_mitmproxy(self, allow_hosts):
+        """注入假 mitmproxy 模块（ctx.options.allow_hosts）——离线验证真实生效值路径。"""
+        mod = types.ModuleType("mitmproxy")
+        mod.ctx = types.SimpleNamespace(
+            options=types.SimpleNamespace(allow_hosts=allow_hosts)
+        )
+        sys.modules["mitmproxy"] = mod
+        self.addCleanup(sys.modules.pop, "mitmproxy", None)
+
+    def test_unavailable_when_unobservable(self):
+        ci = A._collection_identity()["captureIdentity"]
+        self.assertEqual(
+            ci,
+            {"allowHosts": None, "allowHostsSource": "unavailable", "ctrlPort": 8072},
+            "无法自观测且无 env 声明 → 未知不猜（不按当前矩阵反填）",
+        )
+
+    def test_env_fallback_declared_source(self):
+        os.environ["SPEEDEX_HK_ALLOW_HOSTS"] = self.PAT
+        ci = A._collection_identity()["captureIdentity"]
+        self.assertEqual(ci["allowHosts"], [self.PAT])
+        self.assertEqual(ci["allowHostsSource"], "env", "unit 声明值来源如实标注")
+        self.assertEqual(ci["ctrlPort"], 8072)
+
+    def test_mitmproxy_options_preferred_over_env(self):
+        os.environ["SPEEDEX_HK_ALLOW_HOSTS"] = "^env-claim$"
+        pats = [self.PAT, r"^example\.com$"]
+        self._fake_mitmproxy(pats)
+        ci = A._collection_identity()["captureIdentity"]
+        self.assertEqual(ci["allowHosts"], pats, "真实生效值优先于 env 声明")
+        self.assertEqual(ci["allowHostsSource"], "mitmproxy-options")
+        # 空列表 = 未设白名单（全量拦截）——是真实生效值，不回退 env
+        ci2 = A._capture_identity()
+        self.assertEqual(ci2["allowHosts"], pats)
+        sys.modules.pop("mitmproxy")
+        self._fake_mitmproxy([])
+        self.assertEqual(
+            A._capture_identity()["allowHosts"],
+            [],
+            "空 allow_hosts 如实报告（全量拦截事实）",
+        )
+        self.assertEqual(A._capture_identity()["allowHostsSource"], "mitmproxy-options")
+
+    def test_patterns_bounded(self):
+        self._fake_mitmproxy([f"^h{i}\\.example$" for i in range(20)] + ["x" * 600])
+        hosts, source = A._effective_allow_hosts()
+        self.assertEqual(source, "mitmproxy-options")
+        self.assertEqual(len(hosts), 16, "模式集有界 ≤16")
+        self.assertTrue(all(len(h) <= 512 for h in hosts), "每条 ≤512 字符")
+
+    def test_identity_in_timeline_and_health(self):
+        os.environ["SPEEDEX_HK_ALLOW_HOSTS"] = self.PAT
+        tl = A.STORE.timeline("run-ci-none")
+        self.assertEqual(
+            tl["captureIdentity"]["allowHosts"],
+            [self.PAT],
+            "timeline 自带采集身份（每批持久化）",
+        )
+        self.assertEqual(tl["captureIdentity"]["allowHostsSource"], "env")
+        code, body = _http_json("GET", "http://127.0.0.1:8072/health")
+        self.assertEqual(code, 200)
+        self.assertEqual(
+            body["captureIdentity"], tl["captureIdentity"], "/health 与 timeline 同源"
+        )
+        blob = json.dumps(body["captureIdentity"])
+        self.assertNotIn("SPEEDEX_", blob, "只含配置事实——不含 env 名/值 dump")
+
+
+class ChainHeadTests(unittest.TestCase):
+    def test_pre_anchor_stale_null_and_closed_window(self):
+        now = [1000]
+        c = A.ChainHeadWindow(clock=lambda: now[0])
+        c.run_id = "head-window"
+        from collections import deque
+
+        c.samples = {"solana": deque(maxlen=512), "robinhood": deque(maxlen=512)}
+        for value in [None, True, "42", {}]:
+            c.add("solana", value, "rpc-poll")
+        self.assertEqual(
+            c.snapshot("head-window", 1100)["solana"]["status"], "no-pre-anchor-head"
+        )
+        c.add("solana", 100, "ws-head")
+        now[0] = 1200
+        c.add("solana", 101, "ws-head")
+        self.assertEqual(c.snapshot("head-window", 1100)["solana"]["height"], 100)
+        self.assertEqual(
+            c.snapshot("head-window", 4000)["solana"]["status"], "stale-head"
+        )
+        self.assertEqual(c.snapshot("wrong", 1300), {})
+        c.close()
+        c.add("solana", 200, "ws-head")
+        self.assertEqual(c.snapshot("head-window", 1300), {})
+
+    def test_hook_freezes_same_window_head_without_network(self):
+        from collections import deque
+
+        original = A.HEADS
+        c = A.ChainHeadWindow(clock=lambda: 1000)
+        c.run_id = "head-window"
+        c.samples = {"robinhood": deque(maxlen=512)}
+        c.add("robinhood", {"number": "0x64", "hash": "0x" + "aa" * 32}, "ws-head")
+        A.HEADS = c
+        try:
+            store = A.Store()
+            store.mark_open("head-window")
+            with store.lock:
+                leg = store._new_leg_locked(
+                    "head-window", "okx", "robinhood", {"t": 1100, "tw": "synthetic"}
+                )
+            captured = leg["_headSnapshots"]["robinhood"]
+            self.assertEqual(captured["height"], 100)
+            self.assertEqual(captured["anchorTs"], 1100)
+            self.assertEqual(captured["vantage"], "hk")
+            c.add("robinhood", {"number": "0x65", "hash": "0x" + "bb" * 32}, "ws-head")
+            self.assertEqual(captured["height"], 100)
+            self.assertEqual(
+                store.timeline("head-window")["legs"][0]["chainHead"]["height"], 100
+            )
+        finally:
+            c.close()
+            A.HEADS = original
+
+
+class TestChainHeadSolForkContinuity(unittest.TestCase):
+    """Solana 链头在 processed 承诺下无 hash——slotSubscribe 的 parent 槽位是唯一
+    分叉连续性证据：同高不同 parent = 分叉、高度回退——清空重锚（与 EVM hash/parentHash
+    冲突清空同律），分叉前的缓冲头不得给后续 hook 出值。v10.14（speedex AG-2 同步）：
+    更高 slot 的 parent 不是上一头（漏通知，或 Alpenglow 候选 slot 开始后被跳过）= 跳过，
+    不清缓冲——slot 号单调，旧头仍是有效 slot 刻度。getSlot 轮询是裸整数（无 parent）——
+    无连续性证据即不判冲突。"""
+
+    @staticmethod
+    def _window(now):
+        from collections import deque
+
+        c = A.ChainHeadWindow(clock=lambda: now[0])
+        c.run_id = "sol-heads"
+        c.samples = {"solana": deque(maxlen=512)}
+        return c
+
+    def test_sol_parent_continuity_and_fork_reanchor(self):
+        now = [1000]
+        c = self._window(now)
+        try:
+            c.add("solana", {"parent": 99, "slot": 100, "root": 98}, "ws-head")
+            now[0] = 1100
+            c.add("solana", {"parent": 100, "slot": 101, "root": 100}, "ws-head")
+            snap = c.snapshot("sol-heads", 1150)["solana"]
+            self.assertEqual(snap["status"], "ok")
+            self.assertEqual(
+                (snap["height"], snap["parent"]), (101, 100), "parent 槽位随样本保留"
+            )
+            self.assertIsNone(snap["hash"], "processed 头仍无区块 hash")
+            # 同高不同 parent = 分叉——清空重锚；分叉前的头不得出值
+            now[0] = 1200
+            c.add("solana", {"parent": 99, "slot": 101, "root": 98}, "ws-head")
+            self.assertEqual(
+                c.snapshot("sol-heads", 1150)["solana"]["status"], "no-pre-anchor-head"
+            )
+            snap = c.snapshot("sol-heads", 1250)["solana"]
+            self.assertEqual((snap["status"], snap["parent"]), ("ok", 99))
+            # v10.14：更高 slot 的 parent 跳号（漏通知 102/103）= 跳过，不清——旧头仍可给更早锚出值
+            now[0] = 1300
+            c.add("solana", {"parent": 102, "slot": 104, "root": 101}, "ws-head")
+            snap = c.snapshot("sol-heads", 1250)["solana"]
+            self.assertEqual((snap["status"], snap["height"]), ("ok", 101))
+            self.assertEqual(c.snapshot("sol-heads", 1350)["solana"]["height"], 104)
+            # Alpenglow 候选 slot 104 被跳过，105 建在 102 上：前进 + 更老 parent = 跳过，不清
+            now[0] = 1400
+            c.add("solana", {"parent": 102, "slot": 105, "root": 102}, "ws-head")
+            snap = c.snapshot("sol-heads", 1350)["solana"]
+            self.assertEqual((snap["status"], snap["height"]), ("ok", 104))
+            snap = c.snapshot("sol-heads", 1450)["solana"]
+            self.assertEqual(
+                (snap["status"], snap["height"], snap["parent"]), ("ok", 105, 102)
+            )
+            # v10.15（AG-3 B）：更低的 ws slot = 落后源，丢弃计数，不清缓冲（头仍 105）
+            now[0] = 1500
+            c.add("solana", {"parent": 101, "slot": 102, "root": 101}, "ws-head")
+            self.assertEqual(c.snapshot("sol-heads", 1450)["solana"]["height"], 105)
+            self.assertEqual(c.snapshot("sol-heads", 1550)["solana"]["height"], 105)
+            self.assertEqual(c.diag_snapshot()["wsBehind"], {"solana": 1})
+        finally:
+            c.close()
+
+    def test_sol_multisource_highest_slot_wins_v10_15(self):
+        """v10.15 AG-3 B：多源 Solana——落后源低 slot 丢弃、同 slot 重复首到为准、记 wsOrigin 与 diag。"""
+        now = [1000]
+        c = self._window(now)
+        try:
+            c.add("solana", {"parent": 499, "slot": 500, "root": 498}, "ws-head", origin="solana.publicnode.com")
+            now[0] = 1050
+            c.add("solana", {"parent": 475, "slot": 476, "root": 474}, "ws-head", origin="api.mainnet-beta.solana.com")
+            now[0] = 1100
+            c.add("solana", {"parent": 499, "slot": 500, "root": 498}, "ws-head", origin="api.mainnet-beta.solana.com")
+            snap = c.snapshot("sol-heads", 1150)["solana"]
+            self.assertEqual(
+                (snap["status"], snap["height"], snap["observedTs"], snap["wsOrigin"]),
+                ("ok", 500, 1000, "solana.publicnode.com"),
+            )
+            now[0] = 1200
+            c.add("solana", {"parent": 500, "slot": 501, "root": 499}, "ws-head", origin="api.mainnet-beta.solana.com")
+            snap = c.snapshot("sol-heads", 1250)["solana"]
+            self.assertEqual((snap["height"], snap["wsOrigin"]), (501, "api.mainnet-beta.solana.com"))
+            d = c.diag_snapshot()
+            self.assertEqual(d["wsBehind"], {"solana": 2})
+            self.assertEqual(
+                d["wsLead"],
+                {"solana|solana.publicnode.com": 1, "solana|api.mainnet-beta.solana.com": 1},
+            )
+            # 同 slot 异 proven parent 仍是分叉——清空重锚
+            now[0] = 1300
+            c.add("solana", {"parent": 499, "slot": 501, "root": 498}, "ws-head", origin="solana.publicnode.com")
+            self.assertEqual(c.snapshot("sol-heads", 1250)["solana"]["status"], "no-pre-anchor-head")
+        finally:
+            c.close()
+
+    def test_sol_one_source_ending_keeps_other_sources_heads_v10_15(self):
+        """Kimi review（v10.15）：多源时单个 Solana ws 会话结束不得清掉他源仍在推的头；最后一个源结束才清。"""
+        import json as _json
+
+        def fake_connect(slot):
+            msgs = [_json.dumps({"jsonrpc": "2.0", "id": 1, "result": 7}),
+                    _json.dumps({"jsonrpc": "2.0", "method": "slotNotification",
+                                 "params": {"subscription": 7, "result": {"slot": slot, "parent": slot - 1, "root": slot - 2}}})]
+
+            class FakeWS:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+                def send(self, _):
+                    pass
+
+                def recv(self, timeout=None):
+                    if msgs:
+                        return msgs.pop(0)
+                    raise RuntimeError("closed")
+
+            return lambda url, **k: FakeWS()
+
+        now = [1000]
+        c = self._window(now)
+        try:
+            c.ws_live["solana"].add("solana.publicnode.com")  # another source still subscribed
+            c.connect = fake_connect(500)
+            c._ws_session("solana", "wss://api.mainnet-beta.solana.com/", "api.mainnet-beta.solana.com")
+            snap = c.snapshot("sol-heads", 1100)["solana"]
+            self.assertEqual((snap["status"], snap["height"]), ("ok", 500), "other source live → heads kept")
+            self.assertEqual(c.ws_diag_snapshot()["active"]["solana"], "solana.publicnode.com")
+            c.ws_live["solana"].discard("solana.publicnode.com")  # last other source gone
+            now[0] = 1200
+            c.connect = fake_connect(501)
+            c._ws_session("solana", "wss://solana-rpc.publicnode.com/", "solana-rpc.publicnode.com")
+            self.assertEqual(c.snapshot("sol-heads", 1250)["solana"]["status"], "no-pre-anchor-head",
+                             "no subscribed source left → ws heads cleared (old single-source behaviour)")
+        finally:
+            c.close()
+
+    def test_sol_start_subscribes_every_registered_wss_source_v10_15(self):
+        """v10.15：start() 对 Solana 每个 _head_ws_urls 源各起一条常驻订阅；EVM 仍单源轮换。"""
+        seen = []
+
+        class FakeWS:
+            def __init__(self, url):
+                self.url = url
+
+            def __enter__(self):
+                seen.append(self.url)
+                raise OSError("offline")
+
+            def __exit__(self, *a):
+                return False
+
+        c = A.ChainHeadWindow(rpc_call=lambda *a, **k: None, connect=lambda url, **k: FakeWS(url), clock=lambda: 1000)
+        try:
+            c.start("multi", ["solana", "robinhood"])
+            deadline = time.time() + 3
+            want = set(A._head_ws_urls("solana"))
+            while time.time() < deadline and not want.issubset(set(seen)):
+                time.sleep(0.05)
+            self.assertTrue(len(want) >= 2, want)
+            self.assertTrue(want.issubset(set(seen)), (want, seen))
+            ws_threads = [t for t in c.threads if getattr(t, "_target", None) == c._ws_fixed]
+            self.assertEqual(len(ws_threads), len(want), "one fixed subscription per Solana source")
+            evm = [t for t in c.threads if getattr(t, "_target", None) == c._ws]
+            self.assertEqual(len(evm), 1, "EVM keeps a single rotating subscription")
+        finally:
+            c.close()
+
+    def test_sol_poll_without_parent_interleaves_without_false_conflict(self):
+        """getSlot 轮询头（裸整数、无 parent）与 ws 头交错：无 parent 证据不判冲突，
+        也不破坏后续 ws 头的 parent 衔接判定（降级回退同今）。"""
+        now = [1000]
+        c = self._window(now)
+        try:
+            c.add("solana", {"parent": 99, "slot": 100, "root": 98}, "ws-head")
+            now[0] = 1050
+            c.add("solana", 101, "rpc-poll")  # 轮询无 parent——照常采纳
+            now[0] = 1100
+            c.add("solana", {"parent": 101, "slot": 102, "root": 101}, "ws-head")
+            snap = c.snapshot("sol-heads", 1150)["solana"]
+            self.assertEqual(
+                (snap["status"], snap["height"]),
+                ("ok", 102),
+                "轮询头可被后续 ws 头正向衔接",
+            )
+            # 同高 ws 头与轮询头（poll 样本无 parent）不制造假冲突
+            now[0] = 1200
+            c.add("solana", {"parent": 101, "slot": 102, "root": 101}, "ws-head")
+            self.assertEqual(c.snapshot("sol-heads", 1250)["solana"]["height"], 102)
+        finally:
+            c.close()
+
+
+class TestChainHeadControlPlaneWiring(unittest.TestCase):
+    """控制面 /mark→采集窗接线（经 IsolatedHTTPServer——绑 OS 分配端口，绝不占
+    生产/隧道端口）：/mark 带 legs 明细开窗即按明细启动链头采集；/mark/close 只在
+    runId 匹配时关停采集窗；re-mark 新窗顶掉旧窗，旧窗迟到的头与快照一律拒绝。
+    采集器传输打桩（rpc 恒空、无 WS 连接）——控制面接线走真实 HTTP 处理器。"""
+
+    def setUp(self):
+        fresh()
+        self._orig_start_heads = A._start_heads  # import 时的 no-op——测后复原
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        A.HEADS.close()
+        A.HEADS = A.ChainHeadWindow()
+        A._start_heads = self._orig_start_heads
+
+    @staticmethod
+    def _isolated_start_heads(run_id, manifest):
+        """与生产 _start_heads 同律但传输打桩（无网络）：rpc 恒空、connect=None。"""
+        A.HEADS.close()
+        A.HEADS = A.ChainHeadWindow(rpc_call=lambda *a, **k: None, connect=None)
+        legs = (manifest or {}).get("legs") or []
+        chains = sorted({x.get("chain") for x in legs if x.get("chain") in A.CHAINS})
+        A.HEADS.start(run_id, chains or list(A.CHAINS))
+
+    def test_mark_starts_window_close_stops_and_remark_replaces(self):
+        A._start_heads = self._isolated_start_heads
+        manifest = {
+            "version": 1,
+            "runId": "run-hw1",
+            "rounds": 1,
+            "legs": [{"platform": "gmgn", "chain": "solana", "rounds": 1}],
+        }
+        code, body = _http_json(
+            "POST",
+            "http://127.0.0.1:8072/mark",
+            {"runId": "run-hw1", "manifest": manifest},
+        )
+        self.assertEqual((code, body["ok"]), (200, True))
+        self.assertEqual(A.HEADS.run_id, "run-hw1", "/mark 开窗即启动链头采集")
+        self.assertEqual(
+            sorted(A.HEADS.samples), ["solana"], "链集合按 legs 明细（非全链默认）"
+        )
+        # 确定性喂头（不经网络）：开窗后的快照出值
+        A.HEADS.add("solana", {"parent": 99, "slot": 100, "root": 98}, "ws-head")
+        snap = A.HEADS.snapshot("run-hw1", A.HEADS.clock() + 100)["solana"]
+        self.assertEqual(snap["status"], "ok")
+        # runId 不匹配的 close 不动采集窗
+        code, _ = _http_json(
+            "POST", "http://127.0.0.1:8072/mark/close", {"runId": "other"}
+        )
+        self.assertEqual(code, 200)
+        self.assertFalse(A.HEADS.stop.is_set(), "runId 不符不关采集窗")
+        # matching runId close → 采集窗关停，快照不再出值
+        code, _ = _http_json(
+            "POST", "http://127.0.0.1:8072/mark/close", {"runId": "run-hw1"}
+        )
+        self.assertEqual(code, 200)
+        self.assertTrue(A.HEADS.stop.is_set())
+        self.assertEqual(
+            A.HEADS.snapshot("run-hw1", A.HEADS.clock() + 100), {}, "关窗后快照为空"
+        )
+        # re-mark → 新窗显式顶掉旧窗；旧窗迟到的头与旧 runId 快照一律拒绝
+        old = A.HEADS
+        code, _ = _http_json(
+            "POST",
+            "http://127.0.0.1:8072/mark",
+            {"runId": "run-hw2", "manifest": manifest},
+        )
+        self.assertEqual(code, 200)
+        self.assertIsNot(A.HEADS, old)
+        self.assertEqual(A.HEADS.run_id, "run-hw2")
+        self.assertIsNotNone(
+            A.STORE.marks["run-hw1"]["closed"], "新窗显式关闭旧窗（单窗纪律）"
+        )
+        old.add("solana", {"parent": 100, "slot": 101, "root": 100}, "ws-head")
+        self.assertEqual(
+            len(old.samples["solana"]), 1, "旧窗已关停——迟到头丢弃，既有样本不删"
+        )
+        self.assertEqual(old.snapshot("run-hw1", old.clock() + 100), {}, "旧窗快照拒绝")
+        self.assertEqual(
+            A.HEADS.snapshot("run-hw1", A.HEADS.clock() + 100), {}, "新窗不认旧 runId"
+        )
+
+
+class TestKeepAliveJsonRpc(unittest.TestCase):
+    """keep-alive 轮询客户端（head-v4）：复用连接、错误后重建、UA 保持（robinhood
+    403 规避）、超时生效、非 200 拒绝、仅 https。全程桩 http.client——零网络。"""
+
+    def test_reuses_connection_and_preserves_ua(self):
+        class FakeResp:
+            status = 200
+
+            def read(self):
+                return json.dumps(
+                    {"result": {"number": "0x64", "hash": "0x" + "aa" * 32}}
+                ).encode()
+
+        class FakeConn:
+            def __init__(self):
+                self.calls = 0
+                self.ua = None
+
+            def request(self, method, path, body=None, headers=None):
+                self.calls += 1
+                self.ua = headers.get("User-Agent")
+
+            def getresponse(self):
+                return FakeResp()
+
+            def close(self):
+                pass
+
+        fake = FakeConn()
+        ka = A.KeepAliveJsonRpc("https://rpc.example/v1", timeout=0.7)
+        ka._connect = lambda: setattr(ka, "_conn", fake)
+        r1 = ka("eth_getBlockByNumber", ["latest", False])
+        r2 = ka("eth_getBlockByNumber", ["latest", False])
+        self.assertEqual(r1["number"], "0x64")
+        self.assertEqual(fake.calls, 2, "两次调用复用同一连接")
+        self.assertEqual(
+            fake.ua,
+            "speedex-hk-timing/1.0",
+            "UA 与 _jsonrpc 一致（robinhood 403 规避）",
+        )
+
+    def test_error_reconnects_and_non200_raises(self):
+        class FakeResp:
+            def __init__(self, status):
+                self.status = status
+
+            def read(self):
+                return b"{}"
+
+        states = {"n": 0}
+
+        class FlakyConn:
+            def __init__(self, fail_once):
+                self.fail_once = fail_once
+                self.calls = 0
+
+            def request(self, *a, **k):
+                self.calls += 1
+                if self.fail_once and self.calls == 1:
+                    raise ConnectionResetError("rst")
+
+            def getresponse(self):
+                return FakeResp(200) if not self.fail_once or self.calls > 1 else None
+
+            def close(self):
+                pass
+
+        ka = A.KeepAliveJsonRpc("https://rpc.example/")
+        built = []
+        ka._connect = lambda: (
+            built.append(FlakyConn(True)) or setattr(ka, "_conn", built[-1])
+        )
+        ok_resp = json.dumps(
+            {"result": {"number": "0x65", "hash": "0x" + "bb" * 32}}
+        ).encode()
+        # 第一次连接被 reset → 重建第二次成功
+        ka2 = A.KeepAliveJsonRpc("https://rpc.example/")
+        seq = []
+
+        class C1:
+            def request(self, *a, **k):
+                seq.append("c1")
+                raise ConnectionResetError("rst")
+
+            def close(self):
+                pass
+
+        class C2:
+            def request(self, *a, **k):
+                seq.append("c2")
+
+            def getresponse(self):
+                class R:
+                    status = 200
+
+                    def read(self):
+                        return ok_resp
+
+                return R()
+
+            def close(self):
+                pass
+
+        conns = [C1(), C2()]
+        ka2._connect = lambda: setattr(ka2, "_conn", conns.pop(0))
+        r = ka2("eth_getBlockByNumber", ["latest", False])
+        self.assertEqual(r["number"], "0x65")
+        self.assertEqual(seq, ["c1", "c2"], "连接错误后重建再试")
+        # 非 200 → raise
+        ka3 = A.KeepAliveJsonRpc("https://rpc.example/")
+
+        class C3:
+            def request(self, *a, **k):
+                pass
+
+            def getresponse(self):
+                return FakeResp(403)
+
+            def close(self):
+                pass
+
+        ka3._connect = lambda: setattr(ka3, "_conn", C3())
+        with self.assertRaises(Exception):
+            ka3("eth_getBlockByNumber", ["latest", False])
+        # https 以外直接拒
+        with self.assertRaises(ValueError):
+            A.KeepAliveJsonRpc("http://rpc.example/")("m", [])
+
+    def test_timeout_passed_to_connection(self):
+        ka = A.KeepAliveJsonRpc("https://rpc.example/", timeout=0.3)
+        seen = {}
+
+        class C:
+            def request(self, *a, **k):
+                seen["timeout"] = self.timeout
+
+            def getresponse(self):
+                class R:
+                    status = 200
+
+                    def read(self):
+                        return json.dumps({"result": 1}).encode()
+
+                return R()
+
+            def close(self):
+                pass
+
+        ka._connect = lambda: setattr(ka, "_conn", C())
+        ka._conn = None
+        ka("m", [], timeout=0.9)
+        self.assertEqual(seen["timeout"], 0.9, "调用级 timeout 覆盖默认值")
+
+
+class TestChainHeadPollDiagAndKeepaliveRouting(unittest.TestCase):
+    """_poll 路由（head-v4）：注入 rpc_call 时尊重注入（不建 keep-alive）；
+    默认路径用 keep-alive 客户端；成功/失败计数入 diag（/health.diag.headPoll 透出）。"""
+
+    def test_injected_rpc_call_respected_and_diag_counts(self):
+        from collections import deque
+
+        now = [1000]
+        calls = []
+        chain = {"h": 100, "hash": "0x" + "aa" * 32}
+
+        def fake_rpc(url, method, params, timeout=None):
+            calls.append((method, timeout))
+            if len(calls) % 3 == 0:
+                raise TimeoutError("rpc timeout")
+            chain["h"] += 1
+            parent = chain["hash"]
+            chain["hash"] = "0x" + f"{chain['h']:064x}"[-64:]
+            return {
+                "number": hex(chain["h"]),
+                "hash": chain["hash"],
+                "parentHash": parent,
+            }
+
+        c = A.ChainHeadWindow(rpc_call=fake_rpc, clock=lambda: now[0])
+        c.run_id = "poll-diag"
+        c.samples = {"robinhood": deque(maxlen=512)}
+        try:
+            for _ in range(5):
+                sent = c.clock()
+                try:
+                    result = c._poll_call(
+                        "robinhood", "eth_getBlockByNumber", ["latest", False]
+                    )
+                    c.add("robinhood", result, "rpc-poll", sent)
+                    with c.lock:
+                        c.diag["pollOk"]["robinhood"] += 1
+                except Exception as e:
+                    with c.lock:
+                        c.diag["pollFail"]["robinhood"] += 1
+                        c.diag["lastErr"]["robinhood"] = (
+                            f"{type(e).__name__}: {str(e)[:80]}"
+                        )
+                now[0] += 600
+            self.assertEqual(
+                len(c.samples["robinhood"]), 4, "第 3 次失败被跳过、其余入缓冲"
+            )
+            self.assertEqual(c.diag["pollOk"]["robinhood"], 4)
+            self.assertEqual(c.diag["pollFail"]["robinhood"], 1)
+            self.assertIn("TimeoutError", c.diag["lastErr"]["robinhood"])
+            self.assertFalse(c._ka, "注入 rpc_call 时不建 keep-alive 客户端")
+            snap = c.diag_snapshot()
+            self.assertEqual(snap["pollOk"]["robinhood"], 4)
+        finally:
+            c.close()
+
+    def test_default_path_builds_keepalive(self):
+        c = A.ChainHeadWindow(clock=lambda: 1000)
+        self.assertIs(c.rpc_call, A._jsonrpc)
+        seen = {}
+
+        class FakeKA:
+            def __init__(self, url, timeout=None):
+                seen["url"], seen["timeout"] = url, timeout
+
+            def __call__(self, method, params):
+                return {"number": "0x64", "hash": "0x" + "aa" * 32}
+
+        original = A.KeepAliveJsonRpc
+        A.KeepAliveJsonRpc = FakeKA
+        try:
+            out = c._poll_call("robinhood", "eth_getBlockByNumber", ["latest", False])
+            self.assertEqual(out["number"], "0x64")
+            self.assertEqual(seen["url"], A.CHAINS["robinhood"]["rpc"])
+            self.assertIsNot(c.rpc_call, None)
+        finally:
+            A.KeepAliveJsonRpc = original
+            c.close()
+
+
+class TestChainHeadPollBehindDropped(unittest.TestCase):
+    """v10.11（9u757 RH r4）：rpc-poll 读数低于已缓冲最新高度 = 节点 latest 滞后，丢弃（不清缓冲、不作链头）；
+    ws-head 回退仍按分叉规则清缓冲。"""
+
+    def _hdr(self, h, parent=None):
+        return {"number": hex(h), "hash": "0x" + f"{h:064x}", "parentHash": "0x" + f"{(parent if parent is not None else h - 1):064x}"}
+
+    def test_lagging_poll_is_dropped_and_head_stays_fresh(self):
+        from collections import deque
+
+        now = [1000]
+        c = A.ChainHeadWindow(clock=lambda: now[0])
+        c.run_id = "lag"
+        c.samples = {"robinhood": deque(maxlen=512)}
+        try:
+            c.add("robinhood", self._hdr(82974628), "ws-head")
+            now[0] = 1300
+            c.add("robinhood", self._hdr(82974620), "rpc-poll", 1290)  # 公共节点落后 8 块
+            snap = c.snapshot("lag", 1310)["robinhood"]
+            self.assertEqual((snap["height"], snap["source"]), (82974628, "ws-head"))
+            self.assertEqual(c.diag_snapshot()["pollBehind"], {"robinhood": 1})
+            now[0] = 1400
+            c.add("robinhood", self._hdr(82974629), "rpc-poll", 1390)  # 追上后的轮询照常接受
+            self.assertEqual(c.snapshot("lag", 1410)["robinhood"]["height"], 82974629)
+            now[0] = 1500
+            c.add("robinhood", self._hdr(82974600), "ws-head")  # ws 回退：分叉规则不变（清缓冲后采用）
+            self.assertEqual(c.snapshot("lag", 1510)["robinhood"]["height"], 82974600)
+        finally:
+            c.close()
+
+
+class TestChainHeadFreshnessAtAnchors(unittest.TestCase):
+    """iyqzt 回归（2026-09-12 head-v4）：锚点节拍 ~15s 下，健康轮询（rtt 远小于
+    maxAgeMs）的链头样本在每个锚点必须 ≤2000ms 新鲜——快照恒 ok，绝不出
+    stale-head/round-reference-unverified 的整腿失真。"""
+
+    def test_anchors_get_fresh_heads_under_healthy_poll(self):
+        from collections import deque
+
+        now = [1000]
+        chain = {"h": 61162715, "hash": "0x" + "ab" * 32}
+
+        def fast_rpc(url, method, params, timeout=None):
+            chain["h"] += 1
+            parent = chain["hash"]
+            chain["hash"] = "0x" + f"{chain['h']:064x}"[-64:]
+            return {
+                "number": hex(chain["h"]),
+                "hash": chain["hash"],
+                "parentHash": parent,
+            }
+
+        c = A.ChainHeadWindow(rpc_call=fast_rpc, clock=lambda: now[0])
+        c.run_id = "fresh-rh"
+        c.samples = {"robinhood": deque(maxlen=512)}
+        try:
+            # 模拟轮询循环节拍：每 ~800ms 一次成功调用；锚点 ~15s 节拍穿插其间
+            anchors = [now[0] + 1200 + k * 15000 for k in range(5)]
+            next_anchor = 0
+            for _ in range(100):
+                result = c._poll_call(
+                    "robinhood", "eth_getBlockByNumber", ["latest", False]
+                )
+                c.add("robinhood", result, "rpc-poll", now[0])
+                now[0] += 800
+                while next_anchor < len(anchors) and now[0] >= anchors[next_anchor]:
+                    anchor = anchors[next_anchor]
+                    snap = c.snapshot("fresh-rh", anchor)["robinhood"]
+                    self.assertEqual(
+                        snap["status"], "ok", f"anchor {anchor}: 快照必须新鲜"
+                    )
+                    self.assertLessEqual(snap["sampleAgeMs"], 2000)
+                    self.assertEqual(snap["anchorTs"], anchor)
+                    next_anchor += 1
+            self.assertEqual(next_anchor, 5, "五个锚点全部核验")
+        finally:
+            c.close()
+
+    def test_stale_and_missing_semantics_preserved(self):
+        from collections import deque
+
+        c = A.ChainHeadWindow(clock=lambda: 1000)
+        c.run_id = "stale-keep"
+        c.samples = {"robinhood": deque(maxlen=512)}
+        try:
+            c.add("robinhood", {"number": "0x64", "hash": "0x" + "aa" * 32}, "rpc-poll")
+            snap = c.snapshot("stale-keep", 4001)["robinhood"]
+            self.assertEqual(
+                snap["status"], "stale-head", "超龄样本如实 stale-head（不谎报新鲜）"
+            )
+            self.assertEqual(
+                c.snapshot("stale-keep", 4001)["robinhood"]["sampleAgeMs"], 3001
+            )
+            c2 = A.ChainHeadWindow(clock=lambda: 1000)
+            c2.run_id = "stale-keep"
+            c2.samples = {"robinhood": deque(maxlen=512)}
+            self.assertEqual(
+                c2.snapshot("stale-keep", 1300)["robinhood"]["status"],
+                "no-pre-anchor-head",
+            )
+            c2.close()
+        finally:
+            c.close()
+
+
+class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
+    """v10.5（2026-10-07，batch 1791324021620-3y0e1 审计）：按链轮询节拍（RH/Arc 200ms、
+    BSC 500ms）且快照/health 如实上报 intervalMs；WS newHeads 主端点失败后按序试
+    已知 WSS 的 fallback；WS 失败可见（headWs 诊断，无 secret）；429/错误退避。全程零网络。"""
+
+    def _evm_rpc(self):
+        chain = {"h": 100, "hash": "0x" + "aa" * 32}
+
+        def rpc(url, method, params, timeout=None):
+            chain["h"] += 1
+            parent = chain["hash"]
+            chain["hash"] = "0x" + f"{chain['h']:064x}"[-64:]
+            return {"number": hex(chain["h"]), "hash": chain["hash"], "parentHash": parent}
+
+        return rpc
+
+    def test_per_chain_cadence_and_snapshot_interval_metadata(self):
+        from collections import deque
+
+        self.assertEqual(A._head_poll_interval_s("robinhood"), 0.2)
+        self.assertEqual(A._head_poll_interval_s("arc"), 0.2)
+        self.assertEqual(A._head_poll_interval_s("bsc"), 0.5)
+        self.assertEqual(A._head_poll_interval_s("unknown-chain"), 0.5)
+        c = A.ChainHeadWindow(rpc_call=self._evm_rpc(), connect=None, clock=lambda: 1000)
+        c.run_id = "cadence"
+        c.samples = {k: deque(maxlen=512) for k in ("robinhood", "arc", "bsc", "solana")}
+        try:
+            snap = c.snapshot("cadence", 1100)
+            self.assertEqual(snap["robinhood"]["intervalMs"], 200)
+            self.assertEqual(snap["arc"]["intervalMs"], 200)
+            self.assertEqual(snap["bsc"]["intervalMs"], 500)
+            self.assertEqual(snap["solana"]["intervalMs"], 500)
+            self.assertEqual(snap["robinhood"]["status"], "no-pre-anchor-head", "其余语义不变")
+        finally:
+            c.close()
+
+    def test_poll_loop_runs_at_chain_cadence_and_reports_health(self):
+        calls = []
+        rpc = self._evm_rpc()
+
+        def counting(url, method, params, timeout=None):
+            calls.append(time.monotonic())
+            return rpc(url, method, params, timeout)
+
+        c = A.ChainHeadWindow(rpc_call=counting, connect=None)
+        c.run_id = "loop"
+        from collections import deque
+
+        c.samples = {"robinhood": deque(maxlen=512)}
+        t = threading.Thread(target=c._poll, args=("robinhood",), daemon=True)
+        t.start()
+        time.sleep(1.05)
+        c.stop.set()
+        t.join(timeout=2)
+        n = len(calls)
+        self.assertGreaterEqual(n, 4, f"200ms 节拍 1s 内应 ≥4 次（实得 {n}）")
+        self.assertLessEqual(n, 7, f"不超过 ~5 req/s（实得 {n}）")
+        d = c.diag_snapshot()
+        self.assertEqual(d["intervalMs"]["robinhood"], 200)
+        self.assertEqual(d["backoffMs"]["robinhood"], 0)
+        self.assertEqual(d["pollFail"], {})
+
+    def test_backoff_resets_when_poll_skipped_for_fresh_ws(self):
+        """Kimi v10.5 审查：失败后若因 WS 头新鲜而跳过轮询（未发请求），退避清零，
+        WS 再断时首轮按链节拍而非旧退避。"""
+        seq = [(False, 429), (False, 429), (None, None), (None, None)]
+        c = A.ChainHeadWindow(rpc_call=lambda *a, **k: None, connect=None)
+        c.run_id = "skip"
+        seen = []
+
+        def fake_once(chain):
+            r = seq.pop(0) if seq else (None, None)
+            with c.lock:
+                seen.append(c.diag["backoffMs"].get(chain, 0))
+            if not seq:
+                c.stop.set()
+            return r
+
+        c._poll_once = fake_once
+        waits = []
+        c.stop.wait = lambda w=None: waits.append(w) or c.stop.is_set()
+        c._poll("robinhood")
+        self.assertGreaterEqual(waits[1], 1.0, "连续 429 时退避")
+        self.assertLessEqual(waits[2], 0.2 + 1e-9, "跳过后退避清零，恢复 200ms 节拍")
+        self.assertEqual(c.diag_snapshot()["backoffMs"]["robinhood"], 0)
+
+    def test_backoff_on_429_and_errors(self):
+        self.assertEqual(A._head_poll_delay_s("robinhood", 0), 0.2)
+        self.assertEqual(A._head_poll_delay_s("robinhood", 1), 0.4)
+        self.assertEqual(A._head_poll_delay_s("robinhood", 2), 0.8)
+        self.assertGreaterEqual(A._head_poll_delay_s("robinhood", 1, 429), 1.0, "429 起步 ≥1s")
+        self.assertGreater(
+            A._head_poll_delay_s("robinhood", 2, 429), A._head_poll_delay_s("robinhood", 1, 429)
+        )
+        for n in (6, 20, 100):
+            self.assertLessEqual(A._head_poll_delay_s("bsc", n, 429), A.HEAD_POLL_BACKOFF_MAX_S)
+        # 轮询一轮：429 计 rateLimited，并给出退避延迟
+        from collections import deque
+
+        def limited(url, method, params, timeout=None):
+            raise A.RpcHttpError(429)
+
+        c = A.ChainHeadWindow(rpc_call=limited, connect=None, clock=lambda: 1000)
+        c.run_id = "rl"
+        c.samples = {"arc": deque(maxlen=512)}
+        try:
+            ok, status = c._poll_once("arc")
+            self.assertIs(ok, False)
+            self.assertEqual(status, 429)
+            d = c.diag_snapshot()
+            self.assertEqual(d["rateLimited"]["arc"], 1)
+            self.assertEqual(d["pollFail"]["arc"], 1)
+            self.assertIn("rpc http 429", d["lastErr"]["arc"], "旧文案保留")
+        finally:
+            c.close()
+        # 真实轮询循环：持续 429 时 1s 内调用次数受退避约束（不打满 5 req/s）
+        hits = []
+
+        def limited2(url, method, params, timeout=None):
+            hits.append(1)
+            raise A.RpcHttpError(429)
+
+        c2 = A.ChainHeadWindow(rpc_call=limited2, connect=None)
+        c2.run_id = "rl2"
+        c2.samples = {"robinhood": deque(maxlen=512)}
+        t = threading.Thread(target=c2._poll, args=("robinhood",), daemon=True)
+        t.start()
+        time.sleep(1.2)
+        snap = c2.diag_snapshot()
+        c2.stop.set()
+        t.join(timeout=6)
+        self.assertLessEqual(len(hits), 2, f"429 退避：1.2s 内 ≤2 次（实得 {len(hits)}）")
+        self.assertGreaterEqual(snap["backoffMs"]["robinhood"], 1000)
+
+    def test_keepalive_does_not_retry_http_429(self):
+        calls = []
+
+        class C:
+            def request(self, *a, **k):
+                calls.append(1)
+
+            def getresponse(self):
+                class R:
+                    status = 429
+
+                    def read(self):
+                        return b"{}"
+
+                return R()
+
+            def close(self):
+                pass
+
+        ka = A.KeepAliveJsonRpc("https://rpc.example/")
+        ka._connect = lambda: setattr(ka, "_conn", C())
+        with self.assertRaises(A.RpcHttpError) as cm:
+            ka("eth_getBlockByNumber", ["latest", False])
+        self.assertEqual(cm.exception.status, 429)
+        self.assertEqual(len(calls), 1, "HTTP 拒绝不立即重试（不加倍打限流端点）")
+
+    def test_ws_url_order_is_primary_then_known_wss_fallbacks(self):
+        rh = A._head_ws_urls("robinhood")
+        self.assertEqual(rh[0], "wss://rpc.mainnet.chain.robinhood.com", "主端点先试（旧行为）")
+        self.assertEqual(
+            rh[1:],
+            ["wss://robinhood-rpc.publicnode.com", "wss://robinhood.rpc.blxrbdn.com"],
+            "只派生已知 WSS 提供方；pocket.network 不臆造 wss",
+        )
+        bsc = A._head_ws_urls("bsc")
+        self.assertEqual(bsc, ["wss://bsc-dataseed1.binance.org", "wss://bsc-rpc.publicnode.com"])
+        self.assertEqual(A._head_ws_urls("arc"), ["wss://rpc.mainnet.arc.io"], "arc 无已知 WSS fallback")
+        for u in rh + bsc:
+            self.assertTrue(u.startswith("wss://"))
+        # 点边界：同后缀异主机不误判
+        orig = A.CHAINS["robinhood"]["rpcFallbacks"]
+        try:
+            A.CHAINS["robinhood"]["rpcFallbacks"] = ["https://evilpublicnode.com", "https://x.publicnode.com"]
+            self.assertEqual(
+                A._head_ws_urls("robinhood")[1:], ["wss://x.publicnode.com"]
+            )
+        finally:
+            A.CHAINS["robinhood"]["rpcFallbacks"] = orig
+
+    def test_ws_failure_diag_and_fallback_attempt_order(self):
+        from collections import deque
+
+        tried = []
+        head = {"h": 0x64, "hash": "0x" + "aa" * 32}
+
+        class InvalidStatus(Exception):
+            def __init__(self, code):
+                super().__init__(f"server rejected WebSocket connection: HTTP {code}")
+
+                class Resp:
+                    status_code = code
+
+                self.response = Resp()
+
+        class FakeWS:
+            def __init__(self, owner):
+                self.owner = owner
+                self.queue = [json.dumps({"jsonrpc": "2.0", "id": 1, "result": "0xsub"})]
+                for i in range(3):
+                    head["h"] += 1
+                    parent = head["hash"]
+                    head["hash"] = "0x" + f"{head['h']:064x}"[-64:]
+                    self.queue.append(json.dumps({
+                        "jsonrpc": "2.0", "method": "eth_subscription",
+                        "params": {"subscription": "0xsub", "result": {
+                            "number": hex(head["h"]), "hash": head["hash"], "parentHash": parent}},
+                    }))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def send(self, data):
+                sub = json.loads(data)
+                assert sub["method"] == "eth_subscribe" and sub["params"] == ["newHeads"]
+
+            def recv(self, timeout=None):
+                if self.queue:
+                    return self.queue.pop(0)
+                self.owner.stop.set()
+                raise TimeoutError()
+
+            def close(self):
+                pass
+
+        holder = {}
+
+        def connect(url, **kw):
+            tried.append(url)
+            if "chain.robinhood.com" in url:
+                raise InvalidStatus(403)
+            if "publicnode" in url:
+                raise ConnectionRefusedError("refused")
+            return FakeWS(holder["c"])
+
+        c = A.ChainHeadWindow(rpc_call=lambda *a, **k: None, connect=connect)
+        holder["c"] = c
+        c.run_id = "wsfb"
+        c.samples = {"robinhood": deque(maxlen=512)}
+        with patch.object(A, "HEAD_WS_RETRY_S", 0.01):
+            t = threading.Thread(target=c._ws, args=("robinhood",), daemon=True)
+            t.start()
+            t.join(timeout=5)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(
+            tried,
+            [
+                "wss://rpc.mainnet.chain.robinhood.com",
+                "wss://robinhood-rpc.publicnode.com",
+                "wss://robinhood.rpc.blxrbdn.com",
+            ],
+            "主端点 → publicnode → blxrbdn 顺序",
+        )
+        d = c.ws_diag_snapshot()
+        self.assertEqual(d["attempts"]["robinhood"], 3)
+        self.assertEqual(d["fail"]["robinhood"], 2, "两次失败均可见（不再静默）")
+        self.assertEqual(d["subscribed"]["robinhood"], 1)
+        self.assertEqual(d["active"]["robinhood"], "robinhood.rpc.blxrbdn.com")
+        self.assertEqual(
+            d["lastErr"]["robinhood"], "robinhood-rpc.publicnode.com: ConnectionRefusedError"
+        )
+        blob = json.dumps(d)
+        self.assertNotIn("wss://", blob, "诊断只记 host，不记 URL")
+        self.assertNotIn("refused", blob, "不记异常消息体")
+
+    def test_ws_primary_403_diag_class_and_status(self):
+        from collections import deque
+
+        class InvalidStatus(Exception):
+            pass
+
+        e = InvalidStatus("HTTP 403 body token=secret")
+
+        class Resp:
+            status_code = 403
+
+        e.response = Resp()
+        self.assertEqual(A._ws_err_class(e), "InvalidStatus:403")
+        c = A.ChainHeadWindow(rpc_call=lambda *a, **k: None, connect=None)
+        c.samples = {"arc": deque(maxlen=512)}
+        c._ws_fail("arc", "rpc.mainnet.arc.io", A._ws_err_class(e))
+        snap = c.ws_diag_snapshot()
+        self.assertEqual(snap["lastErr"]["arc"], "rpc.mainnet.arc.io: InvalidStatus:403")
+        self.assertNotIn("secret", json.dumps(snap))
+        self.assertIsNone(snap["active"]["arc"])
+
+    def test_ws_subscribe_error_rotates_with_diag(self):
+        from collections import deque
+
+        tried = []
+
+        class ErrWS:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def send(self, data):
+                pass
+
+            def recv(self, timeout=None):
+                return json.dumps({"jsonrpc": "2.0", "id": 1, "error": {"code": -32601, "message": "x"}})
+
+            def close(self):
+                pass
+
+        holder = {}
+
+        def connect(url, **kw):
+            tried.append(url)
+            if len(tried) >= 3:
+                holder["c"].stop.set()
+            return ErrWS()
+
+        c = A.ChainHeadWindow(rpc_call=lambda *a, **k: None, connect=connect)
+        holder["c"] = c
+        c.samples = {"bsc": deque(maxlen=512)}
+        with patch.object(A, "HEAD_WS_RETRY_S", 0.01), patch.object(
+            A, "HEAD_WS_CYCLE_BACKOFF_S", (0.01, 0.02)
+        ):
+            t = threading.Thread(target=c._ws, args=("bsc",), daemon=True)
+            t.start()
+            t.join(timeout=5)
+        self.assertEqual(
+            tried[:3],
+            ["wss://bsc-dataseed1.binance.org", "wss://bsc-rpc.publicnode.com", "wss://bsc-dataseed1.binance.org"],
+            "整轮失败后回到主端点（循环退避）",
+        )
+        d = c.ws_diag_snapshot()
+        self.assertGreaterEqual(d["fail"]["bsc"], 2)
+        self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
+
+    def test_health_exposes_head_ws_and_version(self):
+        self.assertEqual(A.ADDON_VERSION, "2026.10.22-sol-multisource-head-v10.15")
+        src = Path(A.__file__).read_text(encoding="utf-8")
+        self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
+
+
+class TestArcSupport(unittest.TestCase):
+    def test_arc_identity_and_frozen_head(self):
+        from collections import deque
+        for body in [{"chain":"arc"}, {"chainId":5042}, {"chainId":"0x13b2"}]:
+            self.assertEqual(A._chain_from_text(json.dumps(body)), "arc")
+        self.assertEqual(A._receipt_candidates("arc", "0x"+"aa"*32), ["arc"])
+        self.assertIn("arc", A._receipt_candidates(None, "0x"+"aa"*32))
+        now = [1000]
+        c = A.ChainHeadWindow(clock=lambda: now[0])
+        c.run_id = "arc-synthetic"
+        c.samples = {"arc": deque(maxlen=512)}
+        c.add("arc", {"number":"0x64", "hash":"0x"+"aa"*32}, "ws-head")
+        snap = c.snapshot("arc-synthetic", 1100)["arc"]
+        self.assertEqual(snap["height"], 100)
+        self.assertEqual(snap["anchor"], "proxy-order-request")
+        self.assertEqual(snap["vantage"], "hk")
+        now[0] = 1200
+        c.add("arc", {"number":"0x65", "hash":"0x"+"bb"*32}, "ws-head")
+        self.assertEqual(snap["height"],100)
+        self.assertEqual(c.snapshot("other",1300), {})
+        c.close()
+
+
+
+class TestExactBroadcastAnchors(unittest.TestCase):
+    # v8（2026-09-19）：广播请求体数学推导身份（keccak256(raw)/solana 首签名）请求侧入锚。
+    # 夹具默认 tx = 夹具请求体的推导 hash（与生产一致——响应 hash 与请求体恒等）；
+    # 显式 tx 且不配体 = 刻意冲突场景。solana 夹具体 "A"*128（96 个零字节，sigCount=0）
+    # 无请求侧身份 → 保持响应驱动路径覆盖；请求侧 solana 身份由专门测试的 wire 体覆盖。
+    EVM_BODY = "0x" + "12" * 100
+
+    def setUp(self):
+        fresh()
+        self.H = A._evm_raw_tx_hash(self.EVM_BODY)
+        self.clock = time.monotonic() * 1000 + 10
+        self.head = 40
+        from unittest.mock import patch
+        for target, replacement in [
+            ("_mono_ms", lambda: self.clock),
+            ("_poll_receipt", lambda *_: None),
+        ]:
+            p = patch.object(A, target, replacement); p.start(); self.addCleanup(p.stop)
+        p = patch.object(A.HEADS, "snapshot", lambda rid, t: {c: {
+            "version": 1, "chain": c, "epoch": rid, "height": self.head,
+            "anchorTs": t, "observedTs": t - 1, "sampleAgeMs": 1,
+        } for c in A.CHAINS}); p.start(); self.addCleanup(p.stop)
+        self.run = "broadcast-window"
+        A.STORE.mark_open(self.run, manifest={"version": 1, "runId": self.run, "legs": [
+            {"platform": "okx", "chain": c, "rounds": 2} for c in A.CHAINS]})
+        self.clock += 100
+
+    def raw(self, chain="bsc", tx=None, request_id=1, body=None):
+        if chain == "solana":
+            tx = tx or "3" * 88
+            f = FakeFlow("hongkong.solana.blockrazor.io", "/v2/sendTransaction?auth=synthetic-secret",
+                         req_body=body or "A" * 128, resp_body=tx)
+        else:
+            host = {"bsc": "okx.bscnetwork.blockrazor.io", "arc": "rpc.mainnet.arc.io",
+                    "robinhood": "rpc.mainnet.chain.robinhood.com"}[chain]
+            body = body or self.EVM_BODY
+            tx = tx or A._evm_raw_tx_hash(body)  # 响应 hash 与请求体一致（生产恒等）
+            f = FakeFlow(host, "/", req_body=json.dumps({"jsonrpc": "2.0", "id": request_id,
+                "method": "eth_sendRawTransaction", "params": [body]}),
+                resp_body=json.dumps({"jsonrpc": "2.0", "id": request_id, "result": tx}))
+        f.request.headers = {"origin": "https://web3.okx.com"}
+        f.response.status_code = 200
+        return f
+
+    def platform(self, chain="bsc", tx=None, oid="order-one"):
+        cid = {"bsc": 56, "robinhood": 4663, "arc": 5042, "solana": 501}[chain]
+        return FakeFlow("web3.okx.com", "/priapi/v6/dx/trade/multi/broadcast",
+            req_body=json.dumps({"chainId": cid, "signedInfoList": [{"txHash": tx or self.H}], "orderId": oid}),
+            resp_body=json.dumps({"code": "0", "data": {"transactionHash": tx or self.H, "orderId": oid}}))
+
+    def success(self, tx=None):
+        return ws_frame("wsdexpri.okx.com", json.dumps({"arg": {"channel": "dex-swap-order-info"},
+            "data": {"dexData": {"status": "1", "orderId": "order-one", "transactionHash": tx or self.H}}}))
+
+    # v10.13：approve+swap batchBroadcast 夹具——合成签名交易（RLP 编码，签名值为合成常量）
+    @staticmethod
+    def _rlp(x):
+        if isinstance(x, list):
+            body = b"".join(TestExactBroadcastAnchors._rlp(i) for i in x)
+            return (bytes([0xC0 + len(body)]) if len(body) < 56 else
+                    bytes([0xF7 + (len(len(body).to_bytes(8, "big").lstrip(b"\0")))]) + len(body).to_bytes(8, "big").lstrip(b"\0")) + body
+        if len(x) == 1 and x[0] < 0x80:
+            return x
+        return (bytes([0x80 + len(x)]) if len(x) < 56 else
+                bytes([0xB7 + len(len(x).to_bytes(8, "big").lstrip(b"\0"))]) + len(x).to_bytes(8, "big").lstrip(b"\0")) + x
+
+    @classmethod
+    def signed_tx(cls, data_hex, to="22" * 20, nonce=7, kind=2):
+        to_b, data = bytes.fromhex(to), bytes.fromhex(data_hex)
+        sig = [b"\x01", b"\x33" * 32, b"\x44" * 32]
+        if kind == 2:
+            body = [b"\x13\xb2", bytes([nonce]), b"\x01", b"\x02", b"\x52\x08", to_b, b"", data, []] + sig
+            return "0x02" + cls._rlp(body).hex()
+        if kind == 1:
+            body = [b"\x13\xb2", bytes([nonce]), b"\x02", b"\x52\x08", to_b, b"", data, []] + sig
+            return "0x01" + cls._rlp(body).hex()
+        body = [bytes([nonce]), b"\x02", b"\x52\x08", to_b, b"", data] + sig
+        return "0x" + cls._rlp(body).hex()
+
+    APPROVE_DATA = "095ea7b3" + "00" * 12 + "33" * 20 + "ff" * 32
+    SWAP_DATA = "0c307f76" + "ab" * 96
+
+    def batch_body(self, rows, simulate=True):
+        return json.dumps({"simulate": simulate, "chainId": 5042, "transactions": [
+            {"signedTx": r, "transactionHash": A._evm_raw_tx_hash(r), "orderId": f"order-{i}", "callDataOut": {}}
+            for i, r in enumerate(rows)]})
+
+    def batch(self, rows):
+        # 服务端广播：响应不含 tx hash（live 1792392759676-amyi4 arc/okx r4 形状）
+        return FakeFlow("web3.okx.com", "/priapi/v6/dx/trade/multi/batchBroadcast",
+            req_body=self.batch_body(rows), resp_body=json.dumps({"code": "0", "data": [{"orderId": "order-1"}]}))
+
+    def test_batch_broadcast_ids_pick_the_single_signed_swap(self):
+        approve, swap = self.signed_tx(self.APPROVE_DATA, nonce=7), self.signed_tx(self.SWAP_DATA, nonce=8)
+        ids = A._okx_broadcast_request_ids(self.batch_body([approve, swap]))
+        self.assertEqual(ids, {"txHash": A._evm_raw_tx_hash(swap), "orderId": "order-1"})
+        self.assertEqual(A._okx_broadcast_request_ids(self.batch_body([swap]))["txHash"], A._evm_raw_tx_hash(swap))
+        for kind in (0, 1):  # legacy / EIP-2930 envelopes decode too
+            sw = self.signed_tx(self.SWAP_DATA, kind=kind)
+            self.assertEqual(A._evm_signed_tx_call(sw)["selector"], "0x0c307f76", kind)
+            self.assertEqual(A._okx_broadcast_request_ids(self.batch_body([self.signed_tx(self.APPROVE_DATA, kind=kind), sw]))["txHash"],
+                             A._evm_raw_tx_hash(sw))
+
+    def test_batch_broadcast_ids_fail_closed(self):
+        approve, swap, swap2 = (self.signed_tx(self.APPROVE_DATA), self.signed_tx(self.SWAP_DATA, nonce=8),
+                                self.signed_tx(self.SWAP_DATA, nonce=9))
+        self.assertEqual(A._okx_broadcast_request_ids(self.batch_body([approve])), {}, "no swap")
+        self.assertEqual(A._okx_broadcast_request_ids(self.batch_body([swap, swap2])), {}, "two swaps")
+        lying = json.loads(self.batch_body([approve, swap]))
+        lying["transactions"][1]["transactionHash"] = "0x" + "9" * 64
+        self.assertEqual(A._okx_broadcast_request_ids(json.dumps(lying)), {}, "claimed hash != keccak(signed)")
+        bad = json.loads(self.batch_body([approve, swap]))
+        bad["transactions"][1]["signedTx"] = "0x02" + "ff" * 40
+        bad["transactions"][1]["transactionHash"] = A._evm_raw_tx_hash(bad["transactions"][1]["signedTx"])
+        self.assertEqual(A._okx_broadcast_request_ids(json.dumps(bad)), {}, "undecodable signed tx")
+        self.assertEqual(A._okx_broadcast_request_ids(json.dumps({"transactions": "x"})), {})
+
+    def test_batch_broadcast_leg_gets_swap_identity_and_success(self):
+        approve, swap = self.signed_tx(self.APPROVE_DATA, nonce=7), self.signed_tx(self.SWAP_DATA, nonce=8)
+        tx = A._evm_raw_tx_hash(swap)
+        f = self.batch([approve, swap]); t0 = self.clock
+        A.addons[0].request(f)
+        self.clock += 40
+        A.addons[0].response(f)
+        self.clock += 200
+        A.addons[0].websocket_message(ws_frame("wsdexpri.okx.com", json.dumps({"arg": {"channel": "dex-swap-order-info"},
+            "data": {"dexData": {"status": "1", "orderId": "order-1", "transactionHash": tx}}})))
+        formal = [x for x in A.STORE.legs[self.run] if not x["dup"]]
+        self.assertEqual(len(formal), 1)
+        leg = formal[0]
+        self.assertEqual(leg["tOrderOutMs"], t0)
+        tl = A.STORE.timeline(self.run, full=True)
+        row = next(x for x in tl["legs"] if x["anchorRole"] == "order" and not x["dup"])
+        self.assertEqual(row["txHash"], tx, "swap tx identity on the leg (EU exact-identity rebind works)")
+        self.assertEqual(row["hkL1aMs"], 240)
+        self.assertNotIn(swap[4:40], json.dumps(tl), "signed raw never persisted")
+
+    def test_delayed_raw_ack_rehomes_success_and_original_head(self):
+        early = self.raw(); t0 = self.clock
+        A.addons[0].request(early)
+        self.clock += 10
+        A.addons[0].websocket_message(self.success())
+        success_t = self.clock
+        self.clock += 1000; self.head = 50
+        late = self.platform(); A.addons[0].request(late); A.addons[0].response(late)
+        # v8：请求侧推导身份（keccak(raw)）在请求到达时已入锚——早到成功帧按身份
+        # 直接路由到 send 腿（保留源时间），不再等 raw-flow 响应缓冲重审。
+        self.assertFalse(A.STORE.ws_buffer.get(self.run), "请求侧身份在场——早到成功帧直接路由，不进缓冲")
+        self.clock += 300
+        A.addons[0].response(early)
+        formal = [x for x in A.STORE.legs[self.run] if not x['dup']]
+        self.assertEqual(len(formal), 1)
+        leg = formal[0]
+        self.assertEqual(leg['tOrderOutMs'], t0)
+        self.assertEqual(leg['tSuccessPushMs'], success_t)
+        self.assertEqual(leg['_headSnapshots']['bsc']['height'], 40)
+        self.assertEqual(leg['_headSnapshots']['bsc']['anchorTs'], t0)
+        tl = A.STORE.timeline(self.run, full=True)
+        row = next(x for x in tl['legs'] if x['anchorRole'] == 'order' and not x['dup'])
+        self.assertEqual(row['hkL1aMs'], 10)
+        self.assertEqual(row['orderRequestSource'], 'okx-evm-send')
+        self.assertEqual(tl['counts']['attempted'], 1)
+        self.assertNotIn('synthetic-secret', json.dumps(tl))
+        self.assertNotIn('121212121212121212121212', json.dumps(tl))
+
+    def test_each_chain_fanout_uses_one_slot_and_ack_is_not_success(self):
+        for chain in A.CHAINS:
+            # v8：EVM 身份 = 请求体推导（keccak256(raw)）——每链独立体得独立 hash；
+            # solana 夹具体无请求侧身份（sigCount=0），走响应驱动路径
+            body = None if chain == "solana" else "0x" + {"bsc": "aa", "arc": "bb", "robinhood": "cc"}[chain] * 100
+            tx = "3" * 88 if chain == "solana" else A._evm_raw_tx_hash(body)
+            for _ in range(4):
+                f = self.raw(chain, body=body); A.addons[0].request(f); A.addons[0].response(f); self.clock += 1
+            p = self.platform(chain, tx); A.addons[0].request(p); A.addons[0].response(p)
+            legs = [x for x in A.STORE.legs[self.run] if x.get('chain') == chain and not x['dup']]
+            self.assertEqual(len(legs), 1, chain)
+            self.assertIsNone(legs[0]['tSuccessPushMs'], 'RPC acceptance is never platform success')
+            self.assertEqual(legs[0]['txHash'], tx)
+        self.assertEqual(A.STORE.timeline(self.run)['counts']['attempted'], 4)
+
+    def test_no_origin_wrong_endpoint_response_or_id_cannot_supply_identity(self):
+        for change in [lambda f: f.request.headers.clear(), lambda f: setattr(f.request, 'pretty_host', 'okx.bscnetwork.blockrazor.io.evil.invalid'),
+                       lambda f: setattr(f.request, 'method', 'OPTIONS'), lambda f: setattr(f.request, 'path', '/credential-path'), lambda f: setattr(f.request, '_body', '{"method":"eth_call"}')]:
+            f=self.raw(); change(f); A.addons[0].request(f); self.assertNotIn('speedex_leg', f.metadata)
+        derived = A._evm_raw_tx_hash(self.EVM_BODY)
+        # v8：请求侧推导身份在窗口内即入锚（合法）——响应侧的拒绝门管的是「晋升」：
+        # 非 200 / 响应 id 不配 → 不晋升（传输/流完整性失败 ≠ 受理）；attempted 不变
+        for change in [lambda f: setattr(f.response, 'status_code', 500),
+                       lambda f: setattr(f.response, '_body', json.dumps({'jsonrpc':'2.0','id':2,'result':derived}))]:
+            f=self.raw(); change(f); A.addons[0].request(f); A.addons[0].response(f)
+            self.assertEqual(f.metadata['speedex_leg'][0]['_anchor'], {'txHash': derived})
+            self.assertEqual(f.metadata['speedex_leg'][0]['anchorRole'], 'send', '拒绝门：不晋升')
+        self.assertEqual(A.STORE.timeline(self.run)['counts']['observed'], 0)
+        self.assertEqual(A.STORE.timeline(self.run)['counts']['attempted'], 0)
+
+    def test_rpc_error_with_matched_id_still_promotes_request_derived_identity(self):
+        """v8 新增：HTTP 200 + JSON-RPC error（already known/nonce too low 等，id 匹配）
+        = 端点已处理本请求——请求侧推导身份晋升照常（RH 实证形态：错误响应无 hash）。"""
+        f = self.raw()
+        f.response._body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'error': {'code': -32000, 'message': 'already known'}})
+        A.addons[0].request(f); A.addons[0].response(f)
+        leg = f.metadata['speedex_leg'][0]
+        self.assertEqual(leg['anchorRole'], 'order')
+        self.assertEqual(leg['txHash'], A._evm_raw_tx_hash(self.EVM_BODY))
+        self.assertEqual(A.STORE.timeline(self.run)['counts']['attempted'], 1)
+
+    def test_unconfirmed_earlier_broadcast_never_leaves_a_shorter_qualified_timer(self):
+        raw = self.raw(); A.addons[0].request(raw)
+        self.clock += 1000
+        late = self.platform(); A.addons[0].request(late); A.addons[0].response(late)
+        self.clock += 10; A.addons[0].websocket_message(self.success())
+        tl = A.STORE.timeline(self.run, full=True)
+        row = next(x for x in tl['legs'] if x.get('anchorRole') == 'order' and not x.get('dup'))
+        self.assertIsNone(row['hkL1aMs'])
+        self.assertEqual(row['incomplete'], 'broadcast-anchor-unconfirmed')
+        self.assertEqual(row['chainHead']['status'], 'broadcast-anchor-unconfirmed')
+        A.addons[0].response(raw)
+        tl = A.STORE.timeline(self.run, full=True)
+        row = next(x for x in tl['legs'] if x.get('anchorRole') == 'order' and not x.get('dup'))
+        self.assertEqual(row['hkL1aMs'], 1010)
+
+    def test_many_reverse_ack_transfers_flatten_aliases_and_keep_first_head(self):
+        flows = []
+        for i in range(12):
+            f = self.raw(request_id=i); A.addons[0].request(f); flows.append(f); self.clock += 1
+        for f in reversed(flows):
+            A.addons[0].response(f)
+        first = flows[0].metadata['speedex_leg'][0]
+        self.assertTrue(all(x.get('_dupOf') is first for x in A.STORE.legs[self.run] if x is not first))
+        self.assertEqual(A.STORE.timeline(self.run)['counts']['attempted'], 1)
+        self.assertTrue(first['receiptPolling'])
+        self.assertEqual(sum(bool(x['receiptPolling']) for x in A.STORE.legs[self.run]), 1)
+
+    def test_same_hash_conflicting_order_or_chain_is_not_deduplicated(self):
+        a=self.platform(oid='order-one'); A.addons[0].request(a)
+        b=self.platform(oid='order-two'); A.addons[0].request(b)
+        c=self.platform(chain='arc'); A.addons[0].request(c)
+        self.assertTrue(all(not x['dup'] for x in A.STORE.legs[self.run]))
+
+    def test_hook_snapshot_precedes_parse_and_closed_window_rejects_ack(self):
+        f=self.raw(); original=f.request.get_text
+        def slow_parse():
+            self.head=70
+            return original()
+        f.request.get_text=slow_parse
+        A.addons[0].request(f)
+        leg=f.metadata['speedex_leg'][0]
+        self.assertEqual(leg['_headSnapshots']['bsc']['height'],40)
+        A.STORE.mark_close(self.run)
+        A.STORE.mark_open(self.run)
+        A.addons[0].response(f)
+        self.assertEqual(leg['_anchor'], {'txHash': A._evm_raw_tx_hash(self.EVM_BODY)},
+            '请求侧推导身份在开窗时合法入锚；关窗+重开后的迟到 ack 不再写锚（仍只读）')
+
+
+class TestRequestSideBroadcastIdentity(unittest.TestCase):
+    """v8（2026-09-19）：广播请求体数学推导身份原语钉死——keccak256 公开向量 /
+    well-formed EVM raw 夹具（noble 对拍）/ solana wire 首签名夹具（b58 对拍）。
+    生产正确性另经真实链上重构验证：BSC legacy 与 Arc EIP-1559 落链 tx 由 RPC 字段
+    重建 raw 后 keccak256 == 链上 hash；solana getTransaction(base64) 首签名逐字节回读。"""
+
+    def test_keccak256_vectors(self):
+        self.assertEqual(A._keccak256(b"").hex(),
+            "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")
+        self.assertEqual(A._keccak256(b"abc").hex(),
+            "4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45")
+        # 跨 rate 块（512B > 136B）防单块假设
+        self.assertEqual(A._keccak256(bytes(range(256)) * 2).hex(),
+            "f55ba327291604f0e5be6651752398b7be2331aad65f5763ce067df95cc13be1")
+
+    def test_evm_raw_tx_hash_fixture(self):
+        raw = ("0xf8682a8504a817c80182520894ece5ca8bf9220718e5727754026757512212cb3c825f5e80"
+               "822788a01111111111111111111111111111111111111111111111111111111111111111"
+               "a02222222222222222222222222222222222222222222222222222222222222222")
+        self.assertEqual(A._evm_raw_tx_hash(raw),
+            "0x832757d7e834f3027de0a40d5fcdfcee575d8510bd72bff7a8f65da0aba68b26")
+        for bad in [None, "", "0x", "0xzz", "0x1234", 123]:
+            self.assertIsNone(A._evm_raw_tx_hash(bad), bad)
+
+    def test_sol_wire_first_sig_fixture(self):
+        b64 = ("AQMKERgfJi00O0JJUFdeZWxzeoGIj5adpKuyucDHztXc4+rx+P8GDRQbIikwNz5FTFNa"
+               "YWhvdn2Ei5KZoKeutbyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqg==")
+        self.assertEqual(A._sol_wire_first_sig(b64),
+            "4XR92Zct9ZodXzisJ4kov3upmTvMotYVrg65MHP8aoCjSPJwUa7vjaXK5VhDF7ZiiF16v7cY5BPazCLnVqZ3yzb")
+        for bad in ["", "!!!", "AAAA", None]:
+            self.assertIsNone(A._sol_wire_first_sig(bad), bad)
+
+    # v10.14：v1 交易（首字节 129，签名在消息之后）。跨语言向量 = speedex
+    # tests/helpers/sol-tx-v1-wire.mjs 合成字节 + scripts/lib/sol-tx-v1.mjs solTxV1FirstSignature 结果；
+    # 实链向量 = 主网 v1 交易 getTransaction(encoding base64) 原样字节，签名 = 链上回读。
+    def test_sol_wire_first_sig_v1(self):
+        import json as _json
+        vec = _json.loads(Path(__file__).with_name("tests").joinpath("fixtures", "sol-tx-v1-vectors.json").read_text())
+        for name, v in vec["synthetic"].items():
+            self.assertEqual(A._sol_wire_first_sig(v["b64"]), v["sig"], name)
+        real = vec["mainnet"]
+        self.assertEqual(A._sol_wire_first_sig(real["b64"]), real["sig"], "主网 v1 交易首签名 = 链上回读")
+        # 旧实现把 129 当 compact-u16 签名数——实链字节首字节确为 129（v1 分支必经）
+        self.assertEqual(__import__("base64").b64decode(real["b64"])[0], 129)
+
+    def test_sol_v1_first_sig_rejects(self):
+        import base64 as _b64
+        vec = __import__("json").loads(Path(__file__).with_name("tests").joinpath("fixtures", "sol-tx-v1-vectors.json").read_text())
+        good = bytearray(_b64.b64decode(vec["synthetic"]["signed"]["b64"]))
+        self.assertIsNotNone(A._sol_v1_first_sig(bytes(good)))
+        self.assertIsNone(A._sol_v1_first_sig(bytes(good) + b"\x00"), "trailing data")
+        self.assertIsNone(A._sol_v1_first_sig(bytes(good[:-64])), "bare message: no signature")
+        zero = bytes(good[:-64]) + bytes(64)
+        self.assertIsNone(A._sol_v1_first_sig(zero), "all-zero placeholder signature")
+        bad_mask = bytearray(good); bad_mask[4] = 0b01  # priority fee bit 0 without bit 1
+        self.assertIsNone(A._sol_v1_first_sig(bytes(bad_mask)), "priority fee needs bits 0 and 1")
+        no_signer = bytearray(good); no_signer[1] = 0
+        self.assertIsNone(A._sol_v1_first_sig(bytes(no_signer)), "no required signature")
+        self.assertIsNone(A._sol_v1_first_sig(bytes(good[:20])), "truncated")
+        self.assertIsNone(A._sol_v1_first_sig(b"\x81" + bytes(5000)), "over 4096 bytes")
+        for k in ("bare", "trailing"):
+            self.assertIsNone(A._sol_wire_first_sig(vec["synthetic_reject"][k]), k)
+
+    def test_request_classification_carries_derived_identity(self):
+        # EVM：eth_sendRawTransaction 分类结果带 reqTxHash（体推导），不写签名原文
+        raw = ("0xf8682a8504a817c80182520894ece5ca8bf9220718e5727754026757512212cb3c825f5e80"
+               "822788a01111111111111111111111111111111111111111111111111111111111111111"
+               "a02222222222222222222222222222222222222222222222222222222222222222")
+        out = A._okx_rpc_request("rpc.mainnet.chain.robinhood.com", "/", "POST",
+            {"origin": "https://web3.okx.com"},
+            json.dumps({"jsonrpc": "2.0", "id": 7, "method": "eth_sendRawTransaction", "params": [raw]}))
+        self.assertEqual(out["reqTxHash"], "0x832757d7e834f3027de0a40d5fcdfcee575d8510bd72bff7a8f65da0aba68b26")
+        self.assertEqual(out["chain"], "robinhood")
+        # solana：bare base64 体
+        out2 = A._okx_rpc_request("hongkong.solana.blockrazor.io", "/v2/sendTransaction", "POST",
+            {"origin": "https://web3.okx.com"},
+            "AQMKERgfJi00O0JJUFdeZWxzeoGIj5adpKuyucDHztXc4+rx+P8GDRQbIikwNz5FTFNa"
+            "YWhvdn2Ei5KZoKeutbyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqg==")
+        self.assertEqual(out2["reqTxHash"],
+            "4XR92Zct9ZodXzisJ4kov3upmTvMotYVrg65MHP8aoCjSPJwUa7vjaXK5VhDF7ZiiF16v7cY5BPazCLnVqZ3yzb")
+
+
+class TestIdentifiedSendNoPoison(unittest.TestCase):
+    """v8 回归（RH/SOL 实证事故形）：R1 广播经请求侧身份晋升后，R2 订单不再被
+    「更早未识别 send」毒化（broadcast-anchor-unconfirmed 不再批量出现）。"""
+
+    def setUp(self):
+        fresh()
+        self.clock = time.monotonic() * 1000 + 10
+        from unittest.mock import patch
+        for target, replacement in [("_mono_ms", lambda: self.clock), ("_poll_receipt", lambda *_: None)]:
+            p = patch.object(A, target, replacement); p.start(); self.addCleanup(p.stop)
+        p = patch.object(A.HEADS, "snapshot", lambda rid, t: {c: {
+            "version": 1, "chain": c, "epoch": rid, "height": 40, "anchorTs": t,
+            "observedTs": t - 1, "sampleAgeMs": 1} for c in A.CHAINS})
+        p.start(); self.addCleanup(p.stop)
+        self.run = "no-poison-window"
+        A.STORE.mark_open(self.run, manifest={"version": 1, "runId": self.run, "legs": [
+            {"platform": "okx", "chain": "robinhood", "rounds": 2}]})
+        self.clock += 100
+
+    def test_identified_earlier_send_does_not_poison_later_orders(self):
+        body1 = "0x" + "12" * 100
+        tx1 = A._evm_raw_tx_hash(body1)
+        # R1：send 请求 + 200 error 响应（already known —— RH 实证形态）→ 请求侧身份晋升
+        r1 = FakeFlow("rpc.mainnet.chain.robinhood.com", "/",
+            req_body=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction", "params": [body1]}),
+            resp_body=json.dumps({"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "already known"}}))
+        r1.request.headers = {"origin": "https://web3.okx.com"}
+        r1.response.status_code = 200
+        A.addons[0].request(r1); A.addons[0].response(r1)
+        send_leg = r1.metadata["speedex_leg"][0]
+        self.assertEqual(send_leg["anchorRole"], "order", "请求侧身份 + id 匹配的 error 响应 → 晋升")
+        self.clock += 1000
+        # R2：另一 tx 的平台订单 + 成功帧——不再被 R1 的 send 毒化
+        body2 = "0x" + "34" * 100
+        tx2 = A._evm_raw_tx_hash(body2)
+        p2 = FakeFlow("web3.okx.com", "/priapi/v6/dx/trade/multi/broadcast",
+            req_body=json.dumps({"chainId": 4663, "signedInfoList": [{"txHash": tx2}], "orderId": "order-two"}),
+            resp_body=json.dumps({"code": "0", "data": {"transactionHash": tx2, "orderId": "order-two"}}))
+        p2.request.headers = {"origin": "https://web3.okx.com"}
+        p2.response.status_code = 200
+        A.addons[0].request(p2); A.addons[0].response(p2)
+        self.clock += 10
+        A.addons[0].websocket_message(ws_frame("wsdexpri.okx.com", json.dumps(
+            {"arg": {"channel": "dex-swap-order-info"},
+             "data": {"dexData": {"status": "1", "orderId": "order-two", "transactionHash": tx2}}})))
+        tl = A.STORE.timeline(self.run, full=True)
+        row = next(x for x in tl["legs"] if x.get("txHash") == tx2 and not x.get("dup"))
+        self.assertIsNone(row["incomplete"], "已晋升的早期 send 不再毒化后续订单")
+        self.assertEqual(row["hkL1aMs"], 10)
+
+    def test_responseless_send_promotes_on_receipt_settle(self):
+        """v9 回归（cjxmw 实证形）：OKX 页扇出中止 → 响应永不到达（tFirstRespMs
+        恒 null）；请求侧身份 + receipt 落定 = 受理证据 → 晋升，后续订单不毒化。"""
+        body1 = "0x" + "12" * 100
+        tx1 = A._evm_raw_tx_hash(body1)
+        r1 = FakeFlow("rpc.mainnet.chain.robinhood.com", "/",
+            req_body=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction", "params": [body1]}),
+            resp_body="")
+        r1.request.headers = {"origin": "https://web3.okx.com"}
+        r1.response.status_code = 200
+        A.addons[0].request(r1)
+        send_leg = r1.metadata["speedex_leg"][0]
+        self.assertEqual(send_leg["anchorRole"], "send")
+        self.assertIsNone(send_leg.get("tFirstRespMs"), "响应永不到达（扇出中止形态）")
+        # 链上 receipt 落定（桩 _poll_receipt 为空操作——直接调 settle 模拟落定）
+        self.clock += 300
+        A._settle_receipt(send_leg, {"rpc": "stub", "chain": "robinhood", "pollIntervalMs": 800,
+            "status": 1, "blockHash": "0x" + "ab" * 32, "blockNumber": "0x67"})
+        self.assertEqual(send_leg["anchorRole"], "order", "receipt 落定 = 受理证据 → 晋升")
+        self.assertEqual(send_leg["tReceiptMs"], self.clock)
+        # 后续订单不再毒化
+        self.clock += 1000
+        body2 = "0x" + "34" * 100
+        tx2 = A._evm_raw_tx_hash(body2)
+        p2 = FakeFlow("web3.okx.com", "/priapi/v6/dx/trade/multi/broadcast",
+            req_body=json.dumps({"chainId": 4663, "signedInfoList": [{"txHash": tx2}], "orderId": "order-two"}),
+            resp_body=json.dumps({"code": "0", "data": {"transactionHash": tx2, "orderId": "order-two"}}))
+        p2.request.headers = {"origin": "https://web3.okx.com"}
+        p2.response.status_code = 200
+        A.addons[0].request(p2); A.addons[0].response(p2)
+        self.clock += 10
+        A.addons[0].websocket_message(ws_frame("wsdexpri.okx.com", json.dumps(
+            {"arg": {"channel": "dex-swap-order-info"},
+             "data": {"dexData": {"status": "1", "orderId": "order-two", "transactionHash": tx2}}})))
+        tl = A.STORE.timeline(self.run, full=True)
+        row = next(x for x in tl["legs"] if x.get("txHash") == tx2 and not x.get("dup"))
+        self.assertIsNone(row["incomplete"], "已晋升的早期 send 不再毒化后续订单")
+        self.assertEqual(row["hkL1aMs"], 10)
+
+    def test_transport_failed_send_still_poisons(self):
+        """兜底不放宽：传输层失败（500）的 send 身份不可证 → 后续订单仍如实缺失。"""
+        body1 = "0x" + "12" * 100
+        r1 = FakeFlow("rpc.mainnet.chain.robinhood.com", "/",
+            req_body=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction", "params": [body1]}),
+            resp_body="")
+        r1.request.headers = {"origin": "https://web3.okx.com"}
+        r1.response.status_code = 500
+        A.addons[0].request(r1); A.addons[0].response(r1)
+        self.assertEqual(r1.metadata["speedex_leg"][0]["anchorRole"], "send", "500 不晋升")
+        self.clock += 1000
+        body2 = "0x" + "34" * 100
+        tx2 = A._evm_raw_tx_hash(body2)
+        p2 = FakeFlow("web3.okx.com", "/priapi/v6/dx/trade/multi/broadcast",
+            req_body=json.dumps({"chainId": 4663, "signedInfoList": [{"txHash": tx2}], "orderId": "order-two"}),
+            resp_body=json.dumps({"code": "0", "data": {"transactionHash": tx2, "orderId": "order-two"}}))
+        p2.request.headers = {"origin": "https://web3.okx.com"}
+        p2.response.status_code = 200
+        A.addons[0].request(p2); A.addons[0].response(p2)
+        self.clock += 10
+        A.addons[0].websocket_message(ws_frame("wsdexpri.okx.com", json.dumps(
+            {"arg": {"channel": "dex-swap-order-info"},
+             "data": {"dexData": {"status": "1", "orderId": "order-two", "transactionHash": tx2}}})))
+        tl = A.STORE.timeline(self.run, full=True)
+        row = next(x for x in tl["legs"] if x.get("txHash") == tx2 and not x.get("dup"))
+        self.assertEqual(row["incomplete"], "broadcast-anchor-unconfirmed")
+        self.assertIsNone(row["hkL1aMs"])
+
+
+class TestMergedSendNoPoison(unittest.TestCase):
+    """fix-send-veto（2026-09-22，批 1g7ms 实证形）：solana 扇出形态每轮产生多条
+    okx-solana-send 腿——首条响应晋升绑槽，其余正向同单归并（dup）；页中止的重复
+    扇出流永不获响应（dup 腿不起 poller，anchorRole 停留 send）。已归并 dup 腿的
+    广播身份由已绑槽 formal 腿承载（成功/receipt 同律归并），不再是未知广播——
+    不得再作 broadcast-anchor-unconfirmed 毒化源；未归并（非 dup）的身份未明
+    send 的毒化保护不动（juk09/7ngeq 边界）。"""
+
+    def setUp(self):
+        fresh()
+        self.clock = time.monotonic() * 1000 + 10
+        from unittest.mock import patch
+        for target, replacement in [("_mono_ms", lambda: self.clock), ("_poll_receipt", lambda *_: None)]:
+            p = patch.object(A, target, replacement); p.start(); self.addCleanup(p.stop)
+        p = patch.object(A.HEADS, "snapshot", lambda rid, t: {c: {
+            "version": 1, "chain": c, "epoch": rid, "height": 40, "anchorTs": t,
+            "observedTs": t - 1, "sampleAgeMs": 1} for c in A.CHAINS})
+        p.start(); self.addCleanup(p.stop)
+        self.run = "sol-fanout-window"
+        A.STORE.mark_open(self.run, manifest={"version": 1, "runId": self.run, "legs": [
+            {"platform": "okx", "chain": "solana", "rounds": 3}]})
+        self.clock += 100
+
+    @staticmethod
+    def _wire_body(seed):
+        import base64
+        return base64.b64encode(bytes([1]) + bytes([seed]) * 64 + bytes([seed]) * 32).decode()
+
+    def _sol_send(self, seed, host="hongkong.solana.blockrazor.io", respond=True):
+        body = self._wire_body(seed)
+        tx = A._sol_wire_first_sig(body)
+        f = FakeFlow(host, "/v2/sendTransaction", req_body=body, resp_body=tx)
+        f.request.headers = {"origin": "https://web3.okx.com"}
+        f.response.status_code = 200
+        A.addons[0].request(f)
+        if respond:
+            A.addons[0].response(f)
+        return f, tx
+
+    def _platform_order(self, tx, oid):
+        f = FakeFlow("web3.okx.com", "/priapi/v6/dx/trade/multi/broadcast",
+            req_body=json.dumps({"chainId": 501, "signedInfoList": [{"txHash": tx}], "orderId": oid}),
+            resp_body=json.dumps({"code": "0", "data": {"transactionHash": tx, "orderId": oid}}))
+        f.request.headers = {"origin": "https://web3.okx.com"}
+        f.response.status_code = 200
+        A.addons[0].request(f); A.addons[0].response(f)
+        return f
+
+    def _success(self, tx, oid):
+        A.addons[0].websocket_message(ws_frame("wsdexpri.okx.com", json.dumps(
+            {"arg": {"channel": "dex-across-order-info"},
+             "data": {"dexData": {"status": "1", "orderId": oid, "transactionHash": tx}}})))
+
+    def _sol_round(self, seed, oid):
+        """一轮 1g7ms 实证形：首条扇出响应晋升绑槽 → 第二条响应确认归并（dup）→
+        第三条页中止（响应永不到达，保持 anchorRole=send 的 dup）→ 平台单归并 →
+        成功帧 → receipt 落定。"""
+        f1, tx = self._sol_send(seed)
+        bound = f1.metadata["speedex_leg"][0]
+        self.assertEqual(bound["anchorRole"], "order", "首条扇出响应晋升")
+        self.clock += 200
+        f2, _ = self._sol_send(seed, host="tokyo.solana.blockrazor.io")
+        f3, _ = self._sol_send(seed, host="frankfurt.solana.blockrazor.io", respond=False)
+        aborted = f3.metadata["speedex_leg"][0]
+        self.assertEqual(f2.metadata["speedex_leg"][0]["anchorRole"], "order", "响应确认归并")
+        self.assertEqual(aborted["anchorRole"], "send", "页中止流永不获响应——不晋升")
+        self.assertTrue(aborted["dup"], "请求侧身份正向同单归并——身份已解决")
+        self._platform_order(tx, oid)
+        self.clock += 10
+        self._success(tx, oid)
+        self.clock += 100
+        A._settle_receipt(bound, {"rpc": "stub", "chain": "solana",
+            "pollIntervalMs": 800, "status": 1, "slot": 777})
+        return bound, tx
+
+    def test_merged_dup_sends_do_not_poison_later_rounds(self):
+        """1g7ms 回归：R1 合格 + R2/R3 不再被前轮已归并 dup send 毒化。"""
+        txs = []
+        for i in range(3):
+            _, tx = self._sol_round(0x11 + i, "sol-order-%d" % i)
+            txs.append(tx)
+            self.clock += 1000
+        A.STORE.mark_close(self.run)
+        tl = A.STORE.timeline(self.run, full=True)
+        formal = [x for x in tl["legs"] if x["anchorRole"] == "order" and not x["dup"]]
+        self.assertEqual(len(formal), 3)
+        for row in formal:
+            self.assertIsNone(row["incomplete"], "已归并 dup send 不毒化后续轮")
+            self.assertEqual(row["hkL1aMs"], 210)
+            self.assertEqual(row["hkL3Ms"], 310)
+        self.assertFalse(any(x["incomplete"] == "broadcast-anchor-unconfirmed"
+                             for x in tl["legs"]),
+                         "全批不再出现 broadcast-anchor-unconfirmed（含 dup 受害腿）")
+        aborted = [x for x in tl["legs"] if x["anchorRole"] == "send"]
+        self.assertEqual(len(aborted), 3)
+        for row in aborted:
+            self.assertTrue(row["dup"])
+            self.assertEqual(row["incomplete"], "broadcast-identity-unconfirmed",
+                             "页中止扇出流自身如实缺失（身份未确认）——但不作毒化源")
+        for row in tl["legs"]:
+            if row["dup"] and row["anchorRole"] == "order":
+                self.assertEqual(row["incomplete"], "duplicate-of-bound-leg")
+        self.assertEqual(tl["counts"]["attempted"], 3)
+        self.assertEqual(tl["counts"]["observed"], 3)
+
+    def test_unmerged_unresolved_send_still_poisons(self):
+        """负例（juk09/7ngeq 边界不动）：未归并、身份未明的更早同链 send
+        （无响应、无 receipt、无同单已绑槽腿可归并）仍毒化后续订单。"""
+        orphan_f, orphan_tx = self._sol_send(0x77, respond=False)
+        orphan = orphan_f.metadata["speedex_leg"][0]
+        self.assertEqual(orphan["anchorRole"], "send")
+        self.assertFalse(orphan["dup"], "无同单已绑槽腿——不归并，身份未解决")
+        self.clock += 1000
+        self._sol_round(0x22, "sol-order-x")
+        A.STORE.mark_close(self.run)
+        tl = A.STORE.timeline(self.run, full=True)
+        row = next(x for x in tl["legs"] if x["anchorRole"] == "order" and not x["dup"])
+        self.assertEqual(row["incomplete"], "broadcast-anchor-unconfirmed")
+        self.assertIsNone(row["hkL1aMs"])
+        self.assertIsNone(row["hkL3Ms"])
+        orow = next(x for x in tl["legs"] if x["txHash"] == orphan_tx)
+        self.assertEqual(orow["incomplete"], "broadcast-identity-unconfirmed")
+
+    def test_evm_merged_send_does_not_poison_either(self):
+        """EVM 同律：已确认扇出 + 页中止 dup send 的轮次不毒化下一轮平台单。"""
+        run2 = "evm-fanout-window"
+        A.STORE.mark_open(run2, manifest={"version": 1, "runId": run2, "legs": [
+            {"platform": "okx", "chain": "bsc", "rounds": 2}]})
+        self.clock += 100
+
+        def platform(tx, oid):
+            f = FakeFlow("web3.okx.com", "/priapi/v6/dx/trade/multi/broadcast",
+                req_body=json.dumps({"chainId": 56, "signedInfoList": [{"txHash": tx}], "orderId": oid}),
+                resp_body=json.dumps({"code": "0", "data": {"transactionHash": tx, "orderId": oid}}))
+            f.request.headers = {"origin": "https://web3.okx.com"}
+            f.response.status_code = 200
+            A.addons[0].request(f); A.addons[0].response(f)
+            return f.metadata["speedex_leg"][0]
+
+        def raw(body, host, rid, respond=True):
+            tx = A._evm_raw_tx_hash(body)
+            f = FakeFlow(host, "/", req_body=json.dumps({"jsonrpc": "2.0", "id": rid,
+                "method": "eth_sendRawTransaction", "params": [body]}),
+                resp_body=json.dumps({"jsonrpc": "2.0", "id": rid, "result": tx}))
+            f.request.headers = {"origin": "https://web3.okx.com"}
+            f.response.status_code = 200
+            A.addons[0].request(f)
+            if respond:
+                A.addons[0].response(f)
+            return f.metadata["speedex_leg"][0], tx
+
+        def success(tx, oid):
+            A.addons[0].websocket_message(ws_frame("wsdexpri.okx.com", json.dumps(
+                {"arg": {"channel": "dex-swap-order-info"},
+                 "data": {"dexData": {"status": "1", "orderId": oid, "transactionHash": tx}}})))
+
+        def settle(leg):
+            A._settle_receipt(leg, {"rpc": "stub", "chain": "bsc", "pollIntervalMs": 800,
+                "status": 1, "blockHash": "0x" + "ab" * 32, "blockNumber": "0x67"})
+
+        # R1：平台单先绑槽；扇出第一条响应确认归并，第二条页中止（无响应、保持 send）
+        body1 = "0x" + "12" * 100
+        tx1 = A._evm_raw_tx_hash(body1)
+        leg1 = platform(tx1, "evm-o1")
+        raw(body1, "okx.bscnetwork.blockrazor.io", 1)
+        aborted, _ = raw(body1, "okx.bsc.blockrazor.xyz", 2, respond=False)
+        self.assertEqual(aborted["anchorRole"], "send")
+        self.assertTrue(aborted["dup"])
+        self.clock += 10
+        success(tx1, "evm-o1")
+        settle(leg1)
+        # R2：下一轮平台单不被 R1 的已归并 dup send 毒化
+        self.clock += 1000
+        body2 = "0x" + "34" * 100
+        tx2 = A._evm_raw_tx_hash(body2)
+        leg2 = platform(tx2, "evm-o2")
+        self.clock += 10
+        success(tx2, "evm-o2")
+        settle(leg2)
+        A.STORE.mark_close(run2)
+        tl = A.STORE.timeline(run2, full=True)
+        row2 = next(x for x in tl["legs"] if x["txHash"] == tx2 and not x["dup"])
+        self.assertIsNone(row2["incomplete"])
+        self.assertEqual(row2["hkL1aMs"], 10)
+        arow = next(x for x in tl["legs"] if x["anchorRole"] == "send")
+        self.assertTrue(arow["dup"])
+        self.assertEqual(arow["incomplete"], "broadcast-identity-unconfirmed")
+        self.assertFalse(any(x["incomplete"] == "broadcast-anchor-unconfirmed"
+                             for x in tl["legs"]))
+
+
+class TestStrictProductStatus(unittest.TestCase):
+    def test_exact_channel_and_status_without_envelope_splicing(self):
+        h = "0x" + "ab" * 32
+        def frame(status="1", channel="dex-across-order-info", data=None):
+            return json.dumps({"arg": {"channel": channel}, "note": "dex-across-order-info", "data": data if data is not None else {"dexData": {"status": status, "orderId": "o1", "txHash": h}}})
+        self.assertTrue(A._okx_ws_entries(frame())[0]["success"])
+        for status in [1, True, "confirmed", "success", None, "0", "-1"]:
+            self.assertFalse(any(x["success"] for x in A._okx_ws_entries(frame(status=status))))
+        for channel in ["other", "prefix-dex-across-order-info", "dex-swap-order-info-suffix"]:
+            self.assertEqual(A._okx_ws_entries(frame(channel=channel)), [])
+        for dd in [None, [], "invalid", {"status": "1"}]:
+            units = A._okx_ws_entries(frame(data={"status": "1", "orderId": "o1", "txHash": h, "dexData": dd}))
+            self.assertFalse(any(x["success"] and x["ids"].get("txHash") for x in units))
+
+
+class TestChainChannelArrivals(unittest.TestCase):
+    """v10（2026-09-19）：www.okx.com /fullnode|/nodeone 链域通道成功通知到达时刻——
+    HK 钟、精确 tx 身份、每通道首到冻结；与成功判定管线完全分离。"""
+
+    def setUp(self):
+        fresh()
+        self.clock = time.monotonic() * 1000 + 10
+        from unittest.mock import patch
+        for target, replacement in [("_mono_ms", lambda: self.clock), ("_poll_receipt", lambda *_: None)]:
+            p = patch.object(A, target, replacement); p.start(); self.addCleanup(p.stop)
+        p = patch.object(A.HEADS, "snapshot", lambda rid, t: {c: {
+            "version": 1, "chain": c, "epoch": rid, "height": 40, "anchorTs": t,
+            "observedTs": t - 1, "sampleAgeMs": 1} for c in A.CHAINS})
+        p.start(); self.addCleanup(p.stop)
+        self.run = "channel-arrivals-window"
+        A.STORE.mark_open(self.run, manifest={"version": 1, "runId": self.run, "legs": [
+            {"platform": "okx", "chain": "robinhood", "rounds": 1},
+            {"platform": "okx", "chain": "solana", "rounds": 1}]})
+        self.clock += 100
+
+    def send_leg(self, chain, body):
+        host = "rpc.mainnet.chain.robinhood.com" if chain == "robinhood" else "hongkong.solana.blockrazor.io"
+        path = "/" if chain == "robinhood" else "/v2/sendTransaction"
+        f = FakeFlow(host, path, req_body=body, resp_body="")
+        f.request.headers = {"origin": "https://web3.okx.com"}
+        f.response.status_code = 200
+        A.addons[0].request(f)
+        return f.metadata["speedex_leg"][0]
+
+    def chan_frame(self, path, payload, host="www.okx.com"):
+        f = FakeFlow(host, path)
+        f.websocket = types.SimpleNamespace(messages=[FakeWSMsg(payload)])
+        return f
+
+    def test_okx_ac_host_robinhood_fullnode_discover_ws(self):
+        """2026-09-22：rh 链域通知实证迁至 www.okx.ac/fullnode/robinhood/discover/ws
+        （host 别名放行；同路径正则与 EVM eth_subscription 身份门不变）。"""
+        body = "0x" + "34" * 100
+        tx = A._evm_raw_tx_hash(body)
+        self.send_leg("robinhood", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction", "params": [body]}))
+        frame = json.dumps({"jsonrpc": "2.0", "method": "eth_subscription",
+            "params": {"subscription": "0xac1", "result": {"transactionHash": tx, "status": "0x1"}}})
+        self.clock += 640
+        A.addons[0].websocket_message(self.chan_frame("/fullnode/robinhood/discover/ws", frame, host="www.okx.ac"))
+        leg = A.STORE.legs[self.run][0]
+        row = A.STORE.timeline(self.run, full=True)["legs"][0]
+        self.assertEqual(row["channelArrivals"], [{"channel": "fullnode", "api": "eth_subscription", "ms": 640}])
+        self.assertIsNone(row["hkL1aMs"], "链域帧不产生成功计时")
+        self.assertIsNone(leg.get("tSuccessPushMs"))
+        # 未登记 host 变体（如 www.okx.ac.evil.example）仍拒绝
+        A.STORE.legs[self.run][0].pop("_channelArrivals", None)
+        self.clock += 100
+        A.addons[0].websocket_message(self.chan_frame("/fullnode/robinhood/discover/ws", frame, host="www.okx.ac.evil.example"))
+        self.assertIsNone(A.STORE.legs[self.run][0].get("_channelArrivals"), "相似 host 不放行")
+
+    def test_nodeone_evm_receipt_frame_records_first_arrival(self):
+        body = "0x" + "12" * 100
+        tx = A._evm_raw_tx_hash(body)
+        self.send_leg("robinhood", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction", "params": [body]}))
+        # eth_subscription 帧：result 内 transactionHash 精确 + status 0x1
+        frame = json.dumps({"jsonrpc": "2.0", "method": "eth_subscription",
+            "params": {"subscription": "0xabc", "result": {"transactionHash": tx, "status": "0x1"}}})
+        self.clock += 700
+        A.addons[0].websocket_message(self.chan_frame("/nodeone/robinhood/mainnet/v1/websocket", frame))
+        self.clock += 500
+        A.addons[0].websocket_message(self.chan_frame("/nodeone/robinhood/mainnet/v1/websocket", frame))  # 第二帧不覆盖首到
+        leg = A.STORE.legs[self.run][0]
+        tl = A.STORE.timeline(self.run, full=True)
+        row = tl["legs"][0]
+        self.assertEqual(row["channelArrivals"], [{"channel": "nodeone", "api": "eth_subscription", "ms": 700}])
+        self.assertIsNone(row["hkL1aMs"], "链域帧不产生成功计时（与成功管线分离）")
+        self.assertIsNone(leg.get("tSuccessPushMs"))
+
+    def test_rejects_wrong_hash_unsuccess_and_nonschema(self):
+        body = "0x" + "12" * 100
+        tx = A._evm_raw_tx_hash(body)
+        self.send_leg("robinhood", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction", "params": [body]}))
+        for result in [
+            {"transactionHash": "0x" + "ff" * 32, "status": "0x1"},   # 异 tx
+            {"transactionHash": tx, "status": "0x0"},                  # 失败态
+            {"transactionHash": tx},                                   # 缺 status
+            {"transactionHash": tx[:-2], "status": "0x1"},             # 前缀相似不完整
+        ]:
+            A.addons[0].websocket_message(self.chan_frame("/nodeone/robinhood/mainnet/v1/websocket",
+                json.dumps({"jsonrpc": "2.0", "method": "eth_subscription", "params": {"subscription": "0x1", "result": result}})))
+        self.assertIsNone(A.STORE.legs[self.run][0].get("_channelArrivals"))
+
+    def test_load_hook_warms_egress_cache_with_epoch_guard(self):
+        """v10.1：load 钩子即时温 egress 缓存（c9tar unknown-proxy 事故防回归）。"""
+        calls = []
+        from unittest.mock import patch
+        p = patch.object(A, "_vantage", lambda fetch=False: calls.append(fetch) or "hk-proxy")
+        p.start(); self.addCleanup(p.stop)
+        epoch_before = A._EGRESS_REFRESH_EPOCH
+        A.addons[0].load(None)
+        self.assertEqual(A._EGRESS_REFRESH_EPOCH, epoch_before + 1, "每代热重载递增 epoch（旧线程让位）")
+        for _ in range(100):
+            if calls:
+                break
+            time.sleep(0.02)
+        self.assertEqual(calls[:1], [True], "load 即时温一次 egress 缓存（fetch=True）")
+
+    def test_solana_fullnode_signature_notification(self):
+        sig_bytes = bytes((i * 7 + 3) & 0xFF for i in range(64))
+        sig = A._b58encode(sig_bytes)
+        wire = bytes([1]) + sig_bytes + bytes(32)
+        import base64 as _b64
+        leg = self.send_leg("solana", _b64.b64encode(wire).decode())
+        self.assertEqual(leg.get("txHash"), sig, "请求侧首签名身份")
+        ok_frame = json.dumps({"jsonrpc": "2.0", "method": "signatureNotification",
+            "params": {"subscription": 1, "result": {"context": {"slot": 9}, "value": {"signature": sig, "err": None}}}})
+        err_frame = json.dumps({"jsonrpc": "2.0", "method": "signatureNotification",
+            "params": {"subscription": 1, "result": {"context": {"slot": 9}, "value": {"signature": sig, "err": {"Custom": 1}}}}})
+        A.addons[0].websocket_message(self.chan_frame("/fullnode/sol/discover/ws", err_frame))
+        self.assertIsNone(A.STORE.legs[self.run][-1].get("_channelArrivals"), "err 帧不认")
+        self.clock += 450
+        A.addons[0].websocket_message(self.chan_frame("/fullnode/sol/discover/ws", ok_frame))
+        tl = A.STORE.timeline(self.run, full=True)
+        sol_rows = [x for x in tl["legs"] if x.get("txHash") == sig]
+        self.assertEqual(sol_rows[0]["channelArrivals"], [{"channel": "fullnode", "api": "signatureNotification", "ms": 450}])
+
+    # ── v10.2：真实线形——signatureNotification 帧不含签名，身份走连接级订阅映射 ──
+    def sol_conn(self):
+        """同一条 fullnode 连接的持久 FakeFlow（订阅映射按连接存 flow.metadata）。"""
+        f = FakeFlow("www.okx.com", "/fullnode/sol/discover/ws")
+        f.websocket = types.SimpleNamespace(messages=[])
+        return f
+
+    def conn_send(self, f, payload, from_client=False):
+        f.websocket.messages = [FakeWSMsg(payload, from_client=from_client)]
+        A.addons[0].websocket_message(f)
+
+    def sol_leg(self):
+        sig_bytes = bytes((i * 7 + 3) & 0xFF for i in range(64))
+        sig = A._b58encode(sig_bytes)
+        wire = bytes([1]) + sig_bytes + bytes(32)
+        import base64 as _b64
+        leg = self.send_leg("solana", _b64.b64encode(wire).decode())
+        self.assertEqual(leg.get("txHash"), sig)
+        return sig
+
+    def sub_pair(self, f, sig, req_id=7, sub_id=284):
+        self.conn_send(f, json.dumps({"jsonrpc": "2.0", "id": req_id, "method": "signatureSubscribe",
+            "params": [sig, {"commitment": "processed"}]}), from_client=True)
+        self.conn_send(f, json.dumps({"jsonrpc": "2.0", "id": req_id, "result": sub_id}))
+
+    def sol_rows(self, sig):
+        tl = A.STORE.timeline(self.run, full=True)
+        return [x for x in tl["legs"] if x.get("txHash") == sig]
+
+    def test_solana_fullnode_subscription_mapped_notification(self):
+        sig = self.sol_leg()
+        f = self.sol_conn()
+        self.sub_pair(f, sig)
+        self.clock += 450
+        # 真实帧形（1a9cs 实证）：value 只有 err:null，无 signature 字段
+        self.conn_send(f, json.dumps({"jsonrpc": "2.0", "method": "signatureNotification",
+            "params": {"subscription": 284, "result": {"context": {"slot": 449737968}, "value": {"err": None}}}}))
+        self.assertEqual(self.sol_rows(sig)[0]["channelArrivals"],
+            [{"channel": "fullnode", "api": "signatureNotification", "ms": 450}],
+            "订阅映射还原签名 → 首到代理钟到达")
+        # 第二帧不覆盖首到
+        self.clock += 300
+        self.conn_send(f, json.dumps({"jsonrpc": "2.0", "method": "signatureNotification",
+            "params": {"subscription": 284, "result": {"context": {"slot": 449737970}, "value": {"err": None}}}}))
+        self.assertEqual(self.sol_rows(sig)[0]["channelArrivals"][0]["ms"], 450)
+
+    def test_solana_fullnode_rejects_unmapped_err_and_foreign(self):
+        sig = self.sol_leg()
+        f = self.sol_conn()
+        self.sub_pair(f, sig)
+        for frame in [
+            # err 非 null → 失败态不认
+            {"jsonrpc": "2.0", "method": "signatureNotification", "params": {"subscription": 284,
+                "result": {"context": {"slot": 9}, "value": {"err": {"Custom": 1}}}}},
+            # 未映射 subscription id → 不认
+            {"jsonrpc": "2.0", "method": "signatureNotification", "params": {"subscription": 999,
+                "result": {"context": {"slot": 9}, "value": {"err": None}}}},
+            # value 缺 err 键 → 非 schema 不认
+            {"jsonrpc": "2.0", "method": "signatureNotification", "params": {"subscription": 284,
+                "result": {"context": {"slot": 9}, "value": {}}}},
+        ]:
+            self.conn_send(f, json.dumps(frame))
+        self.assertIsNone(A.STORE.legs[self.run][-1].get("_channelArrivals"))
+
+    def test_solana_fullnode_no_subscribe_no_arrival(self):
+        sig = self.sol_leg()
+        f = self.sol_conn()
+        # 无订阅映射且帧内无签名 → 不记
+        self.conn_send(f, json.dumps({"jsonrpc": "2.0", "method": "signatureNotification",
+            "params": {"subscription": 284, "result": {"context": {"slot": 9}, "value": {"err": None}}}}))
+        self.assertIsNone(A.STORE.legs[self.run][-1].get("_channelArrivals"))
+
+    def test_solana_fullnode_unsubscribe_drops_mapping(self):
+        sig = self.sol_leg()
+        f = self.sol_conn()
+        self.sub_pair(f, sig)
+        self.conn_send(f, json.dumps({"jsonrpc": "2.0", "id": 8, "method": "signatureUnsubscribe",
+            "params": [284]}), from_client=True)
+        self.conn_send(f, json.dumps({"jsonrpc": "2.0", "method": "signatureNotification",
+            "params": {"subscription": 284, "result": {"context": {"slot": 9}, "value": {"err": None}}}}))
+        self.assertIsNone(A.STORE.legs[self.run][-1].get("_channelArrivals"), "退订后映射清除")
+
+    def test_solana_fullnode_transaction_notification_direct(self):
+        sig = self.sol_leg()
+        f = self.sol_conn()
+        self.clock += 200
+        self.conn_send(f, json.dumps({"jsonrpc": "2.0", "method": "transactionNotification",
+            "params": {"subscription": 12, "result": {"context": {"slot": 9},
+                "transaction": {"signatures": [sig]}, "meta": {"err": None}}}}))
+        self.assertEqual(self.sol_rows(sig)[0]["channelArrivals"],
+            [{"channel": "fullnode", "api": "transactionNotification", "ms": 200}])
+        # meta.err 失败态不认
+        g = self.sol_conn()
+        self.conn_send(g, json.dumps({"jsonrpc": "2.0", "method": "transactionNotification",
+            "params": {"subscription": 12, "result": {"context": {"slot": 9},
+                "transaction": {"signatures": [sig]}, "meta": {"err": {"InstructionError": [0, "Custom"]}}}}}))
+        self.assertEqual(len(self.sol_rows(sig)[0]["channelArrivals"]), 1, "失败帧不新增/不覆盖")
+
+    def test_solana_fullnode_subscription_state_cleared_on_close(self):
+        sig = self.sol_leg()
+        f = self.sol_conn()
+        self.sub_pair(f, sig)
+        A.addons[0].websocket_end(f)
+        self.conn_send(f, json.dumps({"jsonrpc": "2.0", "method": "signatureNotification",
+            "params": {"subscription": 284, "result": {"context": {"slot": 9}, "value": {"err": None}}}}))
+        self.assertIsNone(A.STORE.legs[self.run][-1].get("_channelArrivals"), "连接结束清理订阅映射")
+
+
+class TestWsRawRelay(unittest.TestCase):
+    """v10.6：只承载行情的 WS（OKX ipublic、GMGN trs_ws）101 升级时转 rawtcp 原样中继。"""
+
+    def setUp(self):
+        fresh()
+        A.MARKET_TAP.reset(False)
+
+    def _upgrade(self, host, path):
+        f = FakeFlow(host, path, "GET")
+        f.websocket = object()  # mitmproxy 在 response hook 前为 101 WS 置 WebSocketData
+        A.SpeedexHkTiming().response(f)
+        return f
+
+    def test_market_only_paths_relay_raw(self):
+        for host, path in (("wsdexpri.okx.com", "/ws/v5/ipublic"), ("ws.gmgn.ai", "/trs_ws?rg=hk"), ("ws.gmgn.ai", "/trs_ws/")):
+            f = self._upgrade(host, path)
+            self.assertIsNone(f.websocket, (host, path))
+            self.assertEqual(f.metadata[A._WS_RAW_RELAY_KEY], host)
+        self.assertEqual(A.STORE.diag["wsRawRelay.wsdexpri.okx.com"], 1)
+        self.assertEqual(A.STORE.diag["wsRawRelay.ws.gmgn.ai"], 2)
+
+    def test_success_bearing_paths_keep_websocket(self):
+        # 成功判据所在连接必须继续逐帧解析
+        for host, path in (
+            ("wsdexpri.okx.com", "/ws/v5/iprivate"),
+            ("wsdexpri.okx.com", "/ws/v5/iprivate/dex"),
+            ("ws.gmgn.ai", "/v2/ws"),
+            ("ws.gmgn.ai.evil.example", "/trs_ws"),
+            ("wsdexpri.okx.com", "/ws/v5/ipublicx"),
+        ):
+            f = self._upgrade(host, path)
+            self.assertIsNotNone(f.websocket, (host, path))
+            self.assertNotIn(A._WS_RAW_RELAY_KEY, f.metadata)
+
+    def test_plain_http_untouched_and_tap_enabled_relays_with_sniffer(self):
+        f = FakeFlow("wsdexpri.okx.com", "/ws/v5/ipublic", "GET")  # 非 WS 升级（websocket=None）
+        A.SpeedexHkTiming().response(f)
+        self.assertNotIn(A._WS_RAW_RELAY_KEY, f.metadata)
+        f = self._upgrade("wsdexpri.okx.com", "/ws/v5/ipublic")
+        self.assertNotIn(A._WS_SNIFF_KEY, f.metadata)  # tap 关：只中继不嗅探
+        A.MARKET_TAP.reset(True)
+        f = FakeFlow("wsdexpri.okx.com", "/ws/v5/ipublic", "GET")
+        f.websocket = object()
+        f.client_conn = types.SimpleNamespace(id="conn-1")
+        A.SpeedexHkTiming().response(f)
+        self.assertIsNone(f.websocket)  # v10.8：tap 开启也原样中继
+        self.assertEqual(A.STORE.diag["wsSniff.wsdexpri.okx.com"], 1)
+        # rawtcp 新建 TCPFlow（无 HTTPFlow.metadata）：tcp_start 按客户端连接 id 领取
+        tf = types.SimpleNamespace(client_conn=types.SimpleNamespace(id="conn-1"), metadata={})
+        A.SpeedexHkTiming().tcp_start(tf)
+        self.assertIsInstance(tf.metadata[A._WS_SNIFF_KEY], A._WsSniff)
+        self.assertNotIn("conn-1", A._WS_SNIFF_PENDING)
+        other = types.SimpleNamespace(client_conn=types.SimpleNamespace(id="conn-2"), metadata={})
+        A.SpeedexHkTiming().tcp_start(other)
+        self.assertNotIn(A._WS_SNIFF_KEY, other.metadata)
+
+    def test_tcp_message_keeps_only_latest(self):
+        f = types.SimpleNamespace(messages=[1, 2, 3])
+        A.SpeedexHkTiming().tcp_message(f)
+        self.assertEqual(f.messages, [3])
+        A.SpeedexHkTiming().tcp_message(types.SimpleNamespace())  # 无 messages 不抛
+
+
+def _ws_server_frame(payload, opcode=1, fin=True, rsv1=False, masked=False):
+    b0 = (0x80 if fin else 0) | (0x40 if rsv1 else 0) | opcode
+    n = len(payload)
+    if n < 126:
+        head = bytes([b0, (0x80 if masked else 0) | n])
+    elif n < 65536:
+        head = bytes([b0, (0x80 if masked else 0) | 126]) + n.to_bytes(2, "big")
+    else:
+        head = bytes([b0, (0x80 if masked else 0) | 127]) + n.to_bytes(8, "big")
+    return head + (b"\x00\x00\x00\x00" if masked else b"") + payload
+
+
+def _deflate_msgs(msgs, ctx=True):
+    """permessage-deflate 服务端压缩（上下文接管：同一压缩器；去尾 00 00 ff ff）。"""
+    out = []
+    c = zlib.compressobj(wbits=-15)
+    for m in msgs:
+        if not ctx:
+            c = zlib.compressobj(wbits=-15)
+        d = c.compress(m) + c.flush(zlib.Z_SYNC_FLUSH)
+        out.append(d[:-4])
+    return out
+
+
+class TestWsSniff(unittest.TestCase):
+    """v10.8：原样中继流被动嗅探——只把含发现频道名的消息交给 market-tap，字节不改、坏流判死。"""
+
+    MINT = "So1anaMint" + "A" * 30 + "pump"
+    EVM = "0x" + "cd" * 20
+
+    def setUp(self):
+        fresh()
+        A.MARKET_TAP.reset(True)
+
+    def _msgs(self):
+        noise = json.dumps({"arg": {"channel": "dex-market-memepump-update-metrics"}, "data": [{"ca": "Other" + "B" * 39, "pad": "x" * 3000}]}).encode()
+        key = json.dumps({"arg": {"channel": "dex-market-memepump-new-token", "chainIndex": "501"}, "data": [{"ca": self.MINT, "chain": "501"}]}).encode()
+        key2 = json.dumps({"arg": {"channel": "dex-market-memepump-new-token", "chainIndex": "56"}, "data": [{"ca": self.EVM, "chain": "56"}]}).encode()
+        return [noise, key, noise, key2]
+
+    def _feed_chunked(self, sn, stream, sizes=(1, 7, 300, 2, 4096)):
+        i = k = 0
+        while i < len(stream):
+            n = sizes[k % len(sizes)]
+            sn.feed(stream[i:i + n], 1000.0 + k)
+            i += n
+            k += 1
+
+    def test_deflate_context_takeover_chunked_with_control_and_fragments(self):
+        msgs = self._msgs()
+        comp = _deflate_msgs(msgs)
+        stream = _ws_server_frame(b"", opcode=9)  # ping
+        stream += _ws_server_frame(comp[0], rsv1=True)
+        half = len(comp[1]) // 2  # 分片消息：首帧 RSV1，续帧 opcode 0
+        stream += _ws_server_frame(comp[1][:half], fin=False, rsv1=True) + _ws_server_frame(b"", opcode=10) + _ws_server_frame(comp[1][half:], opcode=0)
+        stream += _ws_server_frame(comp[2], rsv1=True) + _ws_server_frame(comp[3], rsv1=True)
+        sn = A._WsSniff("wsdexpri.okx.com", "permessage-deflate; client_max_window_bits")
+        self._feed_chunked(sn, stream)
+        self.assertIsNone(sn.dead)
+        self.assertEqual((sn.msgs, sn.hits), (4, 2))  # 噪声消息只解压不入 tap
+        af = A.MARKET_TAP.snapshot()["addrFirst"]
+        self.assertEqual(set(af), {f"wsdexpri.okx.com|dex-market-memepump-new-token|{self.MINT}", f"wsdexpri.okx.com|dex-market-memepump-new-token|{self.EVM}"})
+
+    def test_no_context_takeover_and_uncompressed(self):
+        msgs = self._msgs()
+        sn = A._WsSniff("wsdexpri.okx.com", "permessage-deflate; server_no_context_takeover")
+        sn.feed(b"".join(_ws_server_frame(c, rsv1=True) for c in _deflate_msgs(msgs, ctx=False)), 5.0)
+        self.assertEqual((sn.dead, sn.hits), (None, 2))
+        A.MARKET_TAP.reset(True)
+        g = json.dumps({"channel": "trenches_delta", "data": {"fid": "sol_nc_x", "a": [self.MINT], "t": [{"a": self.MINT}]}}).encode()
+        sn = A._WsSniff("ws.gmgn.ai", "")
+        sn.feed(_ws_server_frame(g) + _ws_server_frame(b'{"channel":"heartbeat"}'), 7.0)
+        self.assertEqual(A.MARKET_TAP.snapshot()["addrFirst"][f"ws.gmgn.ai|trenches_delta|{self.MINT}"]["t"], 7.0)
+
+    def test_corrupt_streams_go_dead_without_raising(self):
+        for why, data, ext in (
+            ("masked-server-frame", _ws_server_frame(b"x", masked=True), ""),
+            ("orphan-continuation", _ws_server_frame(b"x", opcode=0), ""),
+            ("unknown-opcode", _ws_server_frame(b"x", opcode=3), ""),
+            ("rsv1-without-deflate", _ws_server_frame(b"x", rsv1=True), ""),
+            ("inflate-error", _ws_server_frame(b"\xff\xff\xff\xff", rsv1=True), "permessage-deflate"),
+        ):
+            sn = A._WsSniff("ws.gmgn.ai", ext)
+            sn.feed(data, 1.0)
+            self.assertEqual(sn.dead, why)
+            sn.feed(_ws_server_frame(b'{"channel":"trenches_delta"}'), 2.0)  # 死后不再处理
+        self.assertEqual(A.MARKET_TAP.snapshot()["frames"], 0)
+
+    def test_tcp_message_hook_direction_and_tap_off(self):
+        f = FakeFlow("ws.gmgn.ai", "/trs_ws", "GET")
+        sn = A._WsSniff("ws.gmgn.ai", "")
+        f.metadata[A._WS_SNIFF_KEY] = sn
+        frame = _ws_server_frame(json.dumps({"channel": "trenches_delta", "data": {"a": [self.MINT]}}).encode())
+        f.messages = [types.SimpleNamespace(content=frame, from_client=True)]
+        A.SpeedexHkTiming().tcp_message(f)
+        self.assertEqual(sn.msgs, 0)  # 客户端方向不嗅
+        f.messages = [types.SimpleNamespace(content=frame, from_client=False)]
+        A.SpeedexHkTiming().tcp_message(f)
+        self.assertEqual(sn.hits, 1)
+        self.assertEqual(A._WS_SNIFF_STATS["hits.ws.gmgn.ai"] >= 1, True)  # v10.9 计数进 market-tap 快照
+        A.MARKET_TAP.set_enabled(False)
+        A.SpeedexHkTiming().tcp_message(f)
+        self.assertEqual(sn.dead, "tap-disabled")  # 关 tap 即永久停嗅（解压上下文已断）
+
+
+class TestProcSampler(unittest.TestCase):
+    """v10.7：market-tap 观测期负载守卫——进程 CPU% / 节点 steal% 区间均值。"""
+
+    def test_first_sample_is_none_then_interval_values(self):
+        sp = A._ProcSampler()
+        first = sp.sample()
+        self.assertEqual(first["cpuPct"], None)
+        sp.last = (sp.last[0] - 2.0, sp.last[1] - 0.5, sp.last[2], sp.last[3])  # 合成：2s 内耗 0.5s CPU
+        second = sp.sample()
+        self.assertIsNotNone(second["cpuPct"])
+        self.assertGreaterEqual(second["cpuPct"], 20.0)
+        self.assertTrue(second["stealPct"] is None or 0.0 <= second["stealPct"] <= 100.0)
+
+    def test_too_short_interval_reports_none(self):
+        sp = A._ProcSampler()
+        sp.sample()
+        self.assertEqual(sp.sample()["cpuPct"], None)
+
+
+class TestMarketTap(unittest.TestCase):
+    """market-tap 支线：行情 WS 帧的 channel/首见地址记录，独立于开窗管线。"""
+
+    def setUp(self):
+        fresh()
+        A.MARKET_TAP.reset(False)
+
+    def test_records_channel_and_first_seen_addr(self):
+        addr = "0x" + "ab" * 20
+        A.MARKET_TAP.reset(True)
+        t0 = A._mono_ms()
+        flow = FakeFlow("ws.gmgn.ai", "/v2/ws", "GET")
+        A._market_tap_note(flow, json.dumps({"channel": "public_broadcast", "data": [{"token": addr}]}), t0)
+        A._market_tap_note(flow, json.dumps({"channel": "public_broadcast", "data": [{"token": addr}]}), t0 + 5)
+        self.assertEqual(A.MARKET_TAP.snapshot()["frames"], 2)
+        self.assertEqual(len(A.MARKET_TAP.snapshot()["addrFirst"]), 1)  # 同地址只记首见
+
+    def test_solana_mint_only_on_new_token_channels(self):
+        mint = "So1anaMint" + "A" * 30 + "pump"  # 44 位 base58
+        A.MARKET_TAP.reset(True)
+        t0 = A._mono_ms()
+        g = FakeFlow("ws.gmgn.ai", "/trs_ws", "GET")
+        o = FakeFlow("wsdexpri.okx.com", "/ws/v5/ipublic", "GET")
+        logo = "data:image/png;base64," + "iVBORw0KGgo" + "B" * 40 + "/" + "C" * 40
+        A._market_tap_note(g, json.dumps({"channel": "trenches_delta", "data": {"t": [{"a": mint, "f": {"ls_b64": logo}}]}}), t0)
+        A._market_tap_note(o, json.dumps({"channel": "dex-market-memepump-new-token", "data": [{"ca": mint}]}), t0 + 3)
+        A._market_tap_note(o, json.dumps({"channel": "dex-market-memepump-update-metrics", "data": [{"ca": "Other" + "B" * 39}]}), t0 + 4)
+        af = A.MARKET_TAP.snapshot()["addrFirst"]
+        self.assertEqual(set(af), {f"ws.gmgn.ai|trenches_delta|{mint}", f"wsdexpri.okx.com|dex-market-memepump-new-token|{mint}"})
+        self.assertEqual(af[f"ws.gmgn.ai|trenches_delta|{mint}"]["t"], t0)  # 大小写保留、logo 子串不入
+
+    def test_host_filter_and_binary_skip(self):
+        A.MARKET_TAP.reset(True)
+        t0 = A._mono_ms()
+        A._market_tap_note(FakeFlow("example.com", "/", "GET"), '{"channel":"x"}', t0)
+        A._market_tap_note(FakeFlow("ws.gmgn.ai.evil.example", "/", "GET"), '{"channel":"x"}', t0)
+        self.assertEqual(A.MARKET_TAP.snapshot()["frames"], 0)  # 点边界——后缀相似主机不匹配
+        # 二进制帧 utf8 归一：可解码则计入体量（无 channel/地址），不可解码只计体量
+        A._market_tap_note(FakeFlow("wsdexpri.okx.com", "/ws/v5/ipublic", "GET"), b"\x00\x01", t0)
+        s = A.MARKET_TAP.snapshot()
+        self.assertEqual(s["frames"], 1)
+        self.assertEqual(list(s["channels"].keys()), ["wsdexpri.okx.com|-"])
+        self.assertEqual(s["addrFirst"], {})
+        self.assertEqual(A.MARKET_TAP.snapshot()["addrFirst"], {})
+
+    def test_okx_nested_channel(self):
+        addr = "0x" + "cd" * 20
+        A.MARKET_TAP.reset(True)
+        t0 = A._mono_ms()
+        A._market_tap_note(
+            FakeFlow("wsdexpri.okx.com", "/ws/v5/ipublic", "GET"),
+            json.dumps({"arg": {"channel": "dex-market-new-token-logo-update"}, "data": [{"a": addr}]}),
+            t0,
+        )
+        s = A.MARKET_TAP.snapshot()
+        self.assertIn("wsdexpri.okx.com|dex-market-new-token-logo-update", s["channels"])
+        self.assertIn("wsdexpri.okx.com|dex-market-new-token-logo-update|" + addr, s["addrFirst"])
+
+
+class TestPendingReceiptDedup(unittest.TestCase):
+    """4ez2h: Solana platform POST and raw send share one exact transaction.
+    Solana chainId=501 is not a chain anchor here; only its receipt may backfill it.
+    Requests, responses and WS success use production hooks; no RPC is performed.
+    """
+
+    raw = TestExactBroadcastAnchors.raw
+    platform = TestExactBroadcastAnchors.platform
+    success = TestExactBroadcastAnchors.success
+    EVM_BODY = TestExactBroadcastAnchors.EVM_BODY
+    _wire_body = staticmethod(TestMergedSendNoPoison._wire_body)
+
+    def setUp(self):
+        self.real_poll_receipt = A._poll_receipt
+        TestExactBroadcastAnchors.setUp(self)
+        self.polls = []
+        self.workers = []
+        owner = self
+        from unittest.mock import patch
+
+        class DeferredPollThread:
+            def __init__(self, target, args=(), daemon=None):
+                self.target, self.args = target, args
+
+            def start(self):
+                owner.polls.append(self.args)
+                owner.workers.append((self.target, self.args))
+
+        # Capture production response -> claim -> real worker target/arguments.
+        # Selected tests execute that target with the RPC stub captured at spawn;
+        # the permutation tests assert scheduling before injecting timed callbacks.
+        p = patch.object(A, "_poll_receipt", self.real_poll_receipt)
+        p.start(); self.addCleanup(p.stop)
+        p = patch.object(A.threading, "Thread", DeferredPollThread)
+        p.start(); self.addCleanup(p.stop)
+
+    def pair(self, reverse_ack=False, seed=0x31, oid="order-one"):
+        body = self._wire_body(seed)
+        tx = A._sol_wire_first_sig(body)
+        early = self.platform("solana", tx, oid)
+        A.addons[0].request(early)
+        early_leg = early.metadata["speedex_leg"][0]
+        self.assertTrue(early_leg["pendingBind"])
+        self.clock += 7
+        late = self.raw("solana", tx, body=body)
+        A.addons[0].request(late)
+        late_leg = late.metadata["speedex_leg"][0]
+        for flow in ([late, early] if reverse_ack else [early, late]):
+            self.clock += 10
+            A.addons[0].response(flow)
+        return early_leg, late_leg, tx
+
+    def receipt(self, leg, slot=777):
+        self.clock += 100
+        A._settle_receipt(leg, {"rpc": "synthetic", "chain": "solana",
+            "pollIntervalMs": 800, "status": 1, "slot": slot})
+        return self.clock
+
+    def check_pair(self, reverse_ack, reverse_receipt):
+        early, late, tx = self.pair(reverse_ack)
+        self.assertEqual(len(self.polls), 2)
+        for leg in (early, late):
+            polls = [args for args in self.polls if args[1] is leg]
+            self.assertEqual(len(polls), 1, "each callback must have a real production poll claim")
+            self.assertEqual(polls[0][0], self.run)
+            self.assertEqual(polls[0][3], tx)
+            self.assertEqual(polls[0][2], leg["chain"])
+            self.assertIsNone(A.STORE.claim_receipt_poll(leg), "never start a second worker")
+        self.assertIsNone(early["chain"], "no chain borrowed from another request")
+        self.clock += 10
+        A.addons[0].websocket_message(self.success(tx))
+        success_t = self.clock
+        self.assertEqual(late["tSuccessPushMs"], success_t)
+        self.clock += 10
+        channel_t = self.clock
+        A.STORE.note_channel_arrival("solana", tx, "nodeone", "signatureNotification", channel_t)
+        receipt_legs = [late, early] if reverse_receipt else [early, late]
+        receipt_t = self.receipt(receipt_legs[0])
+        self.receipt(receipt_legs[1], slot=778)
+        self.clock += 50
+        A.addons[0].websocket_message(self.success(tx))
+        A.STORE.note_channel_arrival("solana", tx, "nodeone", "signatureNotification", self.clock)
+        self.assertFalse(early["dup"])
+        self.assertTrue(late["dup"])
+        self.assertIs(late["_dupOf"], early)
+        self.assertEqual(early["chain"], "solana")
+        self.assertFalse(early["pendingBind"])
+        self.assertEqual(early["tSuccessPushMs"], success_t)
+        self.assertEqual(early["tReceiptMs"], receipt_t)
+        self.assertEqual(early["receipt"]["slot"], 777, "first receipt frozen")
+        self.assertEqual(early["_channelArrivals"]["nodeone"]["tMs"], channel_t)
+        self.assertFalse(late.get("_channelArrivals"))
+        self.assertIsNone(late["tReceiptMs"], "receipt never stays on a dup")
+        self.assertIsNone(late["tSuccessPushMs"], "success never stays on a dup")
+        self.assertIsNone(late["slot"])
+        self.assertFalse(late["receiptPolling"])
+        self.assertEqual(A.STORE.diag["orderReqDuplicate"], 1)
+        tl = A.STORE.timeline(self.run, full=True)
+        self.assertEqual(tl["counts"]["attempted"], 1)
+        self.assertEqual(tl["counts"]["observed"], 1)
+        self.assertEqual(tl["counts"]["unbound"], 0)
+        row = next(x for x in tl["legs"] if x["orderRequestSource"] == "platform-order")
+        self.assertEqual(row["hkL1aMs"], round(success_t - early["tOrderOutMs"], 1))
+        self.assertEqual(row["hkL3Ms"], round(receipt_t - early["tOrderOutMs"], 1))
+        self.assertEqual(row["channelArrivals"], [{"channel": "nodeone", "api": "signatureNotification",
+            "ms": round(channel_t - early["tOrderOutMs"], 1)}])
+        self.assertEqual(early["_headSnapshots"]["solana"]["anchorTs"], early["tOrderOutMs"])
+        A.STORE.mark_close(self.run)
+        with A.STORE.lock:
+            self.assertFalse(A.STORE._run_pinned_locked(self.run))
+
+    def test_platform_ack_and_receipt_first(self):
+        self.check_pair(False, False)
+
+    def test_platform_ack_first_raw_receipt_first(self):
+        self.check_pair(False, True)
+
+    def test_raw_ack_first_platform_receipt_first(self):
+        self.check_pair(True, False)
+
+    def test_raw_ack_and_receipt_first(self):
+        self.check_pair(True, True)
+
+    def test_same_order_dedup_precedes_full_slot_capacity(self):
+        A.STORE.mark_open(self.run, manifest={"version": 1, "runId": self.run,
+            "legs": [{"platform": "okx", "chain": "solana", "rounds": 1}]})
+        early, late, _ = self.pair()
+        self.receipt(early)
+        self.receipt(late)
+        self.assertEqual(early["slot"], 0)
+        self.assertIsNone(late["slot"])
+        self.assertEqual(A.STORE.timeline(self.run)["counts"],
+            {"requested": 1, "attempted": 1, "observed": 1, "unbound": 0})
+
+    def test_known_chain_dup_and_later_unknown_chain_dup_do_not_poll(self):
+        body = self._wire_body(0x31)
+        tx = A._sol_wire_first_sig(body)
+        first = self.raw("solana", tx, body=body)
+        A.addons[0].request(first); A.addons[0].response(first)
+        self.clock += 10
+        duplicate = self.raw("solana", tx, body=body)
+        A.addons[0].request(duplicate); A.addons[0].response(duplicate)
+        self.clock += 10
+        later_unknown = self.platform("solana", tx)
+        A.addons[0].request(later_unknown); A.addons[0].response(later_unknown)
+        self.assertEqual(len(self.polls), 1)
+        self.assertTrue(duplicate.metadata["speedex_leg"][0]["dup"])
+        self.assertTrue(later_unknown.metadata["speedex_leg"][0]["dup"])
+        self.assertFalse(later_unknown.metadata["speedex_leg"][0]["receiptPolling"])
+
+    def test_closed_window_response_does_not_schedule_alias_poll(self):
+        body = self._wire_body(0x31)
+        tx = A._sol_wire_first_sig(body)
+        early = self.platform("solana", tx)
+        A.addons[0].request(early)
+        self.clock += 7
+        late = self.raw("solana", tx, body=body)
+        A.addons[0].request(late); A.addons[0].response(late)
+        A.STORE.mark_close(self.run)
+        A.addons[0].response(early)
+        self.assertEqual(len(self.polls), 1)
+        self.assertFalse(early.metadata["speedex_leg"][0]["receiptPolling"])
+
+    def test_alias_poll_requires_independent_equal_hash_and_same_run(self):
+        early, late, _ = self.pair(reverse_ack=True)
+        self.assertEqual(len(self.polls), 2)
+        early["receiptPolling"] = False
+        # Independent boundary checks, before a callback can qualify the alias.
+        original = early["_anchor"]["txHash"]
+        early["_anchor"]["txHash"] = None
+        self.assertIsNone(A.STORE.claim_receipt_poll(early))
+        early["_anchor"]["txHash"] = "4" * 88
+        self.assertIsNone(A.STORE.claim_receipt_poll(early))
+        early["_anchor"]["txHash"] = original
+        late["runId"] = "other-window"
+        self.assertIsNone(A.STORE.claim_receipt_poll(early))
+
+    def check_alias_poll_failure(self, formal_receipt_first):
+        early, late, tx = self.pair(reverse_ack=True)
+        self.assertEqual(len(self.polls), 2)
+        self.assertIsNone(early["chain"])
+        self.clock += 10
+        A.addons[0].websocket_message(self.success(tx))
+        if formal_receipt_first:
+            self.receipt(late)
+        A._settle_incomplete(early, "receipt poll timeout")
+        self.assertEqual(early["incomplete"], "receipt poll timeout")
+        self.assertIsNone(late["incomplete"], "an unproven-chain alias cannot fail the formal request")
+        self.assertIsNone(A.STORE.claim_receipt_poll(early), "failed probe is terminal")
+        if not formal_receipt_first:
+            self.receipt(late)
+        self.assertIsNotNone(late["tReceiptMs"])
+        self.assertIsNotNone(late["tSuccessPushMs"])
+        self.assertIsNone(late["incomplete"])
+        A.STORE.mark_close(self.run)
+        with A.STORE.lock:
+            self.assertFalse(A.STORE._run_pinned_locked(self.run))
+        tl = A.STORE.timeline(self.run, full=True)
+        row = next(x for x in tl["legs"] if not x["dup"] and x.get("txHash") == tx)
+        self.assertIsNone(row["incomplete"])
+        self.assertEqual(tl["counts"]["observed"], 1)
+
+    def test_unknown_alias_failure_before_formal_receipt_is_diagnostic_only(self):
+        self.check_alias_poll_failure(False)
+
+    def test_unknown_alias_failure_after_formal_receipt_is_diagnostic_only(self):
+        self.check_alias_poll_failure(True)
+
+    def run_captured_worker(self, leg, rpc):
+        target, args = next(x for x in self.workers if x[1][1] is leg)
+        self.assertIs(target, self.real_poll_receipt)
+        self.assertIs(args[4], rpc, "worker must use the captured synthetic RPC, never live RPC")
+        target(*args)
+
+    def test_real_poll_worker_success_rebinds_earlier_alias(self):
+        from unittest.mock import patch
+        calls = []
+
+        def rpc(url, method, params):
+            calls.append((method, params))
+            return {"value": [{"confirmationStatus": "confirmed", "err": None, "slot": 777}]}
+
+        with patch.object(A, "_jsonrpc", rpc):
+            early, late, tx = self.pair(reverse_ack=True)
+        self.clock += 10
+        A.addons[0].websocket_message(self.success(tx))
+        self.clock += 100
+        self.run_captured_worker(late, rpc)
+        first_receipt = late["tReceiptMs"]
+        self.clock += 100
+        self.run_captured_worker(early, rpc)
+        self.assertEqual(calls, [("getSignatureStatuses", [[tx], {"searchTransactionHistory": True}])] * 2)
+        self.assertFalse(early["dup"])
+        self.assertTrue(late["dup"])
+        self.assertEqual(early["chain"], "solana")
+        self.assertEqual(early["tReceiptMs"], first_receipt)
+        self.assertIsNone(late["tReceiptMs"])
+        self.assertEqual(A.STORE.timeline(self.run)["counts"]["observed"], 1)
+
+    def test_real_poll_worker_alias_err_cannot_fail_formal(self):
+        from unittest.mock import patch
+        calls = []
+
+        def rpc(url, method, params):
+            calls.append((method, params))
+            err = {"InstructionError": [0, "synthetic"]} if len(calls) == 1 else None
+            return {"value": [{"confirmationStatus": "confirmed", "err": err, "slot": 777}]}
+
+        with patch.object(A, "_jsonrpc", rpc):
+            early, late, tx = self.pair(reverse_ack=True)
+        self.run_captured_worker(early, rpc)
+        self.assertEqual(early["incomplete"], "signature err")
+        self.assertIsNone(late["incomplete"])
+        self.clock += 100
+        self.run_captured_worker(late, rpc)
+        self.assertEqual(calls, [("getSignatureStatuses", [[tx], {"searchTransactionHistory": True}])] * 2)
+        self.assertIsNotNone(late["tReceiptMs"])
+        self.assertIsNone(late["incomplete"])
+        self.assertTrue(early["dup"])
+        self.assertIsNone(early["tReceiptMs"])
+
+    def test_later_round_and_old_hash_repeat_do_not_consume_another_slot(self):
+        early1, late1, tx1 = self.pair()
+        self.receipt(early1)
+        self.receipt(late1)
+        first_t = early1["tReceiptMs"]
+        self.clock += 1000
+        early2, late2, tx2 = self.pair(seed=0x32, oid="order-two")
+        self.receipt(late2)
+        self.receipt(early2)
+        self.assertNotEqual(tx1, tx2)
+        self.clock += 1000
+        # A later fanout repeat of R1 remains R1's alias, never a new R3 slot.
+        body = self._wire_body(0x31)
+        repeat = self.raw("solana", tx1, body=body)
+        A.addons[0].request(repeat)
+        A.addons[0].response(repeat)
+        replay = repeat.metadata["speedex_leg"][0]
+        self.receipt(replay, slot=999)
+        self.assertIs(replay["_dupOf"], early1)
+        self.assertFalse(early1["dup"])
+        self.assertFalse(early2["dup"])
+        self.assertEqual(early1["tReceiptMs"], first_t)
+        self.assertEqual(A.STORE.timeline(self.run)["counts"],
+            {"requested": 8, "attempted": 2, "observed": 2, "unbound": 0})
+
+    def candidate(self, platform, chain, ident):
+        """Independent request anchors for strict identity boundary unit cases."""
+        self.clock += 10
+        leg = A.STORE.new_leg(self.run, platform, chain,
+            {"t": self.clock, "tw": "synthetic", **ident})
+        A.STORE.update_anchor(leg, ident)
+        return leg
+
+    def test_same_hash_conflicting_order_never_merges(self):
+        tx = A._sol_wire_first_sig(self._wire_body(0x31))
+        early = self.candidate("okx", None, {"txHash": tx, "orderId": "order-one"})
+        late = self.candidate("okx", "solana", {"txHash": tx, "orderId": "order-two"})
+        self.receipt(early)
+        self.receipt(late)
+        self.assertFalse(early["dup"])
+        self.assertFalse(late["dup"])
+        self.assertEqual(A.STORE.timeline(self.run)["counts"]["attempted"], 2)
+
+    def test_same_order_conflicting_hash_never_merges(self):
+        tx1 = A._sol_wire_first_sig(self._wire_body(0x31))
+        tx2 = A._sol_wire_first_sig(self._wire_body(0x32))
+        early = self.candidate("okx", None, {"txHash": tx1, "orderId": "order-one"})
+        late = self.candidate("okx", "solana", {"txHash": tx2, "orderId": "order-one"})
+        self.receipt(early)
+        self.receipt(late)
+        self.assertFalse(early["dup"])
+        self.assertFalse(late["dup"])
+
+    def test_no_shared_identity_chain_alone_does_not_merge(self):
+        early = self.candidate("okx", None, {})
+        late = self.candidate("okx", "solana", {"txHash": "3" * 88})
+        self.receipt(early)
+        self.assertFalse(early["dup"])
+        self.assertFalse(late["dup"])
+
+    def test_shared_identity_across_platforms_does_not_merge(self):
+        ident = {"txHash": "3" * 88, "orderId": "order-one"}
+        early = self.candidate("okx", None, ident)
+        late = self.candidate("gmgn", "solana", ident)
+        self.receipt(early)
+        self.assertFalse(early["dup"])
+        self.assertFalse(late["dup"])
+        self.assertIsNone(late["tReceiptMs"])
+
+    def test_receipt_chain_conflict_does_not_redirect_to_other_chain(self):
+        ident = {"txHash": self.H, "orderId": "order-one"}
+        early = self.candidate("okx", None, ident)
+        late = self.candidate("okx", "bsc", ident)
+        A.STORE.dedup_order_identity(early)
+        self.assertTrue(early["dup"])
+        self.clock += 100
+        A._settle_receipt(early, {"chain": "arc", "status": 1,
+            "blockHash": "0x" + "ab" * 32, "blockNumber": "0x123"})
+        self.assertFalse(early["dup"])
+        self.assertIsNone(late["tReceiptMs"])
+        self.assertEqual(early["receipt"]["chain"], "arc")
+        self.assertEqual(early["chain"], "arc")
+        self.assertEqual(late["chain"], "bsc")
+        self.assertNotEqual(early["slot"], late["slot"])
+        specs = A.STORE.marks[self.run]["manifestLegs"]
+        self.assertEqual(specs[early["slot"]]["chain"], "arc")
+        self.assertEqual(specs[late["slot"]]["chain"], "bsc")
+        self.assertEqual(sum(x["slot"] == early["slot"] for x in A.STORE.legs[self.run]), 1)
+        self.assertEqual(A.STORE.timeline(self.run)["counts"],
+            {"requested": 8, "attempted": 2, "observed": 1, "unbound": 0})
+
+    def test_closed_old_window_receipt_cannot_mutate_new_run(self):
+        early, late, _ = self.pair()
+        A.STORE.mark_close(self.run)
+        new_run = "next-window"
+        A.STORE.mark_open(new_run, manifest={"version": 1, "runId": new_run,
+            "legs": [{"platform": "okx", "chain": "solana", "rounds": 1}]})
+        self.clock += 100
+        self.receipt(early)
+        self.receipt(late)
+        self.assertIsNone(early["tReceiptMs"])
+        self.assertIsNone(late["tReceiptMs"])
+        self.assertEqual(A.STORE.timeline(new_run)["counts"]["attempted"], 0)
+
+    def test_vetoed_pending_leg_cannot_acquire_slot_on_receipt(self):
+        early, late, _ = self.pair()
+        A.STORE.update_anchor(early, {"txHash": A._sol_wire_first_sig(self._wire_body(0x34))})
+        self.receipt(early)
+        self.assertTrue(early["_anchorVeto"])
+        self.assertIsNone(early["slot"])
+        self.assertIsNone(early["tReceiptMs"])
+        self.assertFalse(late["dup"])
+
+
+
+
+class TestTgFrameProbe(unittest.TestCase):
+    """TG 帧探针（2026-10-03 LA bsc/sol 0/5 排查）——形状提取有界、无帧体。"""
+
+    def test_order_channel_list_shape(self):
+        info = A._tg_frame_probe(json.dumps({"channel": "tg_processed_order_info", "data": [
+            {"h": "0x" + "ab" * 32, "oi": "od1", "st": "successful", "si": "buy", "ch": "bsc"},
+            {"h": "0x" + "cd" * 32, "st": "failed", "si": "sell", "ch": "solana"},
+        ]}))
+        self.assertEqual(info["channel"], "tg_processed_order_info")
+        self.assertEqual(info["dataShape"], "list")
+        self.assertEqual(info["n"], 2)
+        self.assertEqual(info["idKeys"], {"h", "oi"})
+        self.assertEqual(info["st"], {"successful", "failed"})
+        self.assertEqual(info["si"], {"buy", "sell"})
+        self.assertEqual(info["chains"], {"bsc", "solana"})
+
+    def test_channel_miss_data_not_list_no_ids(self):
+        mkt = A._tg_frame_probe(json.dumps({"channel": "market-ticker", "data": {"price": 1}}))
+        self.assertEqual(mkt["channel"], "market-ticker")
+        self.assertEqual(mkt["dataShape"], "dict")
+        self.assertEqual(mkt["n"], 0)
+        self.assertEqual(mkt["idKeys"], set())
+        nochan = A._tg_frame_probe(json.dumps({"data": []}))
+        self.assertIsNone(nochan["channel"])
+        nodict = A._tg_frame_probe("not-json{")
+        self.assertIsNone(nodict)
+
+    def test_probe_counters_bump_in_handler(self):
+        fresh()
+        run = "tg-probe-window"
+        A.STORE.mark_open(run, manifest={"version": 1, "runId": run, "legs": [{"platform": "gmgn", "chain": "bsc", "rounds": 1}]})
+        f = FakeFlow("ws.gmgn.ai", "/v2/ws")
+        f.websocket = types.SimpleNamespace(messages=[FakeWSMsg(json.dumps({"channel": "tg_order_info", "data": [{"h": "0x" + "ab" * 32, "st": "successful", "si": "buy", "ch": "bsc"}]}))])
+        A.addons[0].websocket_message(f)
+        f.websocket.messages = [FakeWSMsg(json.dumps({"channel": "market-ticker", "data": {"p": 1}}))]
+        A.addons[0].websocket_message(f)
+        self.assertEqual(A.STORE.diag["tgProbeFrames"], 2)
+        self.assertEqual(A.STORE.diag["tgProbeChan.tg_order_info"], 1)
+        self.assertEqual(A.STORE.diag["tgProbeChan.market-ticker"], 1)
+        self.assertEqual(A.STORE.diag["tgProbeDataNotList"], 1)
+        self.assertEqual(A.STORE.diag["tgProbeNoIds"], 1)
+        self.assertEqual(A.STORE.run_diag[run]["tgProbeFrames"], 2)
+
+
+class TestFullnodeTxProbe(unittest.TestCase):
+    """fullnode 按笔推送实证探针：默认关闭；okx+已登记链+开关 → 每腿一次点火。"""
+
+    def setUp(self):
+        from unittest.mock import patch
+        fresh()
+        self.threads = []
+        owner = self
+
+        class RecThread:
+            def __init__(self, target, args=(), daemon=None):
+                self.target, self.args = target, args
+
+            def start(self):
+                owner.threads.append((self.target, self.args))
+
+        p = patch.object(A.threading, "Thread", RecThread)
+        p.start()
+        self.addCleanup(p.stop)
+        p = patch.object(A, "_probe_enabled", lambda: True)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def leg(self, platform="okx", chain="bsc"):
+        return {"platform": platform, "chain": chain, "runId": "probe-run",
+                "tOrderOutMs": 12345.0}
+
+    def test_okx_registered_chain_fires_once(self):
+        tx = "0x" + "cd" * 32
+        A._maybe_probe_fullnode(self.leg(), tx)
+        self.assertEqual(len(self.threads), 1)
+        target, args = self.threads[0]
+        self.assertIs(target, A._fullnode_probe_worker)
+        self.assertEqual(args, ("bsc", tx, "probe-run", 12345.0))
+
+    def test_gates(self):
+        from unittest.mock import patch
+        tx = "0x" + "cd" * 32
+        A._maybe_probe_fullnode(self.leg(platform="gmgn"), tx)
+        A._maybe_probe_fullnode(self.leg(chain="arc"), tx)  # 未登记（上游无订阅）
+        A._maybe_probe_fullnode(self.leg(chain=None), tx)
+        A._maybe_probe_fullnode(self.leg(), None)
+        self.assertEqual(len(self.threads), 0)
+        with patch.object(A, "_probe_enabled", lambda: False):
+            A._maybe_probe_fullnode(self.leg(), tx)
+        self.assertEqual(len(self.threads), 0)
+
+    def test_claim_receipt_poll_integration(self):
+        """生产路径：okx 广播响应锁 hash → receipt 闩锁 → 探针同机点火（每腿一次）。"""
+        run = "probe-claim-run"
+        A.STORE.mark_open(run)
+        h1 = "0x" + "ef" * 32
+        f = FakeFlow(
+            "web3.okx.com",
+            "/priapi/v6/dx/trade/multi/broadcast",
+            "POST",
+            req_body=json.dumps({"chainId": 56, "signedTx": "0xdeadbeef"}),
+            resp_body=json.dumps({"code": "0", "data": {"transactionHash": h1, "orderId": "o1"}}),
+        )
+        A.addons[0].request(f)
+        A.addons[0].response(f)
+        time.sleep(0.05)
+        probes = [a for t, a in self.threads if t is A._fullnode_probe_worker]
+        self.assertEqual(len(probes), 1, "receipt 闩锁同一时机点燃探针")
+        self.assertEqual(probes[0][0], "bsc")
+        self.assertEqual(probes[0][1], h1)
+        leg = f.metadata["speedex_leg"][0]
+        self.assertIsNone(A.STORE.claim_receipt_poll(leg), "闩锁幂等——探针不重复点火")
+        self.assertEqual(len(probes), 1)
+
+    def test_worker_subscribe_and_log(self):
+        """worker：发送与页面同构的按笔订阅，入站帧落 JSONL，窗口结束收尾。"""
+        from unittest.mock import patch
+        import collections
+
+        tx = "0x" + "ab" * 32
+        sent = []
+        logged = []
+
+        class FakeWS:
+            def __init__(self):
+                self.queue = collections.deque()
+
+            async def send(self, msg):
+                sent.append(msg)
+
+            async def recv(self):
+                if self.queue:
+                    return self.queue.popleft()
+                raise asyncio.TimeoutError
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        import asyncio
+
+        holder = {}
+
+        class StubWSS:
+            def connect(self, url, **kw):
+                holder["url"] = url
+                holder["kw"] = kw
+                ws = FakeWS()
+                ws.queue.append(json.dumps({"jsonrpc": "2.0", "id": tx, "result": "0xsub1"}))
+                ws.queue.append(json.dumps({"jsonrpc": "2.0", "method": "eth_subscription",
+                                            "params": {"subscription": "0xsub1", "result": {"hash": tx, "status": 1}}}))
+                return ws
+
+        with patch.object(A, "_PROBE_WINDOW_S", 0.4), \
+             patch.object(A, "_PROBE_PING_S", 0.2), \
+             patch.object(A, "_probe_log", lambda rec: logged.append(rec)), \
+             patch.dict(sys.modules, {"websockets": StubWSS()}):
+            A._fullnode_probe_worker("bsc", tx, "probe-run", 999.0)
+
+        sub = json.loads(sent[0])
+        self.assertEqual(sub["id"], tx)
+        self.assertEqual(sub["method"], "eth_subscribe")
+        self.assertEqual(sub["params"][0], "newTransactionSubscribe")
+        self.assertEqual(sub["params"][1][0]["hash"], tx)
+        self.assertEqual(sub["params"][1][0]["status"], "syncTxPush")
+        self.assertEqual(holder["url"], A._PROBE_URLS["bsc"][1])
+        events = [r["event"] for r in logged]
+        self.assertEqual(events[0], "subscribed")
+        frames = [r for r in logged if r["event"] == "frame"]
+        self.assertEqual(len(frames), 2, "ACK + 通知帧都落日志")
+        self.assertIn('"status":1', frames[1]["payload"].replace(" ", ""))
+        self.assertEqual(frames[0]["tx"], tx)
+        self.assertEqual(frames[0]["tOrderOutMs"], 999.0)
+        self.assertEqual(events[-1], "window-end")
+        # 记录无 secret 形键/值（公开链上数据）
+        for r in logged:
+            self.assertNotIn("authorization", json.dumps(r).lower())
+
+
+if __name__ == "__main__":
+    unittest.main()
