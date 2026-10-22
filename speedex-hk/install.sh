@@ -79,7 +79,7 @@ chmod 700 "$APP"
 # mitmproxy 12.x 需要 Python≥3.12；py3.11 节点锁 11.0.2（对齐路径 = OS/Python 升级）。
 PYVER="$(python3 -c 'import sys;print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
 if [ "$(printf '%s\n3.12\n' "$PYVER" | sort -V | head -1)" = "3.12" ]; then
-  MITM_PROXY_VER=12.2.3
+  MITM_PROXY_VER=12.3.0  # 2026-10-22：12.3 的 certifi>=2026.10.19 不再信任 eMudhra emSign ECC Root CA - G3（中间 CA 私钥泄露）
   MSGPACK_VER=1.1.2
 else
   MITM_PROXY_VER=11.0.2

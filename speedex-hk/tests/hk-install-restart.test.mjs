@@ -153,7 +153,7 @@ case "$1" in
 esac
 exit 0
 `,
-  // python3 shim：-c 版本探测钉 3.12（锁定集 12.2.3 分支），其余转真实解释器
+  // python3 shim：-c 版本探测钉 3.12（锁定集 12.3.0 分支），其余转真实解释器
   python3: `#!/bin/sh
 if [ "$1" = "-c" ]; then echo "3.12"; exit 0; fi
 exec "$REALPY" "$@"
@@ -171,11 +171,11 @@ exit 0
 const VENV_STUBS = {
   python: STUBS.python3,
   // pip stub：show 报夹具钉选版本（FIXTURE_*_VER 可覆盖——依赖漂移用例注入旧版；
-  // 缺省 = python3 stub 钉的 3.12 分支钉选集 12.2.3/17.1/1.1.2）；install 幂等空转
+  // 缺省 = python3 stub 钉的 3.12 分支钉选集 12.3.0/17.1/1.1.2）；install 幂等空转
   pip: `#!/bin/sh
 if [ "$1" = "show" ]; then
   case "$2" in
-    mitmproxy) printf 'Name: mitmproxy\\nVersion: %s\\n' "\${FIXTURE_MITM_VER:-12.2.3}" ;;
+    mitmproxy) printf 'Name: mitmproxy\\nVersion: %s\\n' "\${FIXTURE_MITM_VER:-12.3.0}" ;;
     websockets) printf 'Name: websockets\\nVersion: %s\\n' "\${FIXTURE_WS_VER:-17.1}" ;;
     msgpack) printf 'Name: msgpack\\nVersion: %s\\n' "\${FIXTURE_MSGPACK_VER:-1.1.2}" ;;
   esac
