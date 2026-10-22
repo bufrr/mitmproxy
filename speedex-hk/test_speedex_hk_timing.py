@@ -6210,11 +6210,11 @@ class ChainHeadTests(unittest.TestCase):
 
 class TestChainHeadSolForkContinuity(unittest.TestCase):
     """Solana 链头在 processed 承诺下无 hash——slotSubscribe 的 parent 槽位是唯一
-    分叉连续性证据：新头必须衔接已接受头（parent == 前一已接受 slot）；同高不同
-    parent = 分叉；parent 跳跃 / processed 回滚后在新分叉推进到更高 slot 同样判
-    不连续——清空重锚（与 EVM hash/parentHash 冲突清空同律），分叉前的缓冲头
-    不得给后续 hook 出值（plugin.md：回退/冲突不可出值）。getSlot 轮询是裸整数
-    （无 parent）——同今的降级回退：无连续性证据即不判冲突。"""
+    分叉连续性证据：同高不同 parent = 分叉、高度回退——清空重锚（与 EVM hash/parentHash
+    冲突清空同律），分叉前的缓冲头不得给后续 hook 出值。v10.14（speedex AG-2 同步）：
+    更高 slot 的 parent 不是上一头（漏通知，或 Alpenglow 候选 slot 开始后被跳过）= 跳过，
+    不清缓冲——slot 号单调，旧头仍是有效 slot 刻度。getSlot 轮询是裸整数（无 parent）——
+    无连续性证据即不判冲突。"""
 
     @staticmethod
     def _window(now):
@@ -6246,19 +6246,17 @@ class TestChainHeadSolForkContinuity(unittest.TestCase):
             )
             snap = c.snapshot("sol-heads", 1250)["solana"]
             self.assertEqual((snap["status"], snap["parent"]), ("ok", 99))
-            # parent 跳跃（未衔接已接受头）= 不连续
+            # v10.14：更高 slot 的 parent 跳号（漏通知 102/103）= 跳过，不清——旧头仍可给更早锚出值
             now[0] = 1300
             c.add("solana", {"parent": 102, "slot": 104, "root": 101}, "ws-head")
-            self.assertEqual(
-                c.snapshot("sol-heads", 1250)["solana"]["status"], "no-pre-anchor-head"
-            )
+            snap = c.snapshot("sol-heads", 1250)["solana"]
+            self.assertEqual((snap["status"], snap["height"]), ("ok", 101))
             self.assertEqual(c.snapshot("sol-heads", 1350)["solana"]["height"], 104)
-            # processed 回滚后在新分叉推进到更高 slot——纯高度检查看不见，parent 衔接拒收
+            # Alpenglow 候选 slot 104 被跳过，105 建在 102 上：前进 + 更老 parent = 跳过，不清
             now[0] = 1400
             c.add("solana", {"parent": 102, "slot": 105, "root": 102}, "ws-head")
-            self.assertEqual(
-                c.snapshot("sol-heads", 1350)["solana"]["status"], "no-pre-anchor-head"
-            )
+            snap = c.snapshot("sol-heads", 1350)["solana"]
+            self.assertEqual((snap["status"], snap["height"]), ("ok", 104))
             snap = c.snapshot("sol-heads", 1450)["solana"]
             self.assertEqual(
                 (snap["status"], snap["height"], snap["parent"]), ("ok", 105, 102)
@@ -7062,7 +7060,7 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.10.19-okx-batch-broadcast-identity-v10.13")
+        self.assertEqual(A.ADDON_VERSION, "2026.10.22-sol-slot-skip-v1-sig-v10.14")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 
@@ -7377,6 +7375,37 @@ class TestRequestSideBroadcastIdentity(unittest.TestCase):
             "4XR92Zct9ZodXzisJ4kov3upmTvMotYVrg65MHP8aoCjSPJwUa7vjaXK5VhDF7ZiiF16v7cY5BPazCLnVqZ3yzb")
         for bad in ["", "!!!", "AAAA", None]:
             self.assertIsNone(A._sol_wire_first_sig(bad), bad)
+
+    # v10.14：v1 交易（首字节 129，签名在消息之后）。跨语言向量 = speedex
+    # tests/helpers/sol-tx-v1-wire.mjs 合成字节 + scripts/lib/sol-tx-v1.mjs solTxV1FirstSignature 结果；
+    # 实链向量 = 主网 v1 交易 getTransaction(encoding base64) 原样字节，签名 = 链上回读。
+    def test_sol_wire_first_sig_v1(self):
+        import json as _json
+        vec = _json.loads(Path(__file__).with_name("tests").joinpath("fixtures", "sol-tx-v1-vectors.json").read_text())
+        for name, v in vec["synthetic"].items():
+            self.assertEqual(A._sol_wire_first_sig(v["b64"]), v["sig"], name)
+        real = vec["mainnet"]
+        self.assertEqual(A._sol_wire_first_sig(real["b64"]), real["sig"], "主网 v1 交易首签名 = 链上回读")
+        # 旧实现把 129 当 compact-u16 签名数——实链字节首字节确为 129（v1 分支必经）
+        self.assertEqual(__import__("base64").b64decode(real["b64"])[0], 129)
+
+    def test_sol_v1_first_sig_rejects(self):
+        import base64 as _b64
+        vec = __import__("json").loads(Path(__file__).with_name("tests").joinpath("fixtures", "sol-tx-v1-vectors.json").read_text())
+        good = bytearray(_b64.b64decode(vec["synthetic"]["signed"]["b64"]))
+        self.assertIsNotNone(A._sol_v1_first_sig(bytes(good)))
+        self.assertIsNone(A._sol_v1_first_sig(bytes(good) + b"\x00"), "trailing data")
+        self.assertIsNone(A._sol_v1_first_sig(bytes(good[:-64])), "bare message: no signature")
+        zero = bytes(good[:-64]) + bytes(64)
+        self.assertIsNone(A._sol_v1_first_sig(zero), "all-zero placeholder signature")
+        bad_mask = bytearray(good); bad_mask[4] = 0b01  # priority fee bit 0 without bit 1
+        self.assertIsNone(A._sol_v1_first_sig(bytes(bad_mask)), "priority fee needs bits 0 and 1")
+        no_signer = bytearray(good); no_signer[1] = 0
+        self.assertIsNone(A._sol_v1_first_sig(bytes(no_signer)), "no required signature")
+        self.assertIsNone(A._sol_v1_first_sig(bytes(good[:20])), "truncated")
+        self.assertIsNone(A._sol_v1_first_sig(b"\x81" + bytes(5000)), "over 4096 bytes")
+        for k in ("bare", "trailing"):
+            self.assertIsNone(A._sol_wire_first_sig(vec["synthetic_reject"][k]), k)
 
     def test_request_classification_carries_derived_identity(self):
         # EVM：eth_sendRawTransaction 分类结果带 reqTxHash（体推导），不写签名原文

@@ -227,8 +227,8 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # 生效的宿主模式集——mitmproxy ctx.options 真实生效值优先、SPEEDEX_HK_ALLOW_HOSTS
 # env unit 声明兜底、unavailable 不猜——+ allowHostsSource + ctrlPort；切换解密
 # 模式后历史批不得拿当前配置解释）、Solana 链头 parent 连续性（slotSubscribe 父
-# 槽位必须衔接已接受头、同高异父=分叉；不连续即清空重锚，与 EVM hash/parentHash
-# 冲突清空同律；样本保留 parent 字段）。修订经过见 git 历史；行为由
+# 槽位同高异父=分叉即清空重锚，与 EVM hash/parentHash 冲突清空同律；v10.14 起更高 slot
+# 的父槽跳号视为跳过不清；样本保留 parent 字段）。修订经过见 git 历史；行为由
 # deploy/hk-proxy/test_speedex_hk_timing.py 与 tests/hk-timing*.test.mjs 钉住。
 # v10.5（2026-10-07）：链头轮询按链节拍（RH/Arc 200ms、BSC/Sol 500ms，快照 intervalMs 按链
 # 如实）、429/错误退避、WS newHeads 主端点失败后试已知 WSS fallback、/health.diag.headWs 可见。
@@ -237,7 +237,11 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # 自身的 calldata 选择器区分 approve(0x095ea7b3)/swap，恰一笔非 approve 才入锚（txHash+orderId），
 # 否则不入锚（fail-closed）。此前该形状无身份 → 腿 tx=None，EU 精确身份回配不到授权轮（Arc 授权轮推送缺失）。
 # （v10.12 号留给 2026-10-08 未合并的 WS 连接诊断 WIP。）
-ADDON_VERSION = "2026.10.19-okx-batch-broadcast-identity-v10.13"
+# v10.14（2026-10-22，speedex AG-3）：① Solana 链头连续性与 EU 侧 AG-2 同口径——更高 slot 的父槽
+# 跳号（漏通知 / Alpenglow 候选 slot 被跳过）视为跳过不清缓冲，同高异父与高度回退仍清；Alpenglow 后
+# 旧规则使约 4% 样本 stream-interrupted。② OKX Solana BlockRazor sendTransaction 体为 v1 交易
+# （首字节 129，签名在消息之后）时按 v1 布局取首签名（此前误当 compact-u16 签名数，身份必错 → 腿缺证据）。
+ADDON_VERSION = "2026.10.22-sol-slot-skip-v1-sig-v10.14"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -364,15 +368,76 @@ def _b58encode(b):
     return "1" * pad + out
 
 
+_SOL_TX_V1_VERSION_BYTE = 129
+_SOL_TX_V1_MAX_BYTES = 4096
+
+
+def _sol_v1_first_sig(raw):
+    """Solana v1 交易（SIMD-0385，首字节 129）→ 首个签名（base58）；v1 的签名在消息**之后**。
+    布局与净化规则逐项移植 speedex `scripts/lib/sol-tx-v1.mjs decodeSolTxV1`：VersionByte · 3B 头 ·
+    u32 config mask · 32B lifetime · u8 指令数 · u8 地址数 · 地址 · popcount(mask)×4B config 值 ·
+    指令头 (u8 program, u8 nAccounts, u16 nData) · 指令载荷 · 签名×numRequiredSignatures。
+    任一净化失败 / 裸消息 / 全零占位签名 → None（fail-closed，不猜）。"""
+    n = len(raw)
+    if n == 0 or raw[0] != _SOL_TX_V1_VERSION_BYTE or n > _SOL_TX_V1_MAX_BYTES or n < 1 + 3 + 4 + 32 + 2:
+        return None
+    req, ro_signed, ro_unsigned = raw[1], raw[2], raw[3]
+    if req < 1 or req > 12 or ro_signed >= req:
+        return None
+    mask = int.from_bytes(raw[4:8], "little")
+    if bool(mask & 1) != bool(mask & 2):  # priority fee needs bits 0 and 1 together
+        return None
+    off = 8 + 32
+    n_ix, n_addr = raw[off], raw[off + 1]
+    off += 2
+    if n_ix > 64 or n_addr > 64 or n_addr < req + ro_unsigned or off + n_addr * 32 > n:
+        return None
+    addrs = [raw[off + i * 32 : off + (i + 1) * 32] for i in range(n_addr)]
+    if len(set(addrs)) != n_addr:
+        return None
+    off += n_addr * 32
+    slots = bin(mask).count("1")
+    if off + slots * 4 > n:
+        return None
+    if mask & (1 << 4):  # heap size: 1 KiB multiple within [32 KiB, 256 KiB]
+        at = off + bin(mask & 0b1111).count("1") * 4
+        heap = int.from_bytes(raw[at : at + 4], "little")
+        if heap % 1024 or heap < 32 * 1024 or heap > 256 * 1024:
+            return None
+    off += slots * 4
+    if off + n_ix * 4 > n:
+        return None
+    heads = []
+    for _ in range(n_ix):
+        heads.append((raw[off], raw[off + 1], int.from_bytes(raw[off + 2 : off + 4], "little")))
+        off += 4
+    for prog, n_acc, n_data in heads:
+        if prog >= n_addr or off + n_acc + n_data > n:
+            return None
+        if any(ix >= n_addr for ix in raw[off : off + n_acc]):
+            return None
+        off += n_acc + n_data
+    if n - off != req * 64:  # bare message (0) or trailing data → no signed tx
+        return None
+    sig = raw[off : off + 64]
+    if not any(sig):
+        return None
+    return _b58encode(sig)
+
+
 def _sol_wire_first_sig(b64_body):
-    """solana wire 交易（base64）→ 首个签名（base58）——wire 头 = compact-u16 签名数
-    后紧跟 64B 签名表；与链上 getTransaction 回读签名逐字节一致（实证向量见测试）。"""
+    """solana wire 交易（base64）→ 首个签名（base58）。legacy/v0：wire 头 = compact-u16
+    签名数后紧跟 64B 签名表；v1（首字节 129，2026-10 起约占主网 45%）：签名在消息之后，
+    走 _sol_v1_first_sig（此前把 129 当 compact-u16 双字节签名数，取出的是头部字节，
+    身份必不匹配 → 腿缺证据）。与链上 getTransaction 回读签名逐字节一致（实证向量见测试）。"""
     try:
         raw = base64.b64decode(b64_body, validate=True)
     except Exception:
         return None
     if not raw:
         return None
+    if raw[0] == _SOL_TX_V1_VERSION_BYTE:
+        return _sol_v1_first_sig(raw)
     count = raw[0]
     off = 1
     if count & 0x80:  # compact-u16 双字节形
@@ -1877,10 +1942,11 @@ class ChainHeadWindow:
                 return
             # A regression/conflicting head breaks continuity; never select a
             # pre-fork buffered head for a later hook. Solana heads carry no hash —
-            # the parent slot is the continuity link: a new head must extend the
-            # accepted head (parent == previous slot); same height with a different
-            # proven parent is a fork. Discontinuity clears and re-anchors, mirroring
-            # the EVM hash/parentHash conflict rule.
+            # the parent slot is the continuity link: same height with a different
+            # proven parent is a fork (clears, mirroring the EVM hash/parentHash rule).
+            # v10.14（2026-10-22，speedex AG-2 同步）：更高 slot 的 parent 不是上一头 = 跳过
+            # （漏通知，或 Alpenglow 下候选 slot 开始后被跳过），不是分叉——slot 号单调，旧样本
+            # 仍是有效 slot 刻度，不清缓冲。高度回退仍清（上面 height < previous）。
             if previous and (
                 height < previous["height"]
                 or (height == previous["height"] and block_hash != previous["hash"])
@@ -1892,14 +1958,9 @@ class ChainHeadWindow:
                 or (
                     sol
                     and parent is not None
-                    and (
-                        (height > previous["height"] and parent != previous["height"])
-                        or (
-                            height == previous["height"]
-                            and previous.get("parent") is not None
-                            and previous["parent"] != parent
-                        )
-                    )
+                    and height == previous["height"]
+                    and previous.get("parent") is not None
+                    and previous["parent"] != parent
                 )
             ):
                 buf.clear()
