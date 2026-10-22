@@ -1,0 +1,25 @@
+# speedex 扫链测速透传隧道（/etc/systemd/system/speedex-tunnel.service；install-tunnel.sh 渲染 __EU_IP__/__RESOLVER_ALLOW__）。
+# 与 speedex-mitm 并列、互不影响。DynamicUser 沙箱；IPAddressDeny 内核级拒回环/私网出站（主机名解析到回环亦拦截），
+# __RESOLVER_ALLOW__ 放行本机 systemd-resolved（127.0.0.53）。
+[Unit]
+Description=speedex trenches no-decrypt CONNECT tunnel (:8444)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 -I /usr/local/lib/speedex-tunnel/speedex_tunnel.py --port 8444 --allow __EU_IP__
+DynamicUser=yes
+Restart=always
+RestartSec=2
+IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
+__RESOLVER_ALLOW__
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+MemoryMax=96M
+TasksMax=64
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
