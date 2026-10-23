@@ -6986,13 +6986,13 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertEqual(cm.exception.status, 429)
         self.assertEqual(len(calls), 1, "HTTP 拒绝不立即重试（不加倍打限流端点）")
 
-    def test_ws_url_order_is_primary_then_known_wss_fallbacks(self):
+    def test_ws_url_order_primary_first_except_fallback_first_chains(self):
         rh = A._head_ws_urls("robinhood")
-        self.assertEqual(rh[0], "wss://rpc.mainnet.chain.robinhood.com", "主端点先试（旧行为）")
         self.assertEqual(
-            rh[1:],
-            ["wss://robinhood-rpc.publicnode.com", "wss://robinhood.rpc.blxrbdn.com"],
-            "只派生已知 WSS 提供方；pocket.network 不臆造 wss",
+            rh,
+            ["wss://robinhood-rpc.publicnode.com", "wss://robinhood.rpc.blxrbdn.com",
+             "wss://rpc.mainnet.chain.robinhood.com"],
+            "v10.16：RH 主端点拒绝 WSS 升级——publicnode 先试、主端点最后；只派生已知 WSS 提供方，pocket.network 不臆造 wss",
         )
         bsc = A._head_ws_urls("bsc")
         self.assertEqual(bsc, ["wss://bsc-dataseed1.binance.org", "wss://bsc-rpc.publicnode.com"])
@@ -7004,7 +7004,8 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         try:
             A.CHAINS["robinhood"]["rpcFallbacks"] = ["https://evilpublicnode.com", "https://x.publicnode.com"]
             self.assertEqual(
-                A._head_ws_urls("robinhood")[1:], ["wss://x.publicnode.com"]
+                A._head_ws_urls("robinhood"),
+                ["wss://x.publicnode.com", "wss://rpc.mainnet.chain.robinhood.com"],
             )
         finally:
             A.CHAINS["robinhood"]["rpcFallbacks"] = orig
@@ -7061,10 +7062,10 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
 
         def connect(url, **kw):
             tried.append(url)
-            if "chain.robinhood.com" in url:
-                raise InvalidStatus(403)
             if "publicnode" in url:
                 raise ConnectionRefusedError("refused")
+            if "blxrbdn" in url:
+                raise InvalidStatus(400)
             return FakeWS(holder["c"])
 
         c = A.ChainHeadWindow(rpc_call=lambda *a, **k: None, connect=connect)
@@ -7079,19 +7080,19 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertEqual(
             tried,
             [
-                "wss://rpc.mainnet.chain.robinhood.com",
                 "wss://robinhood-rpc.publicnode.com",
                 "wss://robinhood.rpc.blxrbdn.com",
+                "wss://rpc.mainnet.chain.robinhood.com",
             ],
-            "主端点 → publicnode → blxrbdn 顺序",
+            "v10.16：publicnode → blxrbdn → 主端点顺序",
         )
         d = c.ws_diag_snapshot()
         self.assertEqual(d["attempts"]["robinhood"], 3)
         self.assertEqual(d["fail"]["robinhood"], 2, "两次失败均可见（不再静默）")
         self.assertEqual(d["subscribed"]["robinhood"], 1)
-        self.assertEqual(d["active"]["robinhood"], "robinhood.rpc.blxrbdn.com")
+        self.assertEqual(d["active"]["robinhood"], "rpc.mainnet.chain.robinhood.com")
         self.assertEqual(
-            d["lastErr"]["robinhood"], "robinhood-rpc.publicnode.com: ConnectionRefusedError"
+            d["lastErr"]["robinhood"], "robinhood.rpc.blxrbdn.com: InvalidStatus:400"
         )
         blob = json.dumps(d)
         self.assertNotIn("wss://", blob, "诊断只记 host，不记 URL")
@@ -7166,7 +7167,7 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.10.22-sol-multisource-head-v10.15")
+        self.assertEqual(A.ADDON_VERSION, "2026.10.23-rh-publicnode-head-v10.16")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 

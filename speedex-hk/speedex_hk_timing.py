@@ -245,7 +245,10 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # slotSubscribe，取最高 slot；落后源的较低 slot 与他源重复 slot 丢弃计数（diag.headPoll.wsBehind/wsLead），不再按
 # 回退清缓冲；样本记 wsOrigin。根因：公共 api.mainnet-beta 流间歇落后 20–39 slot 且不断线（HK 8 分钟实测 p90 20、
 # publicnode ≤2、CPU 闲）。EVM 不变（单源 + 失败轮换）。
-ADDON_VERSION = "2026.10.22-sol-multisource-head-v10.15"
+# v10.16（2026-10-23，speedex 批 n33yw）：Robinhood 链头 ws 源 publicnode 优先——主端点
+# rpc.mainnet.chain.robinhood.com 拒绝 WSS 升级（非 101 / HTTP 400），旧顺序每次启动/断线重连都先撞主端点
+# 再换源，首轮点击前只有 rpc-poll 头（RH 未核验 → round-reference-unverified、t+N 缺失）。主端点留作最后一档。
+ADDON_VERSION = "2026.10.23-rh-publicnode-head-v10.16"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -1677,6 +1680,8 @@ HEAD_POLL_429_FLOOR_S = 1.0
 # add() 的 hash/parentHash（Solana parent slot）连续性检查跨端点同样生效。
 HEAD_WS_PROVIDER_SUFFIXES = ("publicnode.com", "blxrbdn.com")
 HEAD_WS_RETRY_S = 0.5  # 同一轮内换下一个端点前的间隔
+# v10.16：主 RPC 拒绝 WSS 升级的链——已知 WSS 后备排在主端点之前（主端点留作最后一档）
+HEAD_WS_FALLBACK_FIRST = frozenset({"robinhood"})
 HEAD_WS_CYCLE_BACKOFF_S = (2.0, 30.0)  # 整轮端点都失败后的退避（起步, 上限）
 HEAD_WS_STALL_S = 10.0  # 已订阅却无通知超过此值 → 视为失效换端点
 
@@ -1714,11 +1719,11 @@ def _host_of(url):
 
 
 def _head_ws_urls(chain):
-    """主 RPC 的 ws 形（旧行为）+ 已知 WSS 提供方的 fallback；去重、保序。"""
+    """主 RPC 的 ws 形 + 已知 WSS 提供方的 fallback；去重、保序。HEAD_WS_FALLBACK_FIRST 链主端点排最后。"""
     spec = CHAINS[chain]
     out = []
     primary = _ws_url(spec["rpc"])
-    if primary:
+    if primary and chain not in HEAD_WS_FALLBACK_FIRST:
         out.append(primary)
     for u in spec.get("rpcFallbacks", []):
         host = _host_of(u)
@@ -1729,6 +1734,8 @@ def _head_ws_urls(chain):
         w = _ws_url(u)
         if w and w not in out:
             out.append(w)
+    if primary and primary not in out:
+        out.append(primary)
     return out
 
 
@@ -2121,7 +2128,7 @@ class ChainHeadWindow:
             if self.stop.is_set():
                 break
             if got_frame:
-                # 曾正常出头后断开：从主端点重新开始，退避清零
+                # 曾正常出头后断开：从首选端点（urls[0]；v10.16 RH 为 publicnode）重新开始，退避清零
                 idx, cycle_fails = 0, 0
                 self.stop.wait(HEAD_WS_RETRY_S)
                 continue
