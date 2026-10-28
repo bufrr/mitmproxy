@@ -248,7 +248,14 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # v10.16（2026-10-23，speedex 批 n33yw）：Robinhood 链头 ws 源 publicnode 优先——主端点
 # rpc.mainnet.chain.robinhood.com 拒绝 WSS 升级（非 101 / HTTP 400），旧顺序每次启动/断线重连都先撞主端点
 # 再换源，首轮点击前只有 rpc-poll 头（RH 未核验 → round-reference-unverified、t+N 缺失）。主端点留作最后一档。
-ADDON_VERSION = "2026.10.23-rh-publicnode-head-v10.16"
+# v10.17（2026-10-28，speedex 批 c0u66）：EVM 链头按块时间判陈旧——HK BSC publicnode newHeads 流间歇落后 ~70 块
+# （~30s）而样本到达仍新（sampleAgeMs 9–1300ms），旧逻辑 ① ws 回退按分叉清缓冲、采用旧头（盖掉正确的轮询头），
+# ② 流一直「新」→ 轮询被跳过，EU 观测 t+71…89。改为：① EVM 头（ws/轮询）块时间（BSC 含 BEP-520 毫秒）早于墙钟超过
+# HEAD_MAX_BLOCK_AGE_MS → 丢弃计数（diag.headPoll.headStale），不入缓冲；同一会话连续 HEAD_WS_STALE_RECONNECT 帧陈旧 →
+# 断开重连（headWs reason stale-stream）；② EVM ws 头低于已缓冲最新高度 = 该流落后，丢弃计数 wsBehind（同 v10.11 轮询、
+# v10.15 Solana），不再清缓冲。陈旧帧不刷新缓冲 → 轮询不再被跳过。门限依据 HK 实测到达块龄：BSC p99 317ms、
+# RH/Arc（整秒时间戳）max ~1.2s；节点 NTP 已同步（偏差 <0.1ms）。无 timestamp 的头不判（无证据不丢）。
+ADDON_VERSION = "2026.10.28-evm-head-age-gate-v10.17"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -1684,6 +1691,26 @@ HEAD_WS_RETRY_S = 0.5  # 同一轮内换下一个端点前的间隔
 HEAD_WS_FALLBACK_FIRST = frozenset({"robinhood"})
 HEAD_WS_CYCLE_BACKOFF_S = (2.0, 30.0)  # 整轮端点都失败后的退避（起步, 上限）
 HEAD_WS_STALL_S = 10.0  # 已订阅却无通知超过此值 → 视为失效换端点
+# v10.17：EVM 头块龄上限（墙钟 − 块时间）。BSC 有毫秒时间戳；其余 EVM 链整秒（下取整，最多多算 ~1s）。
+HEAD_MAX_BLOCK_AGE_MS = {"bsc": 2000}
+HEAD_MAX_BLOCK_AGE_DEFAULT_MS = 3000
+HEAD_WS_STALE_RECONNECT = 8  # 同一 ws 会话连续陈旧帧数 → 断开重连
+
+
+def _evm_block_ts_ms(chain, header):
+    """EVM 头的块时间（ms）；缺失/非法 → None。BSC 自 Lorentz（BEP-520）mixHash 为零前缀毫秒 0–999。"""
+    try:
+        ts = int(header["timestamp"], 16) * 1000
+    except (TypeError, ValueError, KeyError):
+        return None
+    if chain == "bsc":
+        try:
+            ms = int(header.get("mixHash") or "0x0", 16)
+        except (TypeError, ValueError):
+            ms = 0
+        if 0 <= ms < 1000:
+            ts += ms
+    return ts
 
 
 def _head_poll_interval_s(chain):
@@ -1813,10 +1840,12 @@ class ChainHeadWindow:
     collector. Hook snapshots only consult samples received before hook entry.
     """
 
-    def __init__(self, rpc_call=_jsonrpc, connect=ws_connect, clock=None):
+    def __init__(self, rpc_call=_jsonrpc, connect=ws_connect, clock=None, wall_clock=None):
         self.rpc_call = rpc_call
         self.connect = connect
         self.clock = clock or (lambda: _mono_ms())
+        # v10.17：块龄门只用墙钟（块时间是墙钟域）；observedTs 仍是单调钟
+        self.wall_clock = wall_clock or (lambda: time.time() * 1000)
         self.lock = threading.Lock()
         self.run_id = None
         self.samples = {}
@@ -1839,6 +1868,8 @@ class ChainHeadWindow:
             # v10.15（AG-3 B）：多源 Solana ws-head 中被丢弃的落后/重复 slot 通知数，与各源领先次数
             "wsBehind": defaultdict(int),
             "wsLead": defaultdict(int),
+            # v10.17：块龄超限被丢弃的 EVM 头（ws + 轮询）
+            "headStale": defaultdict(int),
         }
         # v10.5：WS newHeads 可观测（原先失败静默吞掉）。只记 host + 异常类名/状态码，
         # 计数有界（每链固定键），无 URL query/消息体/头。
@@ -1864,6 +1895,7 @@ class ChainHeadWindow:
                 "pollBehind": dict(self.diag["pollBehind"]),
                 "wsBehind": dict(self.diag["wsBehind"]),
                 "wsLead": dict(self.diag["wsLead"]),
+                "headStale": dict(self.diag["headStale"]),
             }
 
     def ws_diag_snapshot(self):
@@ -1930,6 +1962,7 @@ class ChainHeadWindow:
                 thread.start()
 
     def add(self, chain, result, source, sent=None, origin=None):
+        """接受/丢弃一个链头。返回 'ok'（入缓冲）、'stale'（v10.17 块龄超限）、'behind'（低于已缓冲头）或 None（无效/关窗）。"""
         sol = chain == "solana"
         try:
             height = (
@@ -1955,18 +1988,29 @@ class ChainHeadWindow:
                 if type(p) is int and p >= 0:
                     parent = p
         except (TypeError, ValueError, KeyError):
-            return
+            return None
+        block_ts = None if sol else _evm_block_ts_ms(chain, result)
+        stale = block_ts is not None and self.wall_clock() - block_ts > HEAD_MAX_BLOCK_AGE_MS.get(
+            chain, HEAD_MAX_BLOCK_AGE_DEFAULT_MS
+        )
         at = self.clock()
         with self.lock:
             if self.stop.is_set() or chain not in self.samples:
-                return
+                return None
+            if stale:
+                self.diag["headStale"][chain] += 1
+                return "stale"
             buf = self.samples[chain]
             previous = buf[-1] if buf else None
             # v10.11（2026-10-08 9u757 RH 实证）：轮询读数低于已缓冲最新高度 = 该 RPC 节点 latest 滞后
             # （Robinhood 公共节点系统性落后 7–9 块），不是分叉——丢弃，绝不清缓冲后以旧高度作链头。
             if source == "rpc-poll" and previous and height < previous["height"]:
                 self.diag["pollBehind"][chain] += 1
-                return
+                return "behind"
+            # v10.17（c0u66 BSC）：EVM ws 头低于已缓冲最新高度 = 该流落后，不是分叉——丢弃计数，不清缓冲。
+            if not sol and source == "ws-head" and previous and height < previous["height"]:
+                self.diag["wsBehind"][chain] += 1
+                return "behind"
             # v10.15（AG-3 B，多源 Solana）：ws slot 低于已接受头 = 该源落后，不是回退——丢弃计数；同 slot
             # 再到（他源，parent 相同/未知）= 重复，首到为准。同 slot 异 proven parent 仍落入下方分叉清空。
             if (
@@ -1986,7 +2030,7 @@ class ChainHeadWindow:
                 )
             ):
                 self.diag["wsBehind"][chain] += 1
-                return
+                return "behind"
             # A regression/conflicting head breaks continuity; never select a
             # pre-fork buffered head for a later hook. Solana heads carry no hash —
             # the parent slot is the continuity link: same height with a different
@@ -2024,6 +2068,7 @@ class ChainHeadWindow:
             )
             if sol and origin and source == "ws-head":
                 self.diag["wsLead"][f"{chain}|{origin}"] += 1
+        return "ok"
 
     def snapshot(self, run_id, at):
         with self.lock:
@@ -2180,6 +2225,7 @@ class ChainHeadWindow:
                     subscription = None
                     last_progress = time.monotonic()
                     reason = None
+                    stale_run = 0
                     while not self.stop.is_set():
                         if time.monotonic() - last_progress > HEAD_WS_STALL_S:
                             reason = "stall" if subscription is not None else "no-subscribe-ack"
@@ -2213,9 +2259,17 @@ class ChainHeadWindow:
                             and msg.get("method")
                             == ("slotNotification" if sol else "eth_subscription")
                         ):
-                            self.add(chain, msg["params"]["result"], "ws-head", origin=host)
-                            got_frame = True
+                            verdict = self.add(chain, msg["params"]["result"], "ws-head", origin=host)
                             last_progress = time.monotonic()
+                            # v10.17：陈旧帧不算有效通知；连续陈旧 → 断开重连（换流）
+                            if verdict == "stale":
+                                stale_run += 1
+                                if stale_run >= HEAD_WS_STALE_RECONNECT:
+                                    reason = "stale-stream"
+                                    break
+                            else:
+                                stale_run = 0
+                                got_frame = True
                     if reason is None and not self.stop.is_set():
                         reason = "closed"
                     if reason is not None:

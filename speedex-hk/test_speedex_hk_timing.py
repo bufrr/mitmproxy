@@ -6723,7 +6723,7 @@ class TestChainHeadPollDiagAndKeepaliveRouting(unittest.TestCase):
 
 class TestChainHeadPollBehindDropped(unittest.TestCase):
     """v10.11（9u757 RH r4）：rpc-poll 读数低于已缓冲最新高度 = 节点 latest 滞后，丢弃（不清缓冲、不作链头）；
-    ws-head 回退仍按分叉规则清缓冲。"""
+    v10.17 起 EVM ws-head 回退同样丢弃（流落后，不是分叉）。"""
 
     def _hdr(self, h, parent=None):
         return {"number": hex(h), "hash": "0x" + f"{h:064x}", "parentHash": "0x" + f"{(parent if parent is not None else h - 1):064x}"}
@@ -6746,8 +6746,108 @@ class TestChainHeadPollBehindDropped(unittest.TestCase):
             c.add("robinhood", self._hdr(82974629), "rpc-poll", 1390)  # 追上后的轮询照常接受
             self.assertEqual(c.snapshot("lag", 1410)["robinhood"]["height"], 82974629)
             now[0] = 1500
-            c.add("robinhood", self._hdr(82974600), "ws-head")  # ws 回退：分叉规则不变（清缓冲后采用）
-            self.assertEqual(c.snapshot("lag", 1510)["robinhood"]["height"], 82974600)
+            # v10.17（c0u66）：EVM ws 回退 = 该流落后，丢弃计数 wsBehind，不再清缓冲后采用旧头
+            self.assertEqual(c.add("robinhood", self._hdr(82974600), "ws-head"), "behind")
+            self.assertEqual(c.snapshot("lag", 1510)["robinhood"]["height"], 82974629)
+            self.assertEqual(c.diag_snapshot()["wsBehind"], {"robinhood": 1})
+        finally:
+            c.close()
+
+
+class TestChainHeadEvmBlockAgeGateV1017(unittest.TestCase):
+    """v10.17（speedex 批 c0u66）：HK BSC newHeads 流落后 ~70 块而到达仍新——按块时间（BSC 含 BEP-520 毫秒）
+    丢弃陈旧 EVM 头，连续陈旧帧断开重连；陈旧帧不入缓冲，轮询不再被跳过。"""
+
+    WALL = 1_793_109_713_000  # ms
+
+    def _hdr(self, h, ts_ms, chain="bsc"):
+        mix = "0x" + f"{ts_ms % 1000:064x}" if chain == "bsc" else "0x" + "ab" * 32
+        return {"number": hex(h), "hash": "0x" + f"{h:064x}", "parentHash": "0x" + f"{h - 1:064x}",
+                "timestamp": hex(ts_ms // 1000), "mixHash": mix}
+
+    def _window(self, now, wall):
+        from collections import deque
+
+        c = A.ChainHeadWindow(clock=lambda: now[0], wall_clock=lambda: wall[0])
+        c.run_id = "age"
+        c.samples = {"bsc": deque(maxlen=512), "robinhood": deque(maxlen=512)}
+        return c
+
+    def test_block_ts_ms_uses_bep520_mixhash_for_bsc_only(self):
+        self.assertEqual(A._evm_block_ts_ms("bsc", self._hdr(1, self.WALL + 600)), self.WALL + 600)
+        self.assertEqual(A._evm_block_ts_ms("robinhood", self._hdr(1, self.WALL + 600, "robinhood")), self.WALL)
+        self.assertIsNone(A._evm_block_ts_ms("bsc", {"number": "0x1"}))
+        odd = self._hdr(1, self.WALL); odd["mixHash"] = "0x" + "ff" * 32  # 非 BEP-520 形状 → 只用整秒
+        self.assertEqual(A._evm_block_ts_ms("bsc", odd), self.WALL)
+
+    def test_stale_ws_head_is_dropped_and_fresh_poll_head_stands(self):
+        now, wall = [1000], [self.WALL]
+        c = self._window(now, wall)
+        try:
+            self.assertEqual(c.add("bsc", self._hdr(130101877, self.WALL - 300), "rpc-poll", 990), "ok")
+            now[0] = 1100
+            # c0u66 r1：ws 流送来 ~30s 前的块 130101809
+            self.assertEqual(c.add("bsc", self._hdr(130101809, self.WALL - 30_600), "ws-head"), "stale")
+            snap = c.snapshot("age", 1150)["bsc"]
+            self.assertEqual((snap["height"], snap["source"]), (130101877, "rpc-poll"))
+            self.assertEqual(c.diag_snapshot()["headStale"], {"bsc": 1})
+            # 门限边界：BSC 1.9s 旧仍接受；RH 整秒时间戳 2.9s 旧接受、3.1s 丢弃
+            self.assertEqual(c.add("bsc", self._hdr(130101878, self.WALL - 1900), "ws-head"), "ok")
+            self.assertEqual(c.add("robinhood", self._hdr(500, self.WALL - 2900, "robinhood"), "ws-head"), "ok")
+            self.assertEqual(c.add("robinhood", self._hdr(501, self.WALL - 4100, "robinhood"), "ws-head"), "stale")
+            # 无 timestamp 的头不判（无证据不丢）
+            self.assertEqual(c.add("bsc", {"number": hex(130101879), "hash": "0x" + f"{130101879:064x}",
+                                           "parentHash": "0x" + f"{130101878:064x}"}, "ws-head"), "ok")
+        finally:
+            c.close()
+
+    def test_stale_frames_do_not_suppress_polling(self):
+        now, wall = [1000], [self.WALL]
+        polled = []
+        c = self._window(now, wall)
+        c.rpc_call = lambda *a, **k: (polled.append(1), self._hdr(130101900, self.WALL - 200))[1]
+        try:
+            c.add("bsc", self._hdr(130101809, self.WALL - 30_000), "ws-head")  # 陈旧、不入缓冲
+            ok, _ = c._poll_once("bsc")
+            self.assertEqual((ok, len(polled)), (True, 1), "no fresh ws head buffered → poll runs")
+            self.assertEqual(c.snapshot("age", 1001)["bsc"]["height"], 130101900)
+        finally:
+            c.close()
+
+    def test_consecutive_stale_frames_end_the_ws_session(self):
+        import json as _json
+
+        wall = [self.WALL]
+        frames = [_json.dumps({"jsonrpc": "2.0", "id": 1, "result": "0xs"})] + [
+            _json.dumps({"jsonrpc": "2.0", "method": "eth_subscription",
+                         "params": {"subscription": "0xs", "result": self._hdr(100 + i, self.WALL - 30_000 + i * 450)}})
+            for i in range(A.HEAD_WS_STALE_RECONNECT + 3)
+        ]
+
+        class FakeWS:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def send(self, _):
+                pass
+
+            def recv(self, timeout=None):
+                if frames:
+                    return frames.pop(0)
+                raise RuntimeError("closed")
+
+        now = [1000]
+        c = self._window(now, wall)
+        c.connect = lambda url, **k: FakeWS()
+        try:
+            got = c._ws_session("bsc", "wss://bsc-rpc.publicnode.com", "bsc-rpc.publicnode.com")
+            self.assertFalse(got, "stale-only session is not a served session")
+            self.assertEqual(c.ws_diag_snapshot()["lastErr"]["bsc"], "bsc-rpc.publicnode.com: stale-stream")
+            self.assertEqual(c.diag_snapshot()["headStale"], {"bsc": A.HEAD_WS_STALE_RECONNECT})
+            self.assertEqual(len(frames), 3, "session ends right after the Nth stale frame")
         finally:
             c.close()
 
@@ -7167,7 +7267,7 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.10.23-rh-publicnode-head-v10.16")
+        self.assertEqual(A.ADDON_VERSION, "2026.10.28-evm-head-age-gate-v10.17")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 
