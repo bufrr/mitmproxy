@@ -97,3 +97,14 @@
 # [raw] 追加部分（与原 regex 作 OR，保留端口和边界锚）：
 # ^(?:okx\.(?:bsc-rpc\.com|(?:rpc|builder)\.48\.club|bsc\.blockrazor\.xyz|bscnetwork\.blockrazor\.io)|(?:frankfurt|hongkong|newyork|tokyo)2?\.solana\.blockrazor\.io|rpc\.mainnet\.(?:arc\.io|chain\.robinhood\.com))(:\d+)?$
 # 部署需从运行进程核对最终逻辑 regex；不得用默认模板覆盖现有 GMGN/OKX 拦截范围。
+
+# 2026-11-07 FOMO v3 当前执行 transport（v10.18；生产与实验 unit 均列精确主机）。
+# 这些不是上面的 GMGN/OKX 候选 overlay：没有它们，allow_hosts 在 TLS 前透传执行 POST，
+# addon 根本看不到 FOMO 执行锚。扩围只覆盖 bundle-proven 的五个第三方 host；
+# solana-provider-{1,2,3}.prod-edge.fomo.family 已由 *.fomo.family 覆盖。
+# [raw] 追加部分（与原 regex 作 OR，保留端口和边界锚）：
+# ^(?:mainnet\.(?:hudson|block-engine)\.jito\.wtf|sender\.helius-rpc\.com|cashback\.circular\.fi|sender\.lamport\.dev)(:\d+)?$
+# 风险边界：拦截会解密已签名交易 body，并改变到第三方 transport 的 TLS/ALPN 路径；
+# addon 只读 host/path/method、JSON-RPC send method 与受控 ACK，绝不保存 body/header/
+# query/签名。上线前须在默认关闭的实验实例重建连接，逐项验收证书、报价、提交兼容、
+# 平台成功记录与单核 CPU/RSS；不得因 health 200 或一次连通就推定无损。

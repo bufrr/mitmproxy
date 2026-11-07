@@ -80,21 +80,21 @@ fomo.md + tests/classify-ws.test.mjs 等夹具——改规则同步改本注释�
           content.status==="FINISHED"，按 orderId/clientOrderId 强关联；PENDING 帧的
           orderTxId 是 hash 首见（PENDING≠成功，只取 hash 不当成功）。
           nbstream 为二进制信封 → utf8 后取第一个平衡 JSON。
-  FOMO    预览/下单共用 POST prod-api.fomo.family/swaps/v2（L7 路径/体不可区分——
-          两阶段实证见 docs/fomo.md）：腿一律先标 anchorRole:'preview'（不计
-          attempted、不消费 manifest 槽位、不单独产成功）；Relay success 帧正向
-          匹配 requestId≡relaySwapId = 执行证据（Relay 只对已执行请求推 success），
-          命中即原子晋升 'order' 并补授权槽绑定。requestId=responseObject.v2Swap
-          .relaySwapId；成功帧 ws.relay.link request.status.updated 且
-          data.status==="success"；fill hash=data.txHashes[0]。F-SOL 同链腿
-          无 Relay 帧（DFlow 轮询），HK-L1a' 标 incomplete（known limitation）。
+  FOMO    POST prod-api.fomo.family/swaps/v3 只是 preview（solana=v1Swap /
+          relay=v2Swap.relaySwapId / mobula=mobulaSwap.intentId），永不作 order anchor；
+          执行锚 = 当前产品 Solana submission transport 的首个 POST。Relay candidate
+          只在最新 v3 relay preview 与 post-execution subscribe filters.id 相等时冻结；
+          success 还须新鲜、destinationChainId=4663 且带 RH fill hash。Mobula intentId
+          绝不作 Relay requestId。F-SOL 成功 = 页面 GET swaps 响应中同 user/mint
+          基线之外恰一条新同链记录，record.signature 给 exact tx + Sol receipt；
+          缺执行前基线、错 mint、陈旧 createdAt、多记录/多执行候选均不采纳。
 
 成功判定统一锚纪律：成功状态/hash/id 必须与「请求/响应建立的
 独立锚」（leg._anchor：响应抽取 id、binance 请求体 clientOrderId、fomo 页面出站
 subscribe 绑定）正向匹配；帧自带 id 先写入腿再自证关联不算 HK-L1a'。
 响应锚只从 schema-known 字段结构化抽取
 （binance data.orderId 与 data.clientOrderId **分键**、data.signature 等同节点 hash；
-okx/gmgn 键白名单有界遍历；fomo responseObject.v2Swap.relaySwapId；padre 恒无锚）——
+okx/gmgn 键白名单有界遍历；fomo 只认 post-execution subscribe filters.id；padre 恒无锚）——
 整-body 正则不写锚，与结构化抽取的分歧只作诊断 legacyRegexDiverged；入站 WS 帧
 按锚身份路由（Store.route_ws_frame）到**所有开窗腿**中正向匹配的腿——不只平台
 最新腿；dup 腿命中归到其 formal（已绑槽）腿，dup 腿的独立锚并入 formal 锚，
@@ -130,6 +130,7 @@ cookie/authorization 头、签名 body、私钥材料。事件默认内存态（
 """
 
 import base64
+import datetime
 import hashlib
 import http.client
 import importlib.metadata
@@ -140,6 +141,7 @@ import re
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 import uuid
 import zlib
@@ -255,7 +257,16 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # 断开重连（headWs reason stale-stream）；② EVM ws 头低于已缓冲最新高度 = 该流落后，丢弃计数 wsBehind（同 v10.11 轮询、
 # v10.15 Solana），不再清缓冲。陈旧帧不刷新缓冲 → 轮询不再被跳过。门限依据 HK 实测到达块龄：BSC p99 317ms、
 # RH/Arc（整秒时间戳）max ~1.2s；节点 NTP 已同步（偏差 <0.1ms）。无 timestamp 的头不判（无证据不丢）。
-ADDON_VERSION = "2026.10.28-evm-head-age-gate-v10.17"
+# v10.18（2026-11-07）：FOMO 当前路径 = /swaps/v3 preview + 页内 Privy 签名 + Solana 执行 transport。
+# preview 永不作执行锚；Jito/Helius/Circular/Lamport/FOMO provider 的首个执行请求才是 order anchor。
+# Relay 仅认与最新 v3 Relay candidate 相等的 post-execution subscribe + 新鲜、带 RH fill hash 的 success；
+# Mobula intentId 永不进入 Relay 锚。F-SOL 成功 = 同 user/mint 的执行前 swaps 基线之外、恰一条合格
+# 同链新记录；缺基线、多记录或多执行候选均 fail-closed。签名 body/query/header 不持久化。
+# v10.20（2026-11-07，owner 实测）：页面 swaps 轮询恒带 tokenAddress + If-None-Match，
+# 原始响应为 bodiless 304，Chrome 却把缓存 body 给页面，故 EU 有基线而 HK 没有。仅在精确的
+# 只读 swaps GET 删除 If-None-Match/If-Modified-Since，取得真实 200；304/空响应不建/不覆盖快照。
+# 其它请求、header、host/path/method、订单/执行流量和其它平台均不修改；响应状态只计数不记值。
+ADDON_VERSION = "2026.11.07-fomo-swaps-revalidate-v10.20"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -1175,28 +1186,161 @@ def _padre_resp_ids(text):
 
 
 def _fomo_resp_ids(text):
-    """FOMO /swaps/v2 响应：schema-known 路径 responseObject.v2Swap.relaySwapId
-    （docs/fomo.md §：`v2Swap.relaySwapId = Relay requestId`，EVM 0x+64hex 形状）
-    作 orderId 锚；destinationChainId → chain。同链（DFlow）预览响应无 v2Swap → 无锚。"""
+    """FOMO /swaps/v3 preview：只取来源与目标链诊断，不建立执行身份。
+
+    responseObject.source=solana → F-SOL；relay → v2Swap.relaySwapId 是 unfrozen
+    candidate；mobula → intentId 只属 Mobula，绝不返回为 Relay/order 锚。preview
+    candidate 由 response() 写入 Store.fomo_previews，只有 post-execution subscribe
+    与最新 candidate 相等才进入执行腿的独立锚。交易体、签名和 intentId 不保留。
+    """
     j = _j(text)
-    if not isinstance(j, dict):
+    if not isinstance(j, dict) or j.get("success") is not True:
         return {}
-    out = {}
+    try:
+        if j.get("statusCode") is not None and int(j.get("statusCode")) >= 400:
+            return {}
+    except (TypeError, ValueError):
+        return {}
     ro = j.get("responseObject") if isinstance(j.get("responseObject"), dict) else {}
-    v2 = ro.get("v2Swap") if isinstance(ro.get("v2Swap"), dict) else {}
-    rid = (
-        v2.get("relaySwapId")
-        if v2.get("relaySwapId") is not None
-        else ro.get("relaySwapId")
-    )
-    if isinstance(rid, str) and re.fullmatch(r"0[xX][0-9a-fA-F]{64}", rid):
-        out["orderId"] = rid
-    dcid = v2.get("destinationChainId")
-    if dcid is not None:
-        c = CHAIN_ID_TO_NAME.get(str(dcid)) or CHAIN_ID_TO_NAME.get(dcid)
-        if c:
-            out["chain"] = c
-    return out
+    source = ro.get("source")
+    if source == "solana" and isinstance(ro.get("v1Swap"), dict):
+        return {"chain": "solana", "_previewSource": "solana"}
+    if source == "relay" and isinstance(ro.get("v2Swap"), dict):
+        v2 = ro["v2Swap"]
+        if not isinstance(v2.get("relayTransaction"), dict):
+            return {}
+        out = {"chain": "robinhood", "_previewSource": "relay"}
+        rid = v2.get("relaySwapId")
+        if isinstance(rid, str) and re.fullmatch(r"0[xX][0-9a-fA-F]{64}", rid):
+            out["_previewRelayId"] = rid.lower()
+        return out
+    if source == "mobula" and isinstance(ro.get("mobulaSwap"), dict):
+        return {"chain": "robinhood", "_previewSource": "mobula"}
+    return {}
+
+
+# Product-proven Solana transports for one CTA-created transaction. The first request is
+# the execution/order anchor; nearby fanout requests remain aliases of that observation.
+FOMO_EXECUTION_FANOUT_MS = 2000.0
+FOMO_SWAPS_SKEW_MS = 10000
+FOMO_SWAPS_SNAPSHOTS_PER_KEY = 4
+FOMO_SWAPS_KEYS_PER_RUN = 32
+_FOMO_SWAPS_PATH_RE = re.compile(
+    r"^/v2/users/([0-9a-fA-F]{8}-[0-9a-fA-F-]{27,})/swaps$"
+)
+_FOMO_MINT_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+
+
+def _fomo_execution_route(host, path, method):
+    """Current FOMO submission route; URL classification only, never an ACK by itself."""
+    if str(method or "").upper() != "POST":
+        return None
+    p = (path or "/").rstrip("/") or "/"
+    if host == "mainnet.hudson.jito.wtf" and p == "/api/v1/sendTransactionWeb":
+        return {"kind": "solana-jito-web", "ack": "http"}
+    if host == "mainnet.block-engine.jito.wtf" and p == "/api/v1/bundles":
+        return {"kind": "solana-jito-bundle", "ack": "json-rpc", "sendMethods": {"sendBundle", "sendTransaction"}}
+    if host == "sender.helius-rpc.com" and p == "/fast":
+        return {"kind": "solana-helius-submit", "ack": "http"}
+    if host == "cashback.circular.fi" and p == "/transactions":
+        return {"kind": "solana-circular-submit", "ack": "http"}
+    if host == "sender.lamport.dev":
+        # Opaque route and every query value stay out of events/timeline.
+        return {"kind": "solana-lamport-submit", "ack": "http"}
+    if re.fullmatch(r"solana-provider-[123]\.prod-edge\.fomo\.family", host or "") and p == "/":
+        return {"kind": "solana-fomo-rpc-submit", "ack": "json-rpc", "sendMethods": {"sendTransaction"}}
+    return None
+
+
+def _fomo_execution_request(host, path, method, body):
+    """JSON-RPC transports additionally need an inline schema-known send method."""
+    route = _fomo_execution_route(host, path, method)
+    if not route:
+        return None
+    methods = route.get("sendMethods")
+    if not methods:
+        return route
+    obj = _j(body)
+    rows = obj if isinstance(obj, list) else [obj]
+    if not rows:
+        return None
+    for row in rows:
+        if isinstance(row, dict) and row.get("method") in methods:
+            return route
+    return None
+
+
+def _fomo_execution_ack(meta, status_code, body):
+    """HTTP-ok endpoints follow response.ok; JSON-RPC also needs result and no error."""
+    try:
+        code = int(status_code)
+    except (TypeError, ValueError):
+        return False
+    if code < 200 or code >= 300:
+        return False
+    if meta.get("ack") == "http":
+        return True
+    obj = _j(body)
+    return isinstance(obj, dict) and obj.get("error") is None and obj.get("result") is not None
+
+
+def _fomo_swaps_request(host, raw_path, method):
+    """Classify the page's swaps GET without retaining user UUID, query or credentials."""
+    if host != "prod-api.fomo.family" or str(method or "").upper() != "GET":
+        return None
+    try:
+        u = urllib.parse.urlsplit(raw_path or "")
+        match = _FOMO_SWAPS_PATH_RE.fullmatch(u.path)
+        if not match:
+            return None
+        query = urllib.parse.parse_qs(u.query, keep_blank_values=True)
+        tokens = query.get("tokenAddress") or []
+        if len(tokens) != 1 or not _FOMO_MINT_RE.fullmatch(tokens[0]):
+            return None
+        # Only a keyed digest distinguishes account scopes internally; neither the UUID nor
+        # the raw query enters events, logs or timeline. Exactly one valid mint is required.
+        user_key = hashlib.sha256(match.group(1).lower().encode()).hexdigest()[:16]
+        return {"userKey": user_key, "token": tokens[0]}
+    except Exception:
+        return None
+
+
+def _fomo_created_ms(value):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            return None
+        return int(dt.timestamp() * 1000)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _fomo_swap_rows(text):
+    """Bounded, schema-known swaps rows; no business response body is retained."""
+    if not isinstance(text, str) or len(text) > 2 * 1024 * 1024:
+        return None
+    obj = _j(text)
+    if not isinstance(obj, dict) or obj.get("success") is not True:
+        return None
+    ro = obj.get("responseObject") if isinstance(obj.get("responseObject"), dict) else {}
+    raw = ro.get("swaps")
+    if not isinstance(raw, list) or len(raw) > 1000:
+        return None
+    rows = []
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        rows.append({
+            "id": row.get("id") if isinstance(row.get("id"), str) and row.get("id") else None,
+            "signature": _transaction_id_value(row.get("signature")),
+            "outTokenAddress": row.get("outTokenAddress") if isinstance(row.get("outTokenAddress"), str) else None,
+            "createdAtMs": _fomo_created_ms(row.get("createdAt")),
+            "inNetworkId": row.get("inNetworkId"),
+            "outNetworkId": row.get("outNetworkId"),
+        })
+    return rows
 
 
 # ── 平台规则 ──
@@ -1526,21 +1670,43 @@ def _binance_ws_ids(payload):
     return out
 
 
-def _fomo_ws(payload, leg):
+def _fomo_relay_success(payload, leg):
+    """Fresh Relay success for an execution-bound Robinhood order, never F-SOL/Mobula."""
     obj = _decode_ws(payload)
-    if not isinstance(obj, dict):
+    if not isinstance(obj, dict) or obj.get("event") != "request.status.updated":
         return False
-    if str(obj.get("event")) != "request.status.updated":
+    if leg.get("orderRequestSource") != "fomo-solana-execution" or not leg.get("_fomoRelayFrozen"):
         return False
-    d = obj.get("data") if isinstance(obj.get("data"), dict) else obj
+    d = obj.get("data") if isinstance(obj.get("data"), dict) else {}
     if str(d.get("status") or "").lower() != "success":
         return False
-    rid = d.get("requestId") or ((d.get("filters") or {}).get("id")) or d.get("id")
-    norm = lambda v: str(v).lower().removeprefix("0x")
-    # 必须有腿锚（响应 relaySwapId 或页面出站 subscribe 绑定）且帧
-    # requestId 正向相等——腿无锚或帧无 requestId 都不得出 L1a'（缺锚 →
-    # incomplete，F-SOL 同链腿无 Relay 帧的 known limitation 同此出口）。
-    return bool(leg.get("orderId") and rid and norm(rid) == norm(leg.get("orderId")))
+    rid = d.get("requestId")
+    if not isinstance(rid, str) or not re.fullmatch(r"0[xX][0-9a-fA-F]{64}", rid):
+        return False
+    if not leg.get("orderId") or rid.lower() != str(leg.get("orderId")).lower():
+        return False
+    try:
+        if int(d.get("destinationChainId")) != 4663:
+            return False
+    except (TypeError, ValueError):
+        return False
+    hashes = d.get("txHashes")
+    if not isinstance(hashes, list) or not hashes or not _transaction_id_value(hashes[0]) or not str(hashes[0]).lower().startswith("0x"):
+        return False
+    published = obj.get("publishedAt")
+    if isinstance(published, bool) or not isinstance(published, (int, float)):
+        return False
+    wall = leg.get("tOrderOutWallMs")
+    return isinstance(wall, (int, float)) and published >= wall - 5000
+
+
+def _fomo_ws(payload, leg):
+    return _fomo_relay_success(payload, leg)
+
+
+def _fomo_ws_frame_fresh(payload, leg, ids):
+    # Apply the complete success gate before any frame-provided hash/chain can settle.
+    return _fomo_relay_success(payload, leg)
 
 
 def _fomo_ws_ids(payload):
@@ -1549,16 +1715,17 @@ def _fomo_ws_ids(payload):
         return {}
     d = obj.get("data") if isinstance(obj.get("data"), dict) else {}
     out = {}
-    if d.get("requestId"):
-        out["orderId"] = d["requestId"]
+    rid = d.get("requestId")
+    if isinstance(rid, str) and re.fullmatch(r"0[xX][0-9a-fA-F]{64}", rid):
+        out["orderId"] = rid.lower()
     txh = d.get("txHashes")
-    if isinstance(txh, list) and txh:
-        out["txHash"] = txh[0]
-    dcid = d.get("destinationChainId")
-    if dcid is not None:
-        c = CHAIN_ID_TO_NAME.get(str(dcid)) or CHAIN_ID_TO_NAME.get(dcid)
-        if c:
-            out["chain"] = c
+    if isinstance(txh, list) and txh and isinstance(txh[0], str) and re.fullmatch(r"0[xX][0-9a-fA-F]{64}", txh[0]):
+        out["txHash"] = txh[0].lower()
+    try:
+        if int(d.get("destinationChainId")) == 4663:
+            out["chain"] = "robinhood"
+    except (TypeError, ValueError):
+        pass
     return out
 
 
@@ -1627,13 +1794,16 @@ RULES = {
         "extract_chain": _chain_from_text,
     },
     "fomo": {
+        # /swaps/v3 is quote/transaction construction only. Execution transports are
+        # classified separately by _fomo_execution_request and never alias /swaps/v2*.
         "match_order": lambda h, p, m: (
-            h == "prod-api.fomo.family" and p.startswith("/swaps/v2") and m == "POST"
+            h == "prod-api.fomo.family" and p == "/swaps/v3" and m == "POST"
         ),
         "extract_ids": _fomo_resp_ids,
         "ws_hosts": ("ws.relay.link",),
         "ws_success": _fomo_ws,
         "ws_ids": _fomo_ws_ids,
+        "ws_frame_fresh": _fomo_ws_frame_fresh,
         "extract_chain": _chain_from_text,
     },
 }
@@ -2676,6 +2846,11 @@ class Store:
         # 早到 WS 帧缓冲——rid → [单元]（源时间/窗口 epoch/方向保留）；
         # 关窗 freeze 即弃并按零命中计数，窗口身份不符不得采纳
         self.ws_buffer = defaultdict(list)
+        # FOMO current-path side state: latest valid v3 preview per run and bounded
+        # pre-execution swaps snapshots keyed by run/epoch/account-digest/mint.
+        # Values contain only schema-known IDs/metadata, never URLs, headers or bodies.
+        self.fomo_previews = {}
+        self.fomo_swaps = {}
 
     def _freeze_run_locked(self, run_id):
         """关窗即冻结——腿标 windowClosed（后续帧不更新、receipt 回写丢弃），
@@ -2697,6 +2872,10 @@ class Store:
         for p, leg in list(self.open_legs.items()):
             if leg.get("runId") == run_id:
                 del self.open_legs[p]
+        self.fomo_previews.pop(run_id, None)
+        for key in list(self.fomo_swaps):
+            if key[0] == run_id:
+                self.fomo_swaps.pop(key, None)
 
     def _run_pinned_locked(self, run_id):
         """pin：开窗中的 run、或有活动 poller（未 settle 未 incomplete）的腿。"""
@@ -3023,8 +3202,8 @@ class Store:
         起点按最早请求（hkL1aMs = tSuccessPushMs − 最早 tOrderOutMs，与 docs/binance.md
         §90「平台重发含在 L1a′ 内」同口径）。formal 在飞的 receipt poller 经
         _settle_receipt 的 dup→formal 重定向落到新 formal（闩锁随之移交，不起第二
-        poller）。响应/receipt 补链路径调用——preview/sign 晋升路径不做（fomo 同 relaySwapId
-        取最晚 preview 是既定口径，见 route_ws_frame）。"""
+        poller）。响应/receipt 补链路径调用——preview/sign 晋升路径不做（FOMO v3 preview
+        与 execution transport 分腿，绝不按最晚 preview 迁移 formal 资格）。"""
         if leg.get("dup"):
             leg["dup"] = False
             leg["_dupOf"] = None
@@ -3195,10 +3374,9 @@ class Store:
                 self.diag["orderReqUnbound"] += 1
 
     def _new_leg_locked(self, run_id, platform, chain, ev):
-        """建腿（须持锁）。fomo 预览/下单 L7 不可区分 → 腿先标 anchorRole=
-        'preview'；padre 的 Turnkey sign_raw_payload 未证明与 order 一一对应 →
-        'sign'。两者均不计 attempted、不消费 manifest 槽位、不单独产成功；成功帧
-        正向匹配 = 执行证据，命中即经 _promote_leg_locked 原子晋升 'order'。
+        """建腿（须持锁）。FOMO /swaps/v3 恒为独立 preview；execution transport
+        由 ev.anchorRole='order' 建独立执行腿。padre 的 Turnkey sign_raw_payload 未证明与 order 一一对应 →
+        'sign'。preview/sign 均不计 attempted、不消费 manifest 槽位、不单独产成功；
         有明细 manifest 时 order 腿建腿即绑定授权槽；无槽可绑 → unbound
         诊断腿（不计 attempted）。绑定前先做订单身份去重——请求侧
         身份（ev 携带，如 binance clientOrderId）正向匹配同 run 已绑槽腿 → dup
@@ -3214,7 +3392,7 @@ class Store:
             return None
         mark = self.marks.get(run_id) or {}
         detail = mark.get("manifestLegs")
-        role = (
+        role = ev.get("anchorRole") or (
             "preview"
             if platform == "fomo"
             else ("sign" if platform == "padre" else "order")
@@ -3296,9 +3474,11 @@ class Store:
             "_dupOf": dup_of,
             "successAnchorKeys": None,
             "at_wall": ev["tw"],
+            "_fomoLastTransportMs": ev["t"] if ev.get("orderRequestSource") == "fomo-solana-execution" else None,
         }
         self.legs[run_id].append(leg)
-        self.open_legs[platform] = leg
+        if platform != "fomo" or role == "order":
+            self.open_legs[platform] = leg
         return leg
 
     def new_leg(self, run_id, platform, chain, ev):
@@ -3342,26 +3522,220 @@ class Store:
             if len(self.legs[rid]) >= MAX_LEGS_PER_RUN:
                 self.overflow[rid]["legs"] += 1  # 腿预算超限——事件连同腿一起丢弃
                 return None, None
+            if platform == "fomo" and ev.get("orderRequestSource") == "fomo-solana-execution":
+                # Parallel product transports for one CTA are one logical order. Only a
+                # near-simultaneous fanout folds into the first request; later candidates
+                # stay separate so a swaps record with multiple possible owners is rejected.
+                for prior in reversed(self.legs[rid]):
+                    if prior.get("platform") != "fomo" or prior.get("orderRequestSource") != "fomo-solana-execution":
+                        continue
+                    last = prior.get("_fomoLastTransportMs")
+                    if (
+                        prior.get("tSuccessPushMs") is None
+                        and not prior.get("windowClosed")
+                        and isinstance(last, (int, float))
+                        and 0 <= ev["t"] - last <= FOMO_EXECUTION_FANOUT_MS
+                    ):
+                        prior["_fomoLastTransportMs"] = ev["t"]
+                        ev["kind"] = "fomo_transport_req"
+                        self._add_event_locked(rid, ev)
+                        return rid, prior
+                    break
             self._add_event_locked(rid, ev)
             leg = self._new_leg_locked(rid, platform, chain, ev)
             if leg is None:
                 return None, None
             return rid, leg
 
+    def note_fomo_preview(self, leg, ids, observed_ms):
+        """Latest valid v3 response is only an unfrozen candidate (even after execution)."""
+        source = ids.get("_previewSource")
+        # Match the EU candidate lifecycle: only an actual v2Swap.relaySwapId updates
+        # the unfrozen candidate. Solana/Mobula/intent-only previews never clear or replace it.
+        if source != "relay" or not ids.get("_previewRelayId"):
+            return
+        with self.lock:
+            rid = leg.get("runId")
+            if leg.get("windowClosed") or leg.get("anchorRole") != "preview":
+                return
+            self.fomo_previews[rid] = {
+                "source": "relay",
+                "relayId": ids.get("_previewRelayId"),
+                "observedMs": observed_ms,
+            }
+
     def bind_fomo_subscribe(self, fid):
-        """FOMO 页面出站 subscribe 帧 filters.id → 绑到最新 fomo 腿（
-        按到达时序绑定、腿已有 orderId 锚则不动）。这是请求侧锚源而非入站成功帧，
-        不按身份路由；已有不同锚时静默不动（时序绑定不构成身份冲突证据，不记 diag）。
-        被否决腿（锚已自相矛盾）不再吸收新绑定。"""
+        """Bind Relay execution identity only to a transport-anchored order.
+
+        The latest v3 response must be a Relay preview whose v2Swap.relaySwapId equals
+        filters.id. Solana/Mobula/missing candidates never bind. After the first freeze,
+        a different execution subscribe is an anchor conflict; late previews cannot veto.
+        """
+        if not isinstance(fid, str) or not re.fullmatch(r"0[xX][0-9a-fA-F]{64}", fid):
+            return None
+        fid = fid.lower()
         with self.lock:
             leg = self.open_legs.get("fomo")
-            if leg is None or leg.get("windowClosed") or leg.get("_anchorVeto"):
+            if (
+                leg is None
+                or leg.get("windowClosed")
+                or leg.get("_anchorVeto")
+                or leg.get("incomplete")
+                or leg.get("orderRequestSource") != "fomo-solana-execution"
+            ):
                 return None
             anchor = leg.setdefault("_anchor", {})
-            if anchor.get("orderId") is None and fid is not None:
-                anchor["orderId"] = fid
-                if leg.get("orderId") is None:
-                    leg["orderId"] = fid
+            if anchor.get("orderId") is not None:
+                if _ident_norm("orderId", anchor["orderId"]) == _ident_norm("orderId", fid):
+                    return leg
+                # A second, different post-execution subscribe is execution evidence,
+                # not a late preview candidate: freeze the first identity and veto.
+                conflicts = leg.setdefault("_anchorDiag", {}).setdefault("conflicts", [])
+                if "orderId" not in conflicts:
+                    conflicts.append("orderId")
+                self.diag["anchorConflict"] += 1
+                self.run_diag[leg["runId"]]["anchorConflict"] += 1
+                self._veto_leg_locked(leg)
+                return None
+            preview = self.fomo_previews.get(leg.get("runId")) or {}
+            if preview.get("source") != "relay" or not preview.get("relayId"):
+                leg["incomplete"] = leg.get("incomplete") or "relay-preview-missing"
+                self.diag["fomoRelayPreviewMissing"] += 1
+                self.run_diag[leg["runId"]]["fomoRelayPreviewMissing"] += 1
+                return None
+            if _ident_norm("orderId", preview["relayId"]) != _ident_norm("orderId", fid):
+                leg["incomplete"] = leg.get("incomplete") or "relay-preview-mismatch"
+                self.diag["fomoRelayPreviewMismatch"] += 1
+                self.run_diag[leg["runId"]]["fomoRelayPreviewMismatch"] += 1
+                return None
+            anchor["orderId"] = fid
+            leg["orderId"] = fid
+            leg["_fomoRelayFrozen"] = True
+            return leg
+
+    def observe_fomo_swaps(self, window, scope, rows, t_obs, t_wall_ms, body_sha):
+        """Adopt one unique F-SOL record, or retain an explicit incomplete reason.
+
+        Correlation = same run/epoch + same account-digest/mint GET + a response observed
+        before this execution + exactly one eligible execution leg + exactly one new row
+        whose outTokenAddress, createdAt, same-chain network IDs and Sol signature all pass.
+        No record ID, mint, account key or response body is serialized into the timeline.
+        """
+        rid, epoch = window
+        key = (rid, epoch, scope["userKey"], scope["token"])
+        with self.lock:
+            mark = self.marks.get(rid)
+            if not mark or mark.get("closed") is not None or mark.get("epoch") != epoch:
+                return None
+            history = list(self.fomo_swaps.get(key) or [])
+            history.append({
+                "observedMs": t_obs,
+                "ids": {row["id"] for row in rows if row.get("id")},
+            })
+            history = history[-FOMO_SWAPS_SNAPSHOTS_PER_KEY:]
+            if key not in self.fomo_swaps:
+                run_keys = [k for k in self.fomo_swaps if k[0] == rid]
+                if len(run_keys) >= FOMO_SWAPS_KEYS_PER_RUN:
+                    oldest = min(run_keys, key=lambda k: self.fomo_swaps[k][0]["observedMs"] if self.fomo_swaps[k] else 0)
+                    self.fomo_swaps.pop(oldest, None)
+                    self.diag["fomoSwapsBaselineOverflow"] += 1
+                    self.run_diag[rid]["fomoSwapsBaselineOverflow"] += 1
+            self.fomo_swaps[key] = history
+
+            eligible = [
+                leg for leg in self.legs.get(rid, [])
+                if leg.get("platform") == "fomo"
+                and leg.get("orderRequestSource") == "fomo-solana-execution"
+                and leg.get("anchorRole") == "order"
+                and leg.get("tSuccessPushMs") is None
+                and not leg.get("windowClosed")
+                and not leg.get("dup")
+                and not leg.get("unbound")
+                and not leg.get("_anchorVeto")
+                and not leg.get("incomplete")
+                and isinstance(leg.get("tOrderOutMs"), (int, float))
+                and leg["tOrderOutMs"] <= t_obs
+            ]
+            if not eligible:
+                return None
+            if len(eligible) != 1:
+                for leg in eligible:
+                    leg["incomplete"] = "ambiguous-execution-candidate"
+                self.diag["fomoSwapsAmbiguousExecution"] += 1
+                self.run_diag[rid]["fomoSwapsAmbiguousExecution"] += 1
+                return None
+            leg = eligible[0]
+            baselines = [s for s in history[:-1] if s["observedMs"] < leg["tOrderOutMs"]]
+            if not baselines:
+                leg["incomplete"] = "swaps-baseline-missing"
+                self.diag["fomoSwapsBaselineMissing"] += 1
+                self.run_diag[rid]["fomoSwapsBaselineMissing"] += 1
+                return None
+            baseline_ids = baselines[-1]["ids"]
+            claimed = {
+                other.get("_fomoSwapRecordId")
+                for other in self.legs.get(rid, [])
+                if other is not leg and other.get("_fomoSwapRecordId")
+            }
+            wall = leg.get("tOrderOutWallMs")
+            if not isinstance(wall, (int, float)):
+                leg["incomplete"] = "execution-wall-clock-missing"
+                return None
+            hits = []
+            for row in rows:
+                if not row.get("id") or row["id"] in baseline_ids or row["id"] in claimed:
+                    continue
+                if row.get("outTokenAddress") != scope["token"]:
+                    continue
+                if row.get("createdAtMs") is None or row["createdAtMs"] < wall - FOMO_SWAPS_SKEW_MS:
+                    continue
+                if str(row.get("inNetworkId")) != "1399811149" or str(row.get("outNetworkId")) != "1399811149":
+                    continue
+                sig = row.get("signature")
+                if not sig or sig.startswith("0x"):
+                    continue
+                hits.append(row)
+            if len(hits) > 1:
+                leg["incomplete"] = "ambiguous-swap-record"
+                self.diag["fomoSwapsAmbiguousRecord"] += 1
+                self.run_diag[rid]["fomoSwapsAmbiguousRecord"] += 1
+                return None
+            if not hits:
+                return None
+            row = hits[0]
+            if leg.get("chain") not in (None, "solana"):
+                leg["incomplete"] = "swap-record-chain-conflict"
+                return None
+            leg["chain"] = "solana"
+            leg["txHash"] = row["signature"]
+            leg["_fomoSwapRecordId"] = row["id"]
+            leg["tSuccessPushMs"] = t_obs
+            leg["wsSha"] = body_sha
+            leg["successAnchorKeys"] = ["executionFlow"]
+            digest = hashlib.sha256(row["signature"].encode()).hexdigest()
+            leg["successEvidence"] = {
+                "version": 1,
+                "platform": "fomo",
+                "channel": "fomo-swaps-rest",
+                "status": "success",
+                "txHash": row["signature"],
+                "txDigest": "-".join(digest[i:i+16] for i in range(0, 64, 16)),
+                "matchedKeys": ["executionFlow"],
+                "correlation": "swaps-baseline-diff+outToken+createdAt+unique-execution",
+                "observedAtMs": t_obs,
+                "frameSha": body_sha,
+            }
+            if leg.get("pendingBind"):
+                leg["pendingBind"] = False
+            self._promote_leg_locked(leg)
+            self._add_event_locked(rid, {
+                "t": t_obs,
+                "tw": _wall_iso(),
+                "kind": "fomo_swap_success",
+                "platform": "fomo",
+                "host": "prod-api.fomo.family",
+                "sha": body_sha,
+            })
             return leg
 
     def route_ws_frame(self, platform, ids, defer_nomatch=False):
@@ -3414,16 +3788,14 @@ class Store:
                         self.run_diag[newest][key] += 1
                 return None, reason
 
-            # 候选排序：非 dup > 已绑槽（formal）> 出站时刻——order/sign 腿取最早（首次
-            # 下单请求 = EU 侧 order_http_out 同义，平台重发含在 L1a′ 内，与 docs/binance.md
-            # §90 口径一致）；preview 腿取最晚（fomo 预览/执行 L7 不可区分，同 relaySwapId
-            # 的最后一次 /swaps/v2 最接近执行 POST——沿用 r7 前「最新腿」近似，不放大预览提前量）
+            # 候选排序：非 dup > 已绑槽（formal）> 最早出站时刻。
+            # FOMO v3 preview 没有执行锚，不参与候选；执行 transport 锚首写冻结。
             def _pref(x):
                 t = x.get("tOrderOutMs") or 0
                 return (
                     bool(x.get("dup")),
                     x.get("slot") is None,
-                    -t if x.get("anchorRole") == "preview" else t,
+                    t,
                 )
 
             positives.sort(key=_pref)
@@ -3828,9 +4200,8 @@ class Store:
                     "observationIndex": x.get(
                         "observationIndex"
                     ),  # platform×chain 内到达序（纯观察事实）
-                    # fomo 预览腿 anchorRole=preview、padre 签名腿 anchorRole=sign
-                    # （均不计 attempted、不消费 manifest 槽位）；成功帧正向匹配 =
-                    # 执行证据 → 晋升 order
+                    # fomo v3 preview 与 padre sign 不计 attempted/不占槽；
+                    # FOMO execution transport 直接建 order，padre DONE 正向匹配才晋升
                     "anchorRole": x.get("anchorRole"),
                     # 明细 manifest 下无槽可绑的下单观察（链未知/超额）
                     # ——留诊断不冒充授权槽位，不计 attempted/observed
@@ -4711,11 +5082,31 @@ class SpeedexHkTiming:
         t_wall = _wall_iso()
         t_wall_ms = int(time.time() * 1000)
         host = flow.request.pretty_host
-        path = flow.request.path.split("?")[0]
+        raw_path = flow.request.path or ""
+        path = raw_path.split("?")[0]
         method = flow.request.method
         platform = _classify_order(host, path, method)
+
+        swaps_scope = _fomo_swaps_request(host, raw_path, method)
+        if swaps_scope:
+            # Owner-approved 2026-11-07: only this exact read-only FOMO swaps GET loses
+            # cache validators so HK can observe a full baseline. No value is read/logged;
+            # order/execution traffic and every other request/platform remain untouched.
+            stripped = False
+            for header in ("If-None-Match", "If-Modified-Since"):
+                try:
+                    del flow.request.headers[header]
+                    stripped = True
+                except (KeyError, AttributeError):
+                    pass
+            if stripped:
+                STORE.note_frame_diag("fomoSwapsConditionalStripped")
+            flow.metadata["speedex_fomo_swaps"] = {"window": window, **swaps_scope}
+            return
+
+        fomo_route = _fomo_execution_route(host, path, method)
         raw_candidate = method == "POST" and (host in OKX_RPC_HOSTS or host in OKX_SOL_SEND_HOSTS)
-        if not platform and not raw_candidate:
+        if not platform and not raw_candidate and not fomo_route:
             return
         head_snapshots = HEADS.snapshot(window[0], t_obs)
         # body 解析在锁外完成；完成后复验入口捕获的不可变窗口身份再建腿。
@@ -4726,17 +5117,31 @@ class SpeedexHkTiming:
         except Exception:
             pass
         raw = _okx_rpc_request(host, path, method, getattr(flow.request, "headers", {}), body) if raw_candidate else None
-        if not platform and not raw:
+        fomo_execution = _fomo_execution_request(host, path, method, body) if fomo_route else None
+        if fomo_route and not fomo_execution:
+            STORE.note_frame_diag("fomoExecutionUnproven")
+            return
+        if not platform and not raw and not fomo_execution:
             return
         if raw:
             platform = "okx"
             flow.metadata["speedex_rpc"] = raw
+        elif fomo_execution:
+            platform = "fomo"
         request_ids = _okx_broadcast_request_ids(body) if platform == "okx" and not raw else {}
         chain = None
         try:
-            chain = raw["chain"] if raw else RULES[platform]["extract_chain"](body)
+            # FOMO chain is proven by its success record/Relay destination, never guessed
+            # from a signed Solana origin transaction shared by RH and F-SOL.
+            chain = raw["chain"] if raw else (None if platform == "fomo" else RULES[platform]["extract_chain"](body))
         except Exception:
             chain = None
+        source = (
+            "fomo-solana-execution" if fomo_execution
+            else raw["source"] if raw
+            else "fomo-preview-v3" if platform == "fomo"
+            else "platform-order"
+        )
         ev = {
             "t": t_obs,
             "tw": t_wall,
@@ -4744,11 +5149,13 @@ class SpeedexHkTiming:
             "kind": "order_req",
             "platform": platform,
             "host": host,
-            "path": path,
+            # Lamport's opaque route and every execution query stay unpersisted.
+            "path": None if fomo_execution else path,
             "flowId": flow.id,
             "bodySha": hashlib.sha256(body.encode()).hexdigest()[:16] if body else None,
             "headSnapshots": head_snapshots,
-            "orderRequestSource": raw["source"] if raw else "platform-order",
+            "orderRequestSource": source,
+            **({"anchorRole": "order", "transport": fomo_execution["kind"]} if fomo_execution else {}),
             **request_ids,
         }
         # Binance：出站请求体即知 clientOrderId（比等 ack 更早）——
@@ -4761,6 +5168,8 @@ class SpeedexHkTiming:
         if leg is None:
             return
         flow.metadata["speedex_leg"] = (leg, rid)  # 直接持引用
+        if fomo_execution:
+            flow.metadata["speedex_fomo_execution"] = fomo_execution
         if raw and raw.get("reqTxHash"):
             # OKX 广播请求体数学推导身份（keccak256(raw)/solana wire 首签名）——
             # 请求到达即知 tx 身份；响应侧 hash 仍是交叉验证（不一致 → 锚冲突否决律）。
@@ -4819,6 +5228,44 @@ class SpeedexHkTiming:
                     STORE.note_frame_diag(f"wsSniff.{relay_host}")
                     _WS_SNIFF_STATS[f"registered.{relay_host}"] += 1
             return
+
+        swaps_meta = flow.metadata.get("speedex_fomo_swaps")
+        if swaps_meta:
+            try:
+                code = int(getattr(flow.response, "status_code", None))
+            except (TypeError, ValueError):
+                code = None
+            STORE.note_frame_diag(
+                "fomoSwapsResp200" if code == 200 else "fomoSwapsResp304" if code == 304 else "fomoSwapsRespOther"
+            )
+            # A raw 304 has no authoritative rows, even if Chrome later serves cached rows
+            # to the page. Empty/invalid responses never create or replace HK snapshots.
+            if code == 304 or code is None or code < 200 or code >= 300:
+                return
+            try:
+                body = flow.response.get_text() or ""
+            except Exception:
+                return
+            if not body.strip():
+                return
+            rows = _fomo_swap_rows(body)
+            if rows is None:
+                return
+            body_sha = hashlib.sha256(body.encode()).hexdigest()[:16]
+            wall_ms = int(time.time() * 1000)
+            leg = STORE.observe_fomo_swaps(
+                swaps_meta["window"], swaps_meta, rows, t_obs, wall_ms, body_sha
+            )
+            if leg is not None:
+                h = STORE.claim_receipt_poll(leg)
+                if h:
+                    threading.Thread(
+                        target=_poll_receipt,
+                        args=(leg.get("runId"), leg, leg.get("chain"), h, _jsonrpc),
+                        daemon=True,
+                    ).start()
+            return
+
         meta = flow.metadata.get("speedex_leg")
         if not meta:
             return
@@ -4831,6 +5278,25 @@ class SpeedexHkTiming:
             body = flow.response.get_text() or ""
         except Exception:
             pass
+
+        fomo_execution = flow.metadata.get("speedex_fomo_execution")
+        if fomo_execution:
+            ok = _fomo_execution_ack(
+                fomo_execution, getattr(flow.response, "status_code", None), body
+            )
+            # Status/kind only: signed request params, response bodies and query credentials
+            # are never copied into the event. ACK failure never erases the execution anchor.
+            STORE.add_event(rid, {
+                "t": t_obs,
+                "tw": _wall_iso(),
+                "kind": "fomo_transport_ack",
+                "platform": "fomo",
+                "transport": fomo_execution["kind"],
+                "code": getattr(flow.response, "status_code", None),
+                "ok": ok,
+            })
+            return
+
         rule = RULES[leg["platform"]]
         try:
             raw = flow.metadata.get("speedex_rpc")
@@ -4839,9 +5305,12 @@ class SpeedexHkTiming:
             # 解析崩溃的响应不能充当受理证据（raw RPC 流）：拒绝晋升；锚写入不受影响
             # （_reject 非身份键，update_anchor 键白名单忽略）
             ids = {"_reject": "parse-error"} if flow.metadata.get("speedex_rpc") else {}
+        if leg.get("platform") == "fomo" and leg.get("anchorRole") == "preview":
+            STORE.note_fomo_preview(leg, ids, t_obs)
         # 响应抽取的 id/chain 是独立锚（成功判定/hash 采纳只认锚）：
         # 结构化 schema-known 抽取——orderId 与 clientOrderId 分键写锚；旧整-body 正则
-        # 只算诊断（legacyRegexDiverged），永不写锚。
+        # 只算诊断（legacyRegexDiverged），永不写锚。FOMO v3 的 _preview* 键只进
+        # candidate side state，绝不进入 _anchor。
         STORE.update_anchor(
             leg,
             {k: ids.get(k) for k in ("txHash", "orderId", "clientOrderId", "chain")},
@@ -4868,9 +5337,10 @@ class SpeedexHkTiming:
                 args=(rid, leg, leg.get("chain"), h, _jsonrpc),
                 daemon=True,
             ).start()
-        # 响应建立锚后重审该平台本 run 的早到缓冲帧——与实时帧
-        # 同一管线（路由/冲突/跨腿去重/新鲜度门），成功时刻用缓冲的单调源时间
-        self._drain_ws_buffer(rid, leg["platform"])
+        # FOMO preview candidate is not an execution anchor and must not replay buffered
+        # Relay success into a preview leg. Only a subscribe-bound execution can drain it.
+        if not (leg.get("platform") == "fomo" and leg.get("anchorRole") == "preview"):
+            self._drain_ws_buffer(rid, leg["platform"])
 
     def websocket_message(self, flow):
         # 内存有界：mitmproxy 会把每条 WS 消息无界累积到 flow.websocket.messages，
@@ -5227,6 +5697,13 @@ class SpeedexHkTiming:
                     "txHash": tx, "txDigest": "-".join(digest[i:i+16] for i in range(0, 64, 16)),
                     "observedAtMs": t_obs, "frameSha": leg["wsSha"],
                 }
+            elif platform == "fomo" and tx:
+                leg["successEvidence"] = {
+                    "version": 1, "platform": "fomo", "channel": "request.status.updated",
+                    "status": "success", "txHash": tx,
+                    "txDigest": "-".join(digest[i:i+16] for i in range(0, 64, 16)),
+                    "observedAtMs": t_obs, "frameSha": leg["wsSha"],
+                }
             # 记录成功帧正向命中的锚键（evidence.successAnchorKeys——关联依据可审计）
             anchor_now = leg.get("_anchor") or {}
             leg["successAnchorKeys"] = [
@@ -5238,10 +5715,19 @@ class SpeedexHkTiming:
             ]
             if leg.get("successEvidence"):
                 leg["successEvidence"]["matchedKeys"] = list(leg["successAnchorKeys"])
-            # preview（fomo /swaps/v2，Relay success requestId≡锚 relaySwapId）/
-            # sign（padre sign_raw_payload，同 DONE 节点合法 hash+独立锚正向匹配）腿
+            # FOMO execution transport created an order with unknown destination chain.
+            # A fully gated RH Relay success proves that chain; bind its pending slot now.
+            if (
+                platform == "fomo"
+                and leg.get("orderRequestSource") == "fomo-solana-execution"
+                and leg.get("pendingBind")
+                and leg.get("chain") == "robinhood"
+            ):
+                leg["pendingBind"] = False
+                STORE._promote_leg_locked(leg)
+            # preview/sign（padre sign_raw_payload，同 DONE 节点合法 hash+独立锚正向匹配）腿
             # 被成功帧正向匹配 = 执行证据——原子晋升 order 并补授权槽绑定；
-            # 预览/签名腿自身永不单独产成功
+            # FOMO /swaps/v3 preview 永不进入此晋升路径
             if leg.get("anchorRole") in ("preview", "sign"):
                 STORE._promote_leg_locked(leg)
         # 事件记进腿自己的 run（不 open_run_ids()[0] 取最旧窗）

@@ -45,7 +45,7 @@ ExecStart=/opt/speedex-mitm-exp/venv/bin/mitmdump \
   --set body_size_limit=2m \
   --set keep_host_header=false \
   --set block_global=false \
-  --set "allow_hosts=^(.*\\.)?(turnkey\\.com|padre\\.gg|binance\\.com|fomo\\.family|relay\\.link)(:\\d+)?$" \
+  --set "allow_hosts=^(?:(.*\\.)?(turnkey\\.com|padre\\.gg|binance\\.com|fomo\\.family|relay\\.link)|(?:mainnet\\.(?:hudson|block-engine)\\.jito\\.wtf|sender\\.helius-rpc\\.com|cashback\\.circular\\.fi|sender\\.lamport\\.dev))(:\\d+)?$" \
   -s /opt/speedex-mitm-exp/speedex_hk_timing.py \
   --quiet
 Restart=always

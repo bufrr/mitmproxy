@@ -183,3 +183,28 @@ test('RHF-19：install.sh 实验目录隔离按规范化真实路径——尾斜
   assert.notEqual(rLink.status, 0, 'symlink 别名必须拒绝');
   assert.ok(rLink.stderr.includes('拒绝：实验实例不得使用生产 APP'), `symlink stderr 缺拒绝文案: ${rLink.stderr.slice(0, 120)}`);
 });
+
+test('FOMO v3：生产/实验 allow_hosts 覆盖全部 bundle-proven 第三方执行 transport', () => {
+  const required = [
+    String.raw`mainnet\\.(?:hudson|block-engine)\\.jito\\.wtf`,
+    String.raw`sender\\.helius-rpc\\.com`,
+    String.raw`cashback\\.circular\\.fi`,
+    String.raw`sender\\.lamport\\.dev`,
+  ];
+  for (const rel of ['deploy/hk-proxy/speedex-mitm.service', 'deploy/hk-proxy/speedex-mitm-exp.service']) {
+    const unit = readSource(rel);
+    for (const pattern of required) assert.ok(unit.includes(pattern), `${rel} 缺 ${pattern}`);
+    assert.ok(!unit.includes(String.raw`*.jito.wtf`), `${rel} 不得用通配 host 扩围`);
+    const raw = unit.match(/--set "allow_hosts=([^"]+)"/)?.[1];
+    assert.ok(raw, `${rel} 缺 allow_hosts 行`);
+    const allow = new RegExp(raw.replace(/\\\\/g, '\\'));
+    for (const host of ['mainnet.hudson.jito.wtf', 'mainnet.block-engine.jito.wtf', 'sender.helius-rpc.com', 'cashback.circular.fi', 'sender.lamport.dev', 'solana-provider-1.prod-edge.fomo.family']) {
+      assert.ok(allow.test(`${host}:443`), `${rel} 实际 regex 未命中 ${host}:443`);
+    }
+    assert.ok(!allow.test('mainnet.hudson.jito.wtf.evil.example:443'), `${rel} 不得命中相似后缀 host`);
+  }
+  const overlay = readSource('deploy/hk-proxy/selective-decrypt.overlay.example');
+  for (const host of ['mainnet\\.(?:hudson|block-engine)\\.jito\\.wtf', 'sender\\.helius-rpc\\.com', 'cashback\\.circular\\.fi', 'sender\\.lamport\\.dev']) {
+    assert.ok(overlay.includes(host), `overlay 缺 FOMO transport ${host}`);
+  }
+});

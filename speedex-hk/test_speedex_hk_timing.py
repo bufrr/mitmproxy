@@ -8,6 +8,7 @@ fomo-runner.test.mjs、binance-ws.test.mjs、runner-core.mjs 引用的生产样�
 # while each real test HTTP server binds an OS-assigned port. Reloaded addon
 # modules see the same fixture; all servers are owned by this test process.
 import atexit
+import datetime
 import http.server
 import json
 import zlib
@@ -60,29 +61,46 @@ class FakeWSMsg:
         self.from_client = from_client
 
 
+class FakeHeaders:
+    """Case-insensitive test headers; values stay inside the synthetic flow."""
+    def __init__(self, values=None):
+        self._values = {str(k).lower(): v for k, v in (values or {}).items()}
+
+    def __delitem__(self, key):
+        del self._values[str(key).lower()]
+
+    def __contains__(self, key):
+        return str(key).lower() in self._values
+
+    def get(self, key, default=None):
+        return self._values.get(str(key).lower(), default)
+
+
 class FakeReq:
-    def __init__(self, host, path, method="POST", body=""):
+    def __init__(self, host, path, method="POST", body="", headers=None):
         self.pretty_host = host
         self.path = path
         self.method = method
         self._body = body
+        self.headers = FakeHeaders(headers)
 
     def get_text(self):
         return self._body
 
 
 class FakeResp:
-    def __init__(self, body=""):
+    def __init__(self, body="", status_code=200):
         self._body = body
+        self.status_code = status_code
 
     def get_text(self):
         return self._body
 
 
 class FakeFlow:
-    def __init__(self, host, path, method="POST", req_body="", resp_body=""):
-        self.request = FakeReq(host, path, method, req_body)
-        self.response = FakeResp(resp_body)
+    def __init__(self, host, path, method="POST", req_body="", resp_body="", headers=None, status_code=200):
+        self.request = FakeReq(host, path, method, req_body, headers)
+        self.response = FakeResp(resp_body, status_code)
         self.metadata = {}
         self.id = "flow-" + str(abs(hash((host, path, time.monotonic_ns()))) % 10**8)
         self.websocket = None
@@ -97,6 +115,106 @@ def ws_frame(host, payload, from_client=False):
 def fresh():
     A.STORE = A.Store()
     return A.STORE
+
+
+FOMO_TEST_UUID = "00000000-0000-4000-8000-000000000001"
+FOMO_TEST_MINT = "FxMint" + "6" * 38
+FOMO_TEST_SIG = "5" * 88
+
+
+def fomo_preview(relay=None, source=None, respond=True):
+    """Current /swaps/v3 response variants; all transaction/intent values are synthetic."""
+    if relay is not None:
+        source = "relay"
+    source = source or ("relay" if relay else "solana")
+    ro = {"source": source, "originChainType": "SOLANA", "tradeInfo": {"provider": "SYNTHETIC"}}
+    if source == "relay":
+        ro["v2Swap"] = {
+            "relaySwapId": relay,
+            "destinationChainId": 4663,
+            "relayTransaction": {"type": "SOLANA", "tx": "c3ludGhldGljLXR4"},
+        }
+    elif source == "mobula":
+        ro["mobulaSwap"] = {
+            "intentId": "synthetic-intent-not-a-relay-id",
+            "deposit": {"type": "SOLANA", "tx": "c3ludGhldGljLXR4"},
+        }
+    else:
+        ro["v1Swap"] = {
+            "swapTransaction": "c3ludGhldGljLXR4",
+            "feePayerSignature": "c3ludGhldGljLXNpZw",
+            "feePayerAddress": "FxFee" + "4" * 38,
+        }
+    f = FakeFlow(
+        "prod-api.fomo.family",
+        "/swaps/v3",
+        "POST",
+        resp_body=json.dumps({"success": True, "statusCode": 200, "responseObject": ro}),
+    )
+    A.addons[0].request(f)
+    if respond:
+        A.addons[0].response(f)
+    return f
+
+
+def fomo_execution(host="mainnet.hudson.jito.wtf", path="/api/v1/sendTransactionWeb", body="{}", response=True):
+    f = FakeFlow(host, path, "POST", req_body=body, resp_body="{}")
+    A.addons[0].request(f)
+    if response:
+        A.addons[0].response(f)
+    return f
+
+
+def fomo_subscribe(rid):
+    A.addons[0].websocket_message(
+        ws_frame(
+            "ws.relay.link",
+            json.dumps({"type": "subscribe", "event": "request.status.updated", "filters": {"id": rid}}),
+            from_client=True,
+        )
+    )
+
+
+def fomo_status(rid, status="success", txh=None, published_at=None, destination=4663):
+    data = {"status": status, "requestId": rid, "destinationChainId": destination}
+    if txh:
+        data["txHashes"] = [txh]
+    payload = {
+        "event": "request.status.updated",
+        "data": data,
+        "publishedAt": int(time.time() * 1000) if published_at is None else published_at,
+    }
+    A.addons[0].websocket_message(ws_frame("ws.relay.link", json.dumps(payload)))
+
+
+def fomo_swaps(rows, token=FOMO_TEST_MINT, user=FOMO_TEST_UUID, headers=None, status_code=200, raw_body=None):
+    body = json.dumps({"success": True, "statusCode": 200, "responseObject": {"swaps": rows}}) if raw_body is None else raw_body
+    query = f"?tokenAddress={token}" if token is not None else ""
+    f = FakeFlow(
+        "prod-api.fomo.family",
+        f"/v2/users/{user}/swaps{query}",
+        "GET",
+        resp_body=body,
+        headers=headers,
+        status_code=status_code,
+    )
+    A.addons[0].request(f)
+    A.addons[0].response(f)
+    return f
+
+
+def fomo_swap_row(over=None):
+    row = {
+        "id": "new-swap-0000-0000-0000-000000000002",
+        "signature": FOMO_TEST_SIG,
+        "outTokenAddress": FOMO_TEST_MINT,
+        "createdAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "inNetworkId": 1399811149,
+        "outNetworkId": 1399811149,
+        "provider": "SYNTHETIC",
+    }
+    row.update(over or {})
+    return row
 
 
 # r8（PX-01）：Turnkey `POST /public/v1/submit/sign_raw_payload` 的**真实响应形状**——
@@ -573,7 +691,7 @@ class TestHkTiming(unittest.TestCase):
         self.assertIsNotNone(leg["hkL3Ms"], "PENDING 帧已见 hash → 轮询已启动")
 
     def test_fomo_relay_three_way(self):
-        """FOMO：relaySwapId↔subscribe filters.id↔data.requestId 三段相等；success 帧。"""
+        """v3 Relay candidate + execution transport + subscribe + success 四段绑定。"""
         A.STORE.mark_open("run-f")
         rid = "0x" + "9a" * 32
         orig = A._jsonrpc
@@ -582,75 +700,29 @@ class TestHkTiming(unittest.TestCase):
             "blockNumber": "0x1",
             "blockHash": "0x" + "99" * 32,
             "transactionHash": p[0],
-        }  # R24：echo 被轮询的 hash
+        }
         try:
-            f = FakeFlow(
-                "prod-api.fomo.family",
-                "/swaps/v2",
-                "POST",
-                resp_body=json.dumps(
-                    {
-                        "success": True,
-                        "responseObject": {
-                            "v2Swap": {"relaySwapId": rid, "destinationChainId": 4663}
-                        },
-                    }
-                ),
-            )
-            A.addons[0].request(f)
-            A.addons[0].response(f)
-            # 页面出站 subscribe（from_client）——绑定 requestId
-            A.addons[0].websocket_message(
-                ws_frame(
-                    "ws.relay.link",
-                    json.dumps(
-                        {
-                            "type": "subscribe",
-                            "event": "request.status.updated",
-                            "filters": {"id": rid},
-                        }
-                    ),
-                    from_client=True,
-                )
-            )
-            # pending 帧不算
-            A.addons[0].websocket_message(
-                ws_frame(
-                    "ws.relay.link",
-                    json.dumps(
-                        {
-                            "event": "request.status.updated",
-                            "data": {"status": "pending", "requestId": rid},
-                        }
-                    ),
-                )
-            )
-            self.assertIsNone(A.STORE.timeline("run-f")["legs"][0]["hkL1aMs"])
-            A.addons[0].websocket_message(
-                ws_frame(
-                    "ws.relay.link",
-                    json.dumps(
-                        {
-                            "event": "request.status.updated",
-                            "data": {
-                                "status": "success",
-                                "requestId": rid,
-                                "txHashes": ["0x" + "12" * 32],
-                                "destinationChainId": 4663,
-                            },
-                        }
-                    ),
-                )
-            )
+            fomo_preview(relay=rid)
+            fomo_execution()
+            fomo_subscribe(rid)
+            fomo_status(rid, "pending")  # pending 且缺 fill hash——不算成功
+            legs = A.STORE.timeline("run-f")["legs"]
+            self.assertEqual(legs[0]["anchorRole"], "preview")
+            self.assertIsNone(legs[0]["hkL1aMs"])
+            self.assertIsNone(legs[1]["hkL1aMs"])
+            fomo_status(rid, "success", "0x" + "12" * 32)
             time.sleep(0.25)
         finally:
             A._jsonrpc = orig
-        leg = A.STORE.timeline("run-f")["legs"][0]
-        self.assertEqual(
-            leg["chain"], "robinhood", "destinationChainId 4663 → robinhood"
-        )
+        legs = A.STORE.timeline("run-f")["legs"]
+        self.assertEqual(legs[0]["anchorRole"], "preview", "preview 永不被 Relay 成功晋升")
+        leg = legs[1]
+        self.assertEqual(leg["anchorRole"], "order")
+        self.assertEqual(leg["orderRequestSource"], "fomo-solana-execution")
+        self.assertEqual(leg["chain"], "robinhood")
         self.assertIsNotNone(leg["hkL1aMs"])
         self.assertIsNotNone(leg["hkL3Ms"], "success 帧 txHashes[0] → EVM 轮询")
+        self.assertEqual(leg["evidence"]["success"]["channel"], "request.status.updated")
 
     def test_rounds_occurrence_and_no_mark(self):
         """无窗口不记录；同平台多次下单记到达序 observationIndex（r7：授权轮 round
@@ -662,7 +734,7 @@ class TestHkTiming(unittest.TestCase):
         self.assertEqual(A.STORE.timeline("nope")["legs"], [])
         A.STORE.mark_open("run-n")
         for _ in range(3):
-            fx = FakeFlow("prod-api.fomo.family", "/swaps/v2", "POST", "", "{}")
+            fx = FakeFlow("prod-api.fomo.family", "/swaps/v3", "POST", "", "{}")
             A.addons[0].request(fx)
             A.addons[0].response(fx)
         legs = A.STORE.timeline("run-n")["legs"]
@@ -859,8 +931,7 @@ class TestR07PositiveCorrelation(unittest.TestCase):
         fresh()
 
     def test_fomo_success_requires_anchor(self):
-        """R07：FOMO 成功帧必须与请求/响应建立的锚（relaySwapId/subscribe 绑定）
-        正向匹配——腿无锚或帧无 requestId 都不得出 L1a'。"""
+        """R07：执行腿无 subscribe 锚或成功帧缺 requestId 都不得出 L1a'。"""
         A.STORE.mark_open("run-fx")
         rid = "0x" + "9a" * 32
         orig = A._jsonrpc
@@ -871,84 +942,33 @@ class TestR07PositiveCorrelation(unittest.TestCase):
             "transactionHash": p[0],
         }
         try:
-            # 腿1：响应提取失败（无 relaySwapId）→ 腿无锚；成功帧带 requestId 也不算
-            f1 = FakeFlow("prod-api.fomo.family", "/swaps/v2", "POST", resp_body="{}")
-            A.addons[0].request(f1)
-            A.addons[0].response(f1)
+            fomo_execution()
+            fomo_status(rid, "success", "0x" + "12" * 32)
+            leg = A.STORE.legs["run-fx"][0]
+            self.assertIsNone(leg.get("tSuccessPushMs"), "无执行订阅锚 → 成功帧不得采纳")
+            self.assertIsNone(leg.get("txHash"))
+
+            fresh()
+            A.STORE.mark_open("run-fx2")
+            fomo_execution()
+            leg = A.STORE.legs["run-fx2"][0]
+            fomo_preview(relay=rid)
+            fomo_subscribe(rid)
+            # 帧缺 requestId：即使有执行锚和 fill hash 也不得凭时间窗充数。
             A.addons[0].websocket_message(
-                ws_frame(
-                    "ws.relay.link",
-                    json.dumps(
-                        {
-                            "event": "request.status.updated",
-                            "data": {
-                                "status": "success",
-                                "requestId": rid,
-                                "txHashes": ["0x" + "12" * 32],
-                                "destinationChainId": 4663,
-                            },
-                        }
-                    ),
-                )
+                ws_frame("ws.relay.link", json.dumps({
+                    "event": "request.status.updated",
+                    "publishedAt": int(time.time() * 1000),
+                    "data": {"status": "success", "txHashes": ["0x" + "34" * 32], "destinationChainId": 4663},
+                }))
             )
-            leg1 = A.STORE.timeline("run-fx")["legs"][0]
-            self.assertIsNone(leg1["hkL1aMs"], "腿无独立锚 → 成功帧不得采纳")
-            self.assertIsNone(leg1["txHash"], "无锚帧 hash 不得挂载")
-            # 腿2：有锚（响应 relaySwapId），帧缺 requestId → 不得算成功
-            f2 = FakeFlow(
-                "prod-api.fomo.family",
-                "/swaps/v2",
-                "POST",
-                resp_body=json.dumps(
-                    {
-                        "success": True,
-                        "responseObject": {
-                            "v2Swap": {"relaySwapId": rid, "destinationChainId": 4663}
-                        },
-                    }
-                ),
-            )
-            A.addons[0].request(f2)
-            A.addons[0].response(f2)
-            A.addons[0].websocket_message(
-                ws_frame(
-                    "ws.relay.link",
-                    json.dumps(
-                        {
-                            "event": "request.status.updated",
-                            "data": {
-                                "status": "success",
-                                "txHashes": ["0x" + "34" * 32],
-                            },
-                        }
-                    ),
-                )
-            )
-            leg2 = A.STORE.timeline("run-fx")["legs"][1]
-            self.assertIsNone(leg2["hkL1aMs"], "帧无 requestId → 不得凭时间窗充数")
-            # 正向控制：帧 requestId ≡ 锚 → 采纳
-            A.addons[0].websocket_message(
-                ws_frame(
-                    "ws.relay.link",
-                    json.dumps(
-                        {
-                            "event": "request.status.updated",
-                            "data": {
-                                "status": "success",
-                                "requestId": rid,
-                                "txHashes": ["0x" + "34" * 32],
-                                "destinationChainId": 4663,
-                            },
-                        }
-                    ),
-                )
-            )
+            self.assertIsNone(leg.get("tSuccessPushMs"))
+            fomo_status(rid, "success", "0x" + "34" * 32)
             time.sleep(0.25)
         finally:
             A._jsonrpc = orig
-        leg2 = A.STORE.timeline("run-fx")["legs"][1]
-        self.assertIsNotNone(leg2["hkL1aMs"], "正向匹配成功帧正常采纳")
-        self.assertIsNotNone(leg2["hkL3Ms"])
+        self.assertIsNotNone(leg.get("tSuccessPushMs"), "candidate+subscribe+requestId 正向匹配")
+        self.assertIsNotNone(leg.get("tReceiptMs"))
 
     def test_binance_frame_cannot_self_certify(self):
         """R07：腿的 orderId 不得由待判成功帧自己先写入再自证关联——锚只能来自
@@ -1680,8 +1700,8 @@ class TestR22Manifest(unittest.TestCase):
         self.assertEqual(len(okx_bsc_ph), 1, "okx/bsc 授权 3 轮实到 2 → 恰好 1 个占位")
 
     def test_manifest_per_leg_rounds_preview_not_consumed(self):
-        """per-leg rounds manifest 下 fomo 预览腿同样不计 attempted、不消费授权轮次
-        占位；Relay success 正向匹配晋升 order 后才消费 1 个占位。"""
+        """per-leg rounds manifest 下 fomo v3 preview 不计 attempted、不消费授权轮次；
+        独立 execution transport + subscribe + Relay success 才消费 1 个占位。"""
         rid = "0x" + "9a" * 32
         orig = A._jsonrpc
         A._jsonrpc = lambda url, m, p, timeout=10: {
@@ -1700,21 +1720,7 @@ class TestR22Manifest(unittest.TestCase):
                     "legs": [{"platform": "fomo", "chain": "robinhood", "rounds": 2}],
                 },
             )
-            f = FakeFlow(
-                "prod-api.fomo.family",
-                "/swaps/v2",
-                "POST",
-                resp_body=json.dumps(
-                    {
-                        "success": True,
-                        "responseObject": {
-                            "v2Swap": {"relaySwapId": rid, "destinationChainId": 4663}
-                        },
-                    }
-                ),
-            )
-            A.addons[0].request(f)
-            A.addons[0].response(f)
+            fomo_preview(relay=rid)
             tl = A.STORE.timeline("run-mp")
             self.assertEqual(
                 tl["counts"],
@@ -1724,22 +1730,9 @@ class TestR22Manifest(unittest.TestCase):
             self.assertEqual(
                 len(tl["legs"]), 3, "1 预览腿 + 2 占位（预览不消费授权轮次）"
             )
-            A.addons[0].websocket_message(
-                ws_frame(
-                    "ws.relay.link",
-                    json.dumps(
-                        {
-                            "event": "request.status.updated",
-                            "data": {
-                                "status": "success",
-                                "requestId": rid,
-                                "txHashes": ["0x" + "12" * 32],
-                                "destinationChainId": 4663,
-                            },
-                        }
-                    ),
-                )
-            )
+            fomo_execution()
+            fomo_subscribe(rid)
+            fomo_status(rid, "success", "0x" + "12" * 32)
             time.sleep(0.25)
         finally:
             A._jsonrpc = orig
@@ -1747,7 +1740,7 @@ class TestR22Manifest(unittest.TestCase):
         self.assertEqual(tl["counts"]["attempted"], 1, "晋升 order 后计 1 次下单")
         self.assertEqual(tl["counts"]["observed"], 1)
         self.assertEqual(
-            len(tl["legs"]), 2, "晋升后消费 1 个占位（1 order 腿 + 1 占位）"
+            len(tl["legs"]), 3, "preview + execution order + 1 占位（execution 消费 1 槽）"
         )
 
 
@@ -2557,10 +2550,7 @@ class TestR22PreviewRoleAndBudgets(unittest.TestCase):
         fresh()
 
     def test_fomo_preview_leg_not_attempted_until_executed(self):
-        """FOMO /swaps/v2 = 点击前预览（L7 路径/体不可区分执行）——腿先标
-        anchorRole=preview：不计 attempted、不消费 manifest 占位；Relay success 帧
-        正向匹配 requestId≡relaySwapId（=执行证据，Relay 只对已执行请求推 success）
-        才原子晋升 order 并计 attempted。"""
+        """v3 preview 永不计单；首个 execution transport 是锚，近端 fanout 不重复计单。"""
         A.STORE.mark_open("run-fp", manifest={"rounds": 1})
         rid = "0x" + "9a" * 32
         orig = A._jsonrpc
@@ -2571,67 +2561,29 @@ class TestR22PreviewRoleAndBudgets(unittest.TestCase):
             "transactionHash": p[0],
         }
         try:
-            # 两次预览（键入/报价刷新页面自发）——均不得计 attempted
             for _ in range(2):
-                f = FakeFlow(
-                    "prod-api.fomo.family",
-                    "/swaps/v2",
-                    "POST",
-                    resp_body=json.dumps(
-                        {
-                            "success": True,
-                            "responseObject": {
-                                "v2Swap": {
-                                    "relaySwapId": rid,
-                                    "destinationChainId": 4663,
-                                }
-                            },
-                        }
-                    ),
-                )
-                A.addons[0].request(f)
-                A.addons[0].response(f)
+                fomo_preview(relay=rid)
             tl = A.STORE.timeline("run-fp")
-            self.assertEqual(
-                tl["counts"]["attempted"],
-                0,
-                "预览不计 attempted（bug：每个预览 POST 都当下单 attempt）",
-            )
+            self.assertEqual(tl["counts"]["attempted"], 0)
             previews = [x for x in tl["legs"] if x["platform"] == "fomo"]
-            self.assertTrue(
-                previews and all(x.get("anchorRole") == "preview" for x in previews),
-                "fomo 腿须标 anchorRole=preview",
-            )
-            self.assertEqual(
-                len(tl["legs"]), 3, "2 预览腿 + 1 manifest 占位（预览不消费授权轮次）"
-            )
-            # 执行证据：Relay success 正向匹配最新预览腿 → 晋升 order + L1a'
-            A.addons[0].websocket_message(
-                ws_frame(
-                    "ws.relay.link",
-                    json.dumps(
-                        {
-                            "event": "request.status.updated",
-                            "data": {
-                                "status": "success",
-                                "requestId": rid,
-                                "txHashes": ["0x" + "12" * 32],
-                                "destinationChainId": 4663,
-                            },
-                        }
-                    ),
-                )
-            )
+            self.assertTrue(previews and all(x.get("anchorRole") == "preview" for x in previews))
+            self.assertEqual(len(tl["legs"]), 3, "2 preview + 1 manifest 占位")
+            fomo_execution()
+            fomo_execution("sender.helius-rpc.com", "/fast?api-key=synthetic-not-retained")
+            self.assertEqual(len(A.STORE.legs["run-fp"]), 3, "Jito+Helius = 同一执行观察")
+            fomo_subscribe(rid)
+            fomo_status(rid, "success", "0x" + "12" * 32)
             time.sleep(0.3)
         finally:
             A._jsonrpc = orig
         tl = A.STORE.timeline("run-fp")
-        self.assertEqual(tl["counts"]["attempted"], 1, "执行证据落地后计 1 次下单")
+        self.assertEqual(tl["counts"]["attempted"], 1)
         self.assertEqual(tl["counts"]["observed"], 1)
         exec_legs = [x for x in tl["legs"] if x.get("anchorRole") == "order"]
         self.assertEqual(len(exec_legs), 1)
+        self.assertEqual(exec_legs[0]["orderRequestSource"], "fomo-solana-execution")
         self.assertIsNotNone(exec_legs[0]["hkL1aMs"])
-        self.assertEqual(len(tl["legs"]), 2, "晋升后 manifest 占位被 order 腿消费")
+        self.assertEqual(len(tl["legs"]), 3, "2 preview + 1 execution；占位被消费")
 
     def test_window_budgets_legs_and_events(self):
         """单 run 腿/事件预算——超限截断并标 overflow（内存有界；防预览风暴）。"""
@@ -2974,7 +2926,7 @@ class TestR22SlotBinding(unittest.TestCase):
             },
         )
         A.addons[0].request(
-            FakeFlow("prod-api.fomo.family", "/swaps/v2", "POST", "", "{}")
+            FakeFlow("prod-api.fomo.family", "/swaps/v3", "POST", "", "{}")
         )
         A.STORE.mark_close("run-pv")
         tl = A.STORE.timeline("run-pv")
@@ -3480,8 +3432,7 @@ class TestR22OrderIdentityDedup(unittest.TestCase):
         self.assertTrue(internal[1]["unbound"])
 
     def test_fomo_duplicate_execution_not_rebound(self):
-        """fomo：preview 晋升绑槽后，同 relaySwapId 的再次预览/再次 success 帧
-        （路由到最新预览腿）不再消费第二个槽——attempted 恒 1。"""
+        """FOMO 多 transport 与重复 success：首观察冻结，不消费第二个授权槽。"""
         rid = "0x" + "9a" * 32
         A.STORE.mark_open(
             "run-fd",
@@ -3492,55 +3443,22 @@ class TestR22OrderIdentityDedup(unittest.TestCase):
                 "legs": [{"platform": "fomo", "chain": "robinhood", "rounds": 1}],
             },
         )
-
-        def preview():
-            f = FakeFlow(
-                "prod-api.fomo.family",
-                "/swaps/v2",
-                "POST",
-                resp_body=json.dumps(
-                    {
-                        "success": True,
-                        "responseObject": {
-                            "v2Swap": {"relaySwapId": rid, "destinationChainId": 4663}
-                        },
-                    }
-                ),
-            )
-            A.addons[0].request(f)
-            A.addons[0].response(f)
-
-        def success():
-            A.addons[0].websocket_message(
-                ws_frame(
-                    "ws.relay.link",
-                    json.dumps(
-                        {
-                            "event": "request.status.updated",
-                            "data": {
-                                "status": "success",
-                                "requestId": rid,
-                                "txHashes": ["0x" + "12" * 32],
-                                "destinationChainId": 4663,
-                            },
-                        }
-                    ),
-                )
-            )
-
-        preview()
-        success()  # 晋升腿1并绑槽
-        preview()  # 同 relaySwapId 的重复预览——响应身份正向同单 → dup
-        success()  # 重复执行证据路由到腿2——晋升但不再占新槽
+        fomo_preview(relay=rid)
+        fomo_execution()
+        fomo_execution("sender.helius-rpc.com", "/fast")
+        fomo_subscribe(rid)
+        fomo_status(rid, "success", "0x" + "12" * 32)
+        first = A.STORE.legs["run-fd"][1]["tSuccessPushMs"]
+        fomo_status(rid, "success", "0x" + "12" * 32)
         tl = A.STORE.timeline("run-fd")
         self.assertEqual(
             tl["counts"], {"requested": 1, "attempted": 1, "observed": 1, "unbound": 0}
         )
         internal = A.STORE.legs["run-fd"]
-        self.assertEqual((internal[0]["slot"], internal[0]["round"]), (0, None))
-        self.assertTrue(internal[1]["dup"], "同单重复预览腿须标 dup")
-        self.assertIsNone(internal[1]["slot"])
-        self.assertEqual(A.STORE.diag.get("orderReqDuplicate"), 1)
+        self.assertEqual(len(internal), 2, "preview + 一个逻辑 execution")
+        self.assertEqual((internal[1]["slot"], internal[1]["round"]), (0, None))
+        self.assertEqual(internal[1]["tSuccessPushMs"], first, "重复 success 不覆盖首观察")
+        self.assertEqual(A.STORE.diag.get("orderReqDuplicate", 0), 0)
 
 
 # ── R22 四轮（2026-09-07 r6）②：Padre DONE·receipt 乱序补绑 ──
@@ -3796,21 +3714,7 @@ class TestR22ObservedBoundOrderGate(unittest.TestCase):
                 "legs": [{"platform": "fomo", "chain": "robinhood", "rounds": 1}],
             },
         )
-        f = FakeFlow(
-            "prod-api.fomo.family",
-            "/swaps/v2",
-            "POST",
-            resp_body=json.dumps(
-                {
-                    "success": True,
-                    "responseObject": {
-                        "v2Swap": {"relaySwapId": rid, "destinationChainId": 4663}
-                    },
-                }
-            ),
-        )
-        A.addons[0].request(f)
-        A.addons[0].response(f)
+        fomo_preview(relay=rid)
         leg = A.STORE.legs["run-op"][0]
         A._settle_receipt(leg, dict(self.RH_RECEIPT))
         A.STORE.mark_close("run-op")
@@ -4155,31 +4059,30 @@ class TestR8StructuredAnchors(unittest.TestCase):
 
     def test_fomo_resp_ids_structured_path(self):
         rid = "0x" + "9a" * 32
-        out = A._fomo_resp_ids(
-            json.dumps(
-                {
-                    "success": True,
-                    "responseObject": {
-                        "v2Swap": {"relaySwapId": rid, "destinationChainId": 4663}
-                    },
-                }
-            )
-        )
-        self.assertEqual(out, {"orderId": rid, "chain": "robinhood"})
+        relay = json.dumps({
+            "success": True,
+            "responseObject": {
+                "source": "relay",
+                "v2Swap": {"relaySwapId": rid, "destinationChainId": 4663, "relayTransaction": {"type": "SOLANA"}},
+            },
+        })
+        out = A._fomo_resp_ids(relay)
+        self.assertEqual(out, {"chain": "robinhood", "_previewSource": "relay", "_previewRelayId": rid})
+        self.assertNotIn("orderId", out, "v3 preview candidate 不是执行锚")
         self.assertEqual(
-            A._fomo_resp_ids(
-                json.dumps({"responseObject": {"v2Swap": {"relaySwapId": "nope"}}})
-            ),
-            {},
-            "非 EVM 形状不取",
+            A._fomo_resp_ids(json.dumps({
+                "success": True,
+                "responseObject": {"source": "solana", "v1Swap": {"swapTransaction": "synthetic"}},
+            })),
+            {"chain": "solana", "_previewSource": "solana"},
         )
-        self.assertEqual(
-            A._fomo_resp_ids(
-                json.dumps({"statusCode": 200, "message": "Successful v2 swap"})
-            ),
-            {},
-            "同链 DFlow 预览无 v2Swap → 无锚",
-        )
+        mobula = A._fomo_resp_ids(json.dumps({
+            "success": True,
+            "responseObject": {"source": "mobula", "mobulaSwap": {"intentId": rid, "deposit": {"tx": "synthetic"}}},
+        }))
+        self.assertEqual(mobula, {"chain": "robinhood", "_previewSource": "mobula"})
+        self.assertNotIn("_previewRelayId", mobula, "Mobula intentId 永不进入 Relay 锚")
+        self.assertEqual(A._fomo_resp_ids(json.dumps({"responseObject": {"source": "relay", "v2Swap": {"relaySwapId": "nope"}}})), {})
 
 
 class TestR8IdentityRouting(unittest.TestCase):
@@ -4525,50 +4428,25 @@ class TestR8IdentityRouting(unittest.TestCase):
         self.assertIsNotNone(legs[0]["hkL1aMs"], "最早腿（首请求）得成功")
         self.assertIsNone(legs[1]["hkL1aMs"])
 
-    def test_fomo_same_relay_id_prefers_latest_preview(self):
-        """fomo 预览/执行 L7 不可区分：同 relaySwapId 多个 preview 腿时成功归**最晚**的
-        preview（最接近执行 POST——沿用 r7 前「最新腿」近似，不放大预览提前量）。"""
+    def test_fomo_success_never_lands_on_latest_preview(self):
+        """同 relayId 多个 v3 preview 也只是候选；success 只落 execution transport 腿。"""
         rid = "0x" + "9a" * 32
         A.STORE.mark_open(
             "run-r8fo",
             manifest=self._manifest("run-r8fo", platform="fomo", chain="robinhood"),
         )
         for _ in range(2):
-            f = FakeFlow(
-                "prod-api.fomo.family",
-                "/swaps/v2",
-                "POST",
-                resp_body=json.dumps(
-                    {
-                        "success": True,
-                        "responseObject": {
-                            "v2Swap": {"relaySwapId": rid, "destinationChainId": 4663}
-                        },
-                    }
-                ),
-            )
-            A.addons[0].request(f)
-            A.addons[0].response(f)
-        A.addons[0].websocket_message(
-            ws_frame(
-                "ws.relay.link",
-                json.dumps(
-                    {
-                        "event": "request.status.updated",
-                        "data": {
-                            "status": "success",
-                            "requestId": rid,
-                            "txHashes": ["0x" + "12" * 32],
-                            "destinationChainId": 4663,
-                        },
-                    }
-                ),
-            )
-        )
+            fomo_preview(relay=rid)
+        fomo_execution()
+        fomo_subscribe(rid)
+        fomo_status(rid, "success", "0x" + "12" * 32)
         internal = A.STORE.legs["run-r8fo"]
         self.assertIsNone(internal[0]["tSuccessPushMs"])
-        self.assertEqual(internal[1]["anchorRole"], "order", "最晚 preview 腿晋升")
-        self.assertIsNotNone(internal[1]["tSuccessPushMs"])
+        self.assertIsNone(internal[1]["tSuccessPushMs"])
+        self.assertEqual(internal[0]["anchorRole"], "preview")
+        self.assertEqual(internal[1]["anchorRole"], "preview")
+        self.assertEqual(internal[2]["anchorRole"], "order")
+        self.assertIsNotNone(internal[2]["tSuccessPushMs"])
         self.assertEqual(
             A.STORE.timeline("run-r8fo")["counts"],
             {"requested": 1, "attempted": 1, "observed": 1, "unbound": 0},
@@ -4640,12 +4518,12 @@ class TestR8IdentityRouting(unittest.TestCase):
 
 
 class TestR9AnchorConflictVeto(unittest.TestCase):
-    """RHF-09：身份冲突 = 否决条件。fomo 页面出站 subscribe 按到达时序绑到最新腿——
-    A 的迟到 subscribe 挂到 B 后，B 自己的响应明确另一 relayId → 锚自相矛盾 → B 降级
-    diagnostic（_anchorVeto + incomplete=anchor-conflict 首写）：冲突帧不得驱动其
-    晋升/成功、不起 receipt 轮询、observed 不增加；A 的成功只匹配 A 的腿（成功腿起点
-    按独立请求/响应证据）。旧码（r8）只记 conflict 不否决——success(A) 落在 B 且
-    起点按 B 的较晚请求（HK-L1a′ 假性偏小）。"""
+    """Current FOMO execution-anchor conflicts.
+
+    Old preview-self-anchor cases map to: first subscribe freeze, a different second
+    execution subscribe veto, late v3 preview non-conflict, missing candidate fail-closed,
+    and cancel/non-success ordering. Preview responses never overwrite an execution anchor.
+    """
 
     RELAY_A = "0x" + "a1" * 32
     RELAY_B = "0x" + "b2" * 32
@@ -4665,215 +4543,117 @@ class TestR9AnchorConflictVeto(unittest.TestCase):
             "legs": [{"platform": "fomo", "chain": "robinhood", "rounds": rounds}],
         }
 
-    def _preview(self, relay=None, respond=True):
-        body = "{}"
-        if relay:
-            body = json.dumps(
-                {
-                    "success": True,
-                    "responseObject": {
-                        "v2Swap": {"relaySwapId": relay, "destinationChainId": 4663}
-                    },
-                }
-            )
-        f = FakeFlow("prod-api.fomo.family", "/swaps/v2", "POST", resp_body=body)
-        A.addons[0].request(f)
-        if respond:
-            A.addons[0].response(f)
-        return f
-
-    def _respond(self, f, relay):
-        f.response = FakeResp(
-            json.dumps(
-                {
-                    "success": True,
-                    "responseObject": {
-                        "v2Swap": {"relaySwapId": relay, "destinationChainId": 4663}
-                    },
-                }
-            )
-        )
-        A.addons[0].response(f)
-
-    def _subscribe(self, rid):
-        A.addons[0].websocket_message(
-            ws_frame(
-                "ws.relay.link",
-                json.dumps(
-                    {
-                        "type": "subscribe",
-                        "event": "request.status.updated",
-                        "filters": {"id": rid},
-                    }
-                ),
-                from_client=True,
-            )
-        )
-
-    def _status(self, rid, status, txh=None):
-        d = {"status": status, "requestId": rid, "destinationChainId": 4663}
-        if txh:
-            d["txHashes"] = [txh]
-        A.addons[0].websocket_message(
-            ws_frame(
-                "ws.relay.link",
-                json.dumps({"event": "request.status.updated", "data": d}),
-            )
-        )
-
-    def test_interleaved_ab_cross_bound_subscribe_vetoed(self):
-        """报告反例（A/B 交错）：A preview→relayA；B preview 请求；A 的 subscribe 挂到
-        B；B 响应明确 relayB；success(A) 不得落 B、B 不得晋升/计 observed。"""
+    def test_cross_order_second_subscribe_vetoes_late_preview_does_not(self):
         run = "run-r9ab"
         A.STORE.mark_open(run, manifest=self._manifest(run))
-        self._preview(self.RELAY_A)  # A 请求+响应（relayA 确证 A 的锚）
-        time.sleep(0.02)  # 保证 B 更晚出站
-        fb = self._preview(respond=False)  # B 请求（响应稍后）
-        self._subscribe(self.RELAY_A)  # A 的 subscribe 迟到 → 挂到最新腿 B
-        self._respond(fb, self.RELAY_B)  # B 响应明确 relayB → 锚自相矛盾 → 否决
-        la, lb = A.STORE.legs[run]
-        self.assertTrue(
-            lb.get("_anchorVeto"), "B 锚自相矛盾 → 否决（旧码：只记 conflict 不动）"
-        )
-        self.assertEqual(
-            lb.get("incomplete"), "anchor-conflict", "否决即时落盘（首写）"
-        )
-        self.assertEqual(
-            (lb.get("_anchor") or {}).get("orderId"),
-            self.RELAY_A,
-            "锚首写冻结——冲突值不覆盖",
-        )
-        self.assertEqual(A.STORE.diag.get("anchorConflict"), 1)
-        self._status(self.RELAY_A, "success", "0x" + "12" * 32)  # A 的真实成功帧
-        self.assertEqual(la.get("anchorRole"), "order", "A 晋升（成功只匹配 A 的腿）")
-        self.assertIsNotNone(la.get("tSuccessPushMs"))
-        self.assertIsNone(
-            lb.get("tSuccessPushMs"), "冲突帧不得驱动 B 成功（旧码：落在 B）"
-        )
-        self.assertEqual(lb.get("anchorRole"), "preview", "被否决腿不晋升")
-        self.assertIsNone(lb.get("slot"))
-        self._status(
-            self.RELAY_B, "success", "0x" + "34" * 32
-        )  # B 的成功帧——B 锚冻结 relayA，正向不可达
-        self.assertIsNone(lb.get("tSuccessPushMs"))
+        fomo_preview(relay=self.RELAY_A)
+        fomo_execution()
+        fomo_subscribe(self.RELAY_A)
+        exec_a = A.STORE.legs[run][1]
+        exec_a["_fomoLastTransportMs"] -= A.FOMO_EXECUTION_FANOUT_MS + 1
+
+        fomo_preview(relay=self.RELAY_B)
+        fomo_execution()
+        exec_b = A.STORE.legs[run][3]
+        # A late candidate can make the cross-order subscribe shape-match; the first
+        # execution anchor still freezes. A later different preview is only stale.
+        fomo_preview(relay=self.RELAY_A)
+        fomo_subscribe(self.RELAY_A)
+        self.assertEqual((exec_b.get("_anchor") or {}).get("orderId"), self.RELAY_A)
+        late = fomo_preview(relay=self.RELAY_B, respond=False)
+        late.response = FakeResp(json.dumps({
+            "success": True,
+            "responseObject": {
+                "source": "relay",
+                "v2Swap": {"relaySwapId": self.RELAY_B, "relayTransaction": {"type": "SOLANA"}},
+            },
+        }))
+        A.addons[0].response(late)
+        self.assertFalse(exec_b.get("_anchorVeto", False), "late v3 preview 不否决执行锚")
+        fomo_subscribe(self.RELAY_B)
+        self.assertTrue(exec_b.get("_anchorVeto"), "第二个不同执行 subscribe = 锚冲突")
+        self.assertEqual((exec_b.get("_anchor") or {}).get("orderId"), self.RELAY_A)
+
+        fomo_status(self.RELAY_A, "success", "0x" + "12" * 32)
+        self.assertIsNotNone(exec_a.get("tSuccessPushMs"))
+        self.assertIsNone(exec_b.get("tSuccessPushMs"))
         A.STORE.mark_close(run)
         tl = A.STORE.timeline(run)
-        self.assertEqual(
-            tl["counts"],
-            {"requested": 2, "attempted": 1, "observed": 1, "unbound": 0},
-            "只有 A 计 attempted/observed——observed 不因冲突帧增加",
-        )
-        out_a, out_b = tl["legs"][0], tl["legs"][1]
-        self.assertLess(la["tOrderOutMs"], lb["tOrderOutMs"])
-        self.assertEqual(
-            out_a["hkL1aMs"],
-            round(la["tSuccessPushMs"] - la["tOrderOutMs"], 1),
-            "成功腿起点 = A 自己的请求（独立请求/响应证据；旧码按 B 的较晚请求）",
-        )
-        self.assertEqual(out_b["incomplete"], "anchor-conflict")
-        self.assertEqual(out_b["evidence"]["anchor"]["conflicts"], ["orderId"])
-        self.assertEqual(
-            tl["diag"].get("wsFrameNoLegMatch"),
-            1,
-            "relayB 成功帧无腿可归属——如实计数不静默",
-        )
-        self.assertEqual(
-            [p[3] for p in self.polls],
-            ["0x" + "12" * 32],
-            "只有 A 的 hash 起 receipt 轮询；被否决腿/未命中帧不起 poller",
-        )
+        self.assertEqual(tl["counts"], {"requested": 2, "attempted": 1, "observed": 1, "unbound": 1})
+        self.assertEqual([p[3] for p in self.polls], ["0x" + "12" * 32])
 
-    def test_subscribe_first_http_response_later(self):
-        """subscribe 先到、HTTP 后到：A/B 请求均未响应时 A 的 subscribe 挂到 B；
-        随后 A 响应 relayA、B 响应 relayB → B 否决；success(A) 落 A。"""
+    def test_subscribe_before_any_valid_candidate_stays_incomplete(self):
         run = "run-r9sf"
-        A.STORE.mark_open(run, manifest=self._manifest(run))
-        fa = self._preview(respond=False)
-        fb = self._preview(respond=False)
-        self._subscribe(self.RELAY_A)  # 两腿都无锚 → 挂最新腿 B
-        self._respond(fa, self.RELAY_A)
-        self._respond(fb, self.RELAY_B)  # B 响应揭示冲突 → 否决
-        la, lb = A.STORE.legs[run]
-        self.assertTrue(lb.get("_anchorVeto"))
-        self.assertFalse(la.get("_anchorVeto", False), "A 锚一致——不误伤")
-        self._status(self.RELAY_A, "success", "0x" + "12" * 32)
-        self.assertIsNotNone(la.get("tSuccessPushMs"))
-        self.assertIsNone(lb.get("tSuccessPushMs"))
-        tl = A.STORE.timeline(run)
-        self.assertEqual(
-            tl["counts"], {"requested": 2, "attempted": 1, "observed": 1, "unbound": 0}
-        )
+        A.STORE.mark_open(run, manifest=self._manifest(run, rounds=1))
+        pending = fomo_preview(relay=self.RELAY_A, respond=False)
+        fomo_execution()
+        fomo_subscribe(self.RELAY_A)
+        leg = A.STORE.legs[run][1]
+        self.assertEqual(leg.get("incomplete"), "relay-preview-missing")
+        pending.response = FakeResp(json.dumps({
+            "success": True,
+            "responseObject": {
+                "source": "relay",
+                "v2Swap": {"relaySwapId": self.RELAY_A, "relayTransaction": {"type": "SOLANA"}},
+            },
+        }))
+        A.addons[0].response(pending)
+        fomo_status(self.RELAY_A, "success", "0x" + "12" * 32)
+        self.assertIsNone(leg.get("tSuccessPushMs"), "迟到 candidate 不能补救已拒 subscribe")
+        self.assertEqual(self.polls, [])
 
-    def test_late_subscribe_after_response_no_veto(self):
-        """对照：B 响应先于 A 的迟到 subscribe——B 已有确证锚，subscribe 静默不动
-        （时序绑定不构成冲突证据）；两单各自成功，无否决无误伤。"""
+    def test_late_preview_after_freeze_no_veto(self):
         run = "run-r9ct"
-        A.STORE.mark_open(run, manifest=self._manifest(run))
-        self._preview(self.RELAY_A)  # A 请求+响应 relayA
-        self._preview(self.RELAY_B)  # B 请求+响应 relayB
-        self._subscribe(self.RELAY_A)  # A 的迟到 subscribe → B 已有锚 → 不动
-        lb = A.STORE.legs[run][1]
-        self.assertFalse(lb.get("_anchorVeto", False))
-        self.assertEqual((lb.get("_anchor") or {}).get("orderId"), self.RELAY_B)
-        self._status(self.RELAY_B, "success", "0x" + "34" * 32)
-        self._status(self.RELAY_A, "success", "0x" + "12" * 32)
-        tl = A.STORE.timeline(run)
-        self.assertEqual(
-            tl["counts"], {"requested": 2, "attempted": 2, "observed": 2, "unbound": 0}
-        )
-        self.assertEqual(tl["diag"], {}, "无冲突无否决无静默丢弃")
-        self.assertIsNotNone(tl["legs"][0]["hkL1aMs"])
-        self.assertIsNotNone(tl["legs"][1]["hkL1aMs"])
+        A.STORE.mark_open(run, manifest=self._manifest(run, rounds=1))
+        fomo_preview(relay=self.RELAY_A)
+        fomo_execution()
+        fomo_subscribe(self.RELAY_A)
+        leg = A.STORE.legs[run][1]
+        late = fomo_preview(relay=self.RELAY_B)
+        self.assertIsNotNone(late)
+        self.assertFalse(leg.get("_anchorVeto", False))
+        self.assertEqual((leg.get("_anchor") or {}).get("orderId"), self.RELAY_A)
+        fomo_status(self.RELAY_A, "success", "0x" + "12" * 32)
+        self.assertIsNotNone(leg.get("tSuccessPushMs"))
 
     def test_cancel_repeat_success_ordering(self):
-        """重复/取消/成功多序：cancel 帧不算成功；同 relayId 重复预览后 success 归
-        最晚**未被否决**的 preview（既定口径不变——否决只剔除自相矛盾的腿）。"""
         run = "run-r9cr"
-        rid = "0x" + "9a" * 32
+        rid = self.RELAY_A
         A.STORE.mark_open(run, manifest=self._manifest(run, rounds=1))
-        self._preview(rid)  # P1
-        self._status(rid, "canceled")  # 取消帧 —— 非成功
-        self.assertIsNone(A.STORE.legs[run][0].get("tSuccessPushMs"))
-        time.sleep(0.02)
-        self._preview(rid)  # P2 同 relayId 重复预览
-        self._status(rid, "success", "0x" + "12" * 32)
-        p1, p2 = A.STORE.legs[run]
-        self.assertIsNone(p1.get("tSuccessPushMs"))
-        self.assertEqual(
-            p2.get("anchorRole"), "order", "最晚一致 preview 晋升（口径不变）"
-        )
-        self.assertIsNotNone(p2.get("tSuccessPushMs"))
+        fomo_preview(relay=rid)
+        fomo_execution()
+        fomo_subscribe(rid)
+        fomo_status(rid, "canceled")
+        leg = A.STORE.legs[run][1]
+        self.assertIsNone(leg.get("tSuccessPushMs"))
+        fomo_status(rid, "success", "0x" + "12" * 32)
+        first = leg.get("tSuccessPushMs")
+        self.assertIsNotNone(first)
+        fomo_status(rid, "success", "0x" + "12" * 32)
+        self.assertEqual(leg.get("tSuccessPushMs"), first, "重复 success 不覆盖首观察")
         A.STORE.mark_close(run)
         tl = A.STORE.timeline(run)
-        self.assertEqual(
-            tl["counts"], {"requested": 1, "attempted": 1, "observed": 1, "unbound": 0}
-        )
+        self.assertEqual(tl["counts"], {"requested": 1, "attempted": 1, "observed": 1, "unbound": 0})
         self.assertEqual(tl["legs"][0]["incomplete"], "no-execution-proof")
-        self.assertEqual(tl["diag"], {})
 
     def test_vetoed_leg_only_match_counted_visible(self):
-        """单腿自毒化（subscribe 与自身响应身份交叉）：帧只命中被否决腿 → 不归属且
-        计 wsFrameAnchorVeto（区别于锚值互斥的 wsFrameAnchorConflict）——缺失可见。"""
         run = "run-r9vo"
         A.STORE.mark_open(run, manifest=self._manifest(run, rounds=1))
-        f = self._preview(respond=False)
-        self._subscribe(self.RELAY_A)  # 绑到唯一腿
-        self._respond(f, self.RELAY_B)  # 自身响应揭示 relayB → 冲突 → 否决
-        leg = A.STORE.legs[run][0]
+        fomo_preview(relay=self.RELAY_A)
+        fomo_execution()
+        fomo_subscribe(self.RELAY_A)
+        fomo_subscribe(self.RELAY_B)
+        leg = A.STORE.legs[run][1]
         self.assertTrue(leg.get("_anchorVeto"))
-        self._status(self.RELAY_A, "success", "0x" + "12" * 32)  # 只命中被否决腿
+        fomo_status(self.RELAY_A, "success", "0x" + "12" * 32)
         self.assertIsNone(leg.get("tSuccessPushMs"))
         self.assertEqual(A.STORE.diag.get("wsFrameAnchorVeto"), 1)
         A.STORE.mark_close(run)
         tl = A.STORE.timeline(run)
-        self.assertEqual(
-            tl["counts"], {"requested": 1, "attempted": 0, "observed": 0, "unbound": 0}
-        )
-        self.assertEqual(
-            tl["diag"].get("wsFrameAnchorVeto"), 1, "per-run diag 同步透出"
-        )
-        self.assertEqual(tl["legs"][0]["incomplete"], "anchor-conflict")
-        self.assertEqual(self.polls, [], "被否决腿不起 receipt 轮询")
+        self.assertEqual(tl["counts"], {"requested": 1, "attempted": 0, "observed": 0, "unbound": 1})
+        self.assertEqual(tl["diag"].get("wsFrameAnchorVeto"), 1)
+        self.assertEqual(tl["legs"][1]["incomplete"], "anchor-conflict")
+        self.assertEqual(self.polls, [])
 
 
 class TestR9OrderIdentityBoundaries(unittest.TestCase):
@@ -5315,9 +5095,8 @@ class TestR10LateVetoRevocation(unittest.TestCase):
     """RHF-09 残余（r10）：success/promotion/receipt 先于否决落定的 late-veto 路径——
     合格指标在 timeline 序列化层统一撤销（hkL1aMs/hkL3Ms → null，撤销值入
     hkL1aMsVetoed/hkL3MsVetoed 诊断键，腿带 anchorVeto:true），内部腿的原始事件
-    时间保留（证据不删）；observed 不增加。报告反例：请求→subscribe A→success A
-    →HTTP 响应明确 B——旧码（r9）veto 后仍导出 hkL1aMs≈1000ms，页面照计
-    （「获证据 0 笔；推送 1000ms；推送 1/1」矛盾）。"""
+    时间保留（证据不删）；observed 不增加。当前 FOMO 形状：execution→subscribe A→success A
+    →第二个不同执行 subscribe B；迟到 v3 preview B 本身不再是否决源。"""
 
     RELAY_A = "0x" + "a1" * 32
     RELAY_B = "0x" + "b2" * 32
@@ -5330,9 +5109,7 @@ class TestR10LateVetoRevocation(unittest.TestCase):
         self.addCleanup(setattr, A, "_poll_receipt", orig)
 
     def test_success_then_conflict_revokes_qualified_metrics(self):
-        """报告残余形状（单腿）：B preview 请求（无响应）→ A 的 subscribe 挂到 B
-        → success(relayA) 帧落 B（晋升 order、绑槽、hkL1a 已有值）→ B 的迟到 HTTP
-        响应明确 relayB → 锚自相矛盾 → 否决。timeline 不得再导出合格时长。"""
+        """success 后第二个不同执行 subscribe 否决；合格时长撤销、原始证据保留。"""
         run = "run-r10lv"
         A.STORE.mark_open(
             run,
@@ -5343,90 +5120,33 @@ class TestR10LateVetoRevocation(unittest.TestCase):
                 "legs": [{"platform": "fomo", "chain": "robinhood", "rounds": 2}],
             },
         )
-        fb = FakeFlow(
-            "prod-api.fomo.family",
-            "/swaps/v2",
-            "POST",
-            req_body=json.dumps({"chainId": 4663}),
-        )
-        A.addons[0].request(fb)  # B 请求（响应稍后）
-        A.addons[0].websocket_message(
-            ws_frame(
-                "ws.relay.link",
-                json.dumps(
-                    {
-                        "type": "subscribe",
-                        "event": "request.status.updated",
-                        "filters": {"id": self.RELAY_A},
-                    }
-                ),
-                from_client=True,
-            )
-        )
-        A.addons[0].websocket_message(
-            ws_frame(
-                "ws.relay.link",
-                json.dumps(
-                    {
-                        "event": "request.status.updated",
-                        "data": {
-                            "status": "success",
-                            "requestId": self.RELAY_A,
-                            "txHashes": ["0x" + "12" * 32],
-                            "destinationChainId": 4663,
-                        },
-                    }
-                ),
-            )
-        )
-        leg = A.STORE.legs[run][0]
-        self.assertIsNotNone(
-            leg.get("tSuccessPushMs"), "成功先于否决落定（内部原始时间保留——证据不删）"
-        )
-        self.assertEqual(
-            leg.get("anchorRole"), "order", "已被成功帧晋升（内部事实保留）"
-        )
+        fomo_preview(relay=self.RELAY_A)
+        fomo_execution()
+        fomo_subscribe(self.RELAY_A)
+        fomo_status(self.RELAY_A, "success", "0x" + "12" * 32)
+        leg = A.STORE.legs[run][1]
+        self.assertIsNotNone(leg.get("tSuccessPushMs"), "成功先于否决落定")
+        self.assertEqual(leg.get("anchorRole"), "order")
         recorded = round(leg["tSuccessPushMs"] - leg["tOrderOutMs"], 1)
-        fb.response = FakeResp(
-            json.dumps(
-                {
-                    "success": True,
-                    "responseObject": {
-                        "v2Swap": {
-                            "relaySwapId": self.RELAY_B,
-                            "destinationChainId": 4663,
-                        }
-                    },
-                }
-            )
-        )
-        A.addons[0].response(fb)  # 迟到响应明确 relayB → 冲突 → 否决
+        fomo_subscribe(self.RELAY_B)
         self.assertTrue(leg.get("_anchorVeto"))
         A.STORE.mark_close(run)
         tl = A.STORE.timeline(run)
-        out = tl["legs"][0]
-        self.assertEqual(
-            out["anchorVeto"], True, "腿带 anchorVeto:true——不再以 bound/eligible 呈现"
-        )
-        self.assertIsNone(
-            out["hkL1aMs"], "合格 L1a′ 撤销（r9 残余：仍导出 1000ms 入页面统计）"
-        )
+        out = tl["legs"][1]
+        self.assertEqual(out["anchorVeto"], True)
+        self.assertIsNone(out["hkL1aMs"], "合格 L1a′ 撤销")
         self.assertEqual(out["hkL1aMsVetoed"], recorded, "被撤销值保留在诊断键")
         self.assertIsNone(out["hkL3Ms"])
-        self.assertIsNone(out["hkL3MsVetoed"], "无 receipt 落地 → 无撤销值")
-        self.assertEqual(
-            out["incomplete"], "anchor-conflict", "否决原因保留（首写落盘）"
-        )
-        self.assertIsNotNone(
-            out["tSuccessPushMs"], "原始事件时间仍在私有 raw（诊断用，不删证据）"
-        )
+        self.assertIsNone(out["hkL3MsVetoed"])
+        self.assertEqual(out["incomplete"], "anchor-conflict")
+        self.assertIsNotNone(out["tSuccessPushMs"], "原始事件时间仍在私有 raw")
         self.assertIsNotNone(out["evidence"]["wsFrameSha"])
         self.assertEqual(
             tl["counts"],
             {"requested": 2, "attempted": 1, "observed": 0, "unbound": 0},
             "槽已消费仍占 attempted；observed 不增加",
         )
-        ph = tl["legs"][1]
+        ph = tl["legs"][2]
         self.assertEqual(
             (ph["anchorVeto"], ph["hkL1aMsVetoed"], ph["hkL3MsVetoed"]),
             (False, None, None),
@@ -7267,9 +6987,283 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.10.28-evm-head-age-gate-v10.17")
+        self.assertEqual(A.ADDON_VERSION, "2026.11.07-fomo-swaps-revalidate-v10.20")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
+
+
+class TestFomoV3CurrentPath(unittest.TestCase):
+    """FOMO v3 execution transports and strict Solana/Relay success evidence."""
+
+    def setUp(self):
+        fresh()
+
+    @staticmethod
+    def _manifest(run, chain="solana", rounds=1):
+        return {
+            "version": 1,
+            "runId": run,
+            "rounds": rounds,
+            "legs": [{"platform": "fomo", "chain": chain, "rounds": rounds}],
+        }
+
+    @staticmethod
+    def _old_row():
+        return fomo_swap_row({
+            "id": "old-swap-0000-0000-0000-000000000001",
+            "signature": "4" * 88,
+            "createdAt": "2020-01-01T00:00:00.000Z",
+        })
+
+    def test_v2_removed_and_v3_preview_is_not_an_order(self):
+        run = "run-fomo-v3-preview"
+        A.STORE.mark_open(run, manifest=self._manifest(run))
+        old = FakeFlow("prod-api.fomo.family", "/swaps/v2/fast-fill", "POST", resp_body="{}")
+        A.addons[0].request(old)
+        A.addons[0].response(old)
+        self.assertEqual(len(A.STORE.legs[run]), 0, "removed /swaps/v2* must not match")
+        fomo_preview(source="solana")
+        tl = A.STORE.timeline(run)
+        self.assertEqual(tl["counts"], {"requested": 1, "attempted": 0, "observed": 0, "unbound": 0})
+        self.assertEqual(tl["legs"][0]["anchorRole"], "preview")
+        self.assertEqual(tl["legs"][0]["orderRequestSource"], "fomo-preview-v3")
+        self.assertIsNone(tl["legs"][0]["hkL1aMs"])
+        self.assertEqual(tl["legs"][1]["incomplete"], "no-order-observed")
+
+    def test_all_bundle_proven_execution_transports(self):
+        cases = [
+            ("mainnet.hudson.jito.wtf", "/api/v1/sendTransactionWeb", "{}", "solana-jito-web"),
+            ("mainnet.block-engine.jito.wtf", "/api/v1/bundles", json.dumps({"method": "sendBundle", "params": ["synthetic-signed"]}), "solana-jito-bundle"),
+            ("sender.helius-rpc.com", "/fast?api-key=synthetic-not-retained", "{}", "solana-helius-submit"),
+            ("cashback.circular.fi", "/transactions", "{}", "solana-circular-submit"),
+            ("sender.lamport.dev", "/opaque-route-not-retained", "{}", "solana-lamport-submit"),
+            ("solana-provider-1.prod-edge.fomo.family", "/?token=synthetic-not-retained", json.dumps({"method": "sendTransaction", "params": ["synthetic-signed"]}), "solana-fomo-rpc-submit"),
+            ("solana-provider-2.prod-edge.fomo.family", "/", json.dumps({"method": "sendTransaction"}), "solana-fomo-rpc-submit"),
+            ("solana-provider-3.prod-edge.fomo.family", "/", json.dumps([{"method": "sendTransaction"}]), "solana-fomo-rpc-submit"),
+        ]
+        for host, path, body, kind in cases:
+            with self.subTest(kind=kind, host=host):
+                parsed = A._fomo_execution_request(host, path.split("?")[0], "POST", body)
+                self.assertEqual(parsed["kind"], kind)
+                self.assertNotIn("synthetic-signed", repr(parsed))
+                self.assertNotIn("synthetic-not-retained", repr(parsed))
+        self.assertIsNone(A._fomo_execution_request(
+            "mainnet.block-engine.jito.wtf", "/api/v1/bundles", "POST",
+            json.dumps({"method": "getSignatureStatuses", "params": ["synthetic-signed"]}),
+        ))
+        self.assertIsNone(A._fomo_execution_request(
+            "solana-provider-1.prod-edge.fomo.family", "/", "POST", "not-json"
+        ))
+
+    def test_solana_swap_record_success_exact_tx_receipt_and_no_secret_persistence(self):
+        run = "run-fomo-sol-success"
+        A.STORE.mark_open(run, manifest=self._manifest(run))
+        fomo_swaps([self._old_row()])  # execution 前同 user/mint 基线
+        fomo_preview(source="solana")
+        fomo_execution(body="synthetic-signed-body-not-retained")
+        orig = A._jsonrpc
+        A._jsonrpc = lambda url, m, p, timeout=10: {
+            "value": [{"confirmationStatus": "finalized", "err": None, "slot": 123}]
+        }
+        try:
+            fomo_swaps([self._old_row(), fomo_swap_row()])
+            time.sleep(0.25)
+        finally:
+            A._jsonrpc = orig
+        tl = A.STORE.timeline(run, full=True)
+        self.assertEqual(tl["counts"], {"requested": 1, "attempted": 1, "observed": 1, "unbound": 0})
+        preview, leg = tl["legs"]
+        self.assertEqual(preview["anchorRole"], "preview")
+        self.assertEqual(leg["chain"], "solana")
+        self.assertEqual(leg["txHash"], FOMO_TEST_SIG)
+        self.assertIsNotNone(leg["hkL1aMs"])
+        self.assertIsNotNone(leg["hkL3Ms"])
+        success = leg["evidence"]["success"]
+        self.assertEqual(success["channel"], "fomo-swaps-rest")
+        self.assertEqual(success["matchedKeys"], ["executionFlow"])
+        self.assertEqual(success["correlation"], "swaps-baseline-diff+outToken+createdAt+unique-execution")
+        self.assertEqual(leg["evidence"]["receipt"]["slot"], 123)
+        serialized = json.dumps(tl)
+        for forbidden in (
+            "synthetic-signed-body-not-retained", FOMO_TEST_UUID, FOMO_TEST_MINT,
+            "tokenAddress", "c3ludGhldGljLXR4", "c3ludGhldGljLXNpZw",
+        ):
+            self.assertNotIn(forbidden, serialized, "request/query/account/mint/body 不得持久化")
+
+    def test_conditional_stripping_only_exact_swaps_get(self):
+        def headers():
+            return {
+                "If-None-Match": "synthetic-etag-value",
+                "If-Modified-Since": "synthetic-modified-value",
+                "X-Synthetic": "synthetic-header-keep-value",
+            }
+        cases = [
+            ("other-path", "prod-api.fomo.family", f"/v2/users/{FOMO_TEST_UUID}/balances?tokenAddress={FOMO_TEST_MINT}", "GET"),
+            ("post", "prod-api.fomo.family", f"/v2/users/{FOMO_TEST_UUID}/swaps?tokenAddress={FOMO_TEST_MINT}", "POST"),
+            ("other-host", "example.com", f"/v2/users/{FOMO_TEST_UUID}/swaps?tokenAddress={FOMO_TEST_MINT}", "GET"),
+            ("missing-token", "prod-api.fomo.family", f"/v2/users/{FOMO_TEST_UUID}/swaps", "GET"),
+            ("multiple-tokens", "prod-api.fomo.family", f"/v2/users/{FOMO_TEST_UUID}/swaps?tokenAddress={FOMO_TEST_MINT}&tokenAddress={FOMO_TEST_MINT}", "GET"),
+            ("other-platform", "gmgn.ai", f"/v2/users/{FOMO_TEST_UUID}/swaps?tokenAddress={FOMO_TEST_MINT}", "GET"),
+        ]
+        for name, host, path, method in cases:
+            with self.subTest(name=name):
+                fresh()
+                A.STORE.mark_open("run-strip-" + name)
+                flow = FakeFlow(host, path, method, headers=headers())
+                A.addons[0].request(flow)
+                self.assertIn("If-None-Match", flow.request.headers)
+                self.assertIn("If-Modified-Since", flow.request.headers)
+                self.assertIn("X-Synthetic", flow.request.headers)
+                self.assertEqual(A.STORE.diag.get("fomoSwapsConditionalStripped", 0), 0)
+        fresh()
+        A.STORE.mark_open("run-strip-positive")
+        fomo_swaps([self._old_row()], headers=headers())
+        self.assertEqual(A.STORE.diag.get("fomoSwapsConditionalStripped"), 1)
+        self.assertEqual(A.STORE.diag.get("fomoSwapsResp200"), 1)
+        serialized = json.dumps({"timeline": A.STORE.timeline("run-strip-positive"), "diag": A.STORE.diag, "events": A.STORE.events})
+        for forbidden in ("synthetic-etag-value", "synthetic-modified-value", "synthetic-header-keep-value"):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_304_bodiless_and_error_responses_never_create_baseline(self):
+        for name, status, expected_counter in [("status304", 304, "fomoSwapsResp304"), ("empty200", 200, "fomoSwapsResp200"), ("error500", 500, "fomoSwapsRespOther")]:
+            with self.subTest(name=name), patch.object(A, "_poll_receipt", lambda *a, **k: None):
+                fresh()
+                run = "run-fomo-no-baseline-" + name
+                A.STORE.mark_open(run, manifest=self._manifest(run))
+                if name == "empty200":
+                    fomo_swaps([], status_code=status, raw_body="")
+                else:
+                    # Even a synthetic body cannot make a 304/500 authoritative.
+                    fomo_swaps([self._old_row()], status_code=status)
+                self.assertFalse(A.STORE.fomo_swaps, "无权威 body 不得建立快照")
+                self.assertEqual(A.STORE.diag.get(expected_counter), 1)
+                fomo_execution()
+                fomo_swaps([self._old_row(), fomo_swap_row()])
+                leg = A.STORE.legs[run][0]
+                self.assertEqual(leg.get("incomplete"), "swaps-baseline-missing")
+                self.assertIsNone(leg.get("tSuccessPushMs"))
+
+    def test_conditional_polls_execution_and_first_post_200_binds(self):
+        """Owner-verified ordering: full 200 baseline + 304s → execution → first new 200."""
+        def headers():
+            return {
+                "If-None-Match": "synthetic-etag-value",
+                "If-Modified-Since": "synthetic-modified-value",
+                "X-Synthetic": "synthetic-header-keep-value",
+            }
+        run = "run-fomo-revalidate-replay"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            A.STORE.mark_open(run, manifest=self._manifest(run))
+            old = self._old_row()
+            fomo_swaps([old], headers=headers())
+            fomo_swaps([old], headers=headers(), status_code=304)  # 不覆盖 200 基线
+            fomo_preview(source="solana")
+            fomo_preview(source="solana")
+            fomo_execution()
+            fomo_execution("sender.helius-rpc.com", "/fast")
+            fomo_swaps([old, fomo_swap_row()], headers=headers())
+            leg = A.STORE.legs[run][-1]
+            first_success = leg.get("tSuccessPushMs")
+            self.assertIsNotNone(first_success, "首个 post-execution 200 才产生成功")
+            fomo_swaps([old, fomo_swap_row()], headers=headers(), status_code=304)
+            self.assertEqual(leg.get("tSuccessPushMs"), first_success, "后续 304 不改写首观察")
+            tl = A.STORE.timeline(run, full=True)
+            self.assertEqual(tl["counts"], {"requested": 1, "attempted": 1, "observed": 1, "unbound": 0})
+            self.assertEqual(len(tl["legs"]), 3, "2 preview + bound execution；无 no-order 占位")
+            self.assertEqual(tl["legs"][-1]["chain"], "solana")
+            self.assertFalse(tl["legs"][-1]["unbound"])
+            self.assertEqual(tl["legs"][-1]["txHash"], FOMO_TEST_SIG)
+            self.assertEqual(A.STORE.diag.get("fomoSwapsConditionalStripped"), 4)
+            self.assertEqual(A.STORE.diag.get("fomoSwapsResp200"), 2)
+            self.assertEqual(A.STORE.diag.get("fomoSwapsResp304"), 2)
+            self.assertEqual(A.STORE.diag.get("fomoSwapsRespOther", 0), 0)
+            serialized = json.dumps({"timeline": tl, "diag": A.STORE.diag, "events": A.STORE.events})
+            for forbidden in ("synthetic-etag-value", "synthetic-modified-value", "synthetic-header-keep-value"):
+                self.assertNotIn(forbidden, serialized)
+
+    def test_solana_swap_record_rejections(self):
+        cases = []
+        old = self._old_row()
+        cases.append(("baseline-record", [old], True, "no-success-observed"))
+        cases.append(("wrong-mint", [old, fomo_swap_row({"outTokenAddress": "7" * 43})], True, "no-success-observed"))
+        cases.append(("before-click", [old, fomo_swap_row({"createdAt": "2020-01-01T00:00:00.000Z"})], True, "no-success-observed"))
+        second = fomo_swap_row({
+            "id": "new-swap-0000-0000-0000-000000000003",
+            "signature": "6" * 88,
+        })
+        cases.append(("ambiguous", [old, fomo_swap_row(), second], True, "ambiguous-swap-record"))
+        cases.append(("missing-baseline", [fomo_swap_row()], False, "swaps-baseline-missing"))
+        for name, rows, baseline, expected in cases:
+            with self.subTest(name=name), patch.object(A, "_poll_receipt", lambda *a, **k: None):
+                fresh()
+                run = "run-fomo-reject-" + name
+                A.STORE.mark_open(run, manifest=self._manifest(run))
+                if baseline:
+                    fomo_swaps([old])
+                fomo_execution()
+                fomo_swaps(rows)
+                leg = A.STORE.legs[run][0]
+                self.assertIsNone(leg.get("tSuccessPushMs"))
+                self.assertIsNone(leg.get("txHash"))
+                A.STORE.mark_close(run)
+                tl = A.STORE.timeline(run)
+                self.assertEqual(tl["legs"][0]["incomplete"], expected)
+                self.assertEqual(tl["counts"]["observed"], 0)
+                self.assertEqual(tl["counts"]["unbound"], 1)
+
+    def test_multiple_execution_candidates_make_swap_record_ambiguous(self):
+        run = "run-fomo-ambiguous-execution"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None), patch.object(A, "FOMO_EXECUTION_FANOUT_MS", 0):
+            A.STORE.mark_open(run, manifest=self._manifest(run, rounds=2))
+            old = self._old_row()
+            fomo_swaps([old])
+            fomo_execution()
+            fomo_execution("sender.helius-rpc.com", "/fast")
+            fomo_swaps([old, fomo_swap_row()])
+            legs = A.STORE.legs[run]
+            self.assertEqual(len(legs), 2)
+            self.assertTrue(all(leg.get("incomplete") == "ambiguous-execution-candidate" for leg in legs))
+            self.assertTrue(all(leg.get("tSuccessPushMs") is None for leg in legs))
+
+    def test_mobula_intent_never_becomes_relay_anchor(self):
+        run = "run-fomo-mobula"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            A.STORE.mark_open(run, manifest=self._manifest(run, chain="robinhood"))
+            fomo_preview(source="mobula")
+            fomo_execution()
+            rid = "0x" + "9a" * 32
+            fomo_subscribe(rid)
+            fomo_status(rid, "success", "0x" + "12" * 32)
+            leg = A.STORE.legs[run][1]
+            self.assertEqual(leg.get("incomplete"), "relay-preview-missing")
+            self.assertIsNone(leg.get("tSuccessPushMs"))
+            self.assertNotIn("orderId", leg.get("_anchor") or {})
+            A.STORE.mark_close(run)
+            tl = A.STORE.timeline(run, full=True)
+            self.assertEqual(tl["counts"]["observed"], 0)
+            self.assertNotIn("synthetic-intent-not-a-relay-id", json.dumps(tl))
+
+    def test_relay_success_requires_fresh_source_rh_chain_and_fill_hash(self):
+        run = "run-fomo-relay-gates"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            A.STORE.mark_open(run, manifest=self._manifest(run, chain="robinhood"))
+            rid = "0x" + "9a" * 32
+            fomo_preview(relay=rid)
+            fomo_execution()
+            fomo_subscribe(rid)
+            leg = A.STORE.legs[run][1]
+            fomo_status(rid, "success", "0x" + "12" * 32, published_at=0)
+            fomo_status(rid, "success", "0x" + "12" * 32, destination=792703809)
+            fomo_status(rid, "success", None)
+            A.addons[0].websocket_message(ws_frame("ws.relay.link", json.dumps({
+                "event": "request.status.updated",
+                "data": {"status": "success", "requestId": rid, "destinationChainId": 4663, "txHashes": ["0x" + "12" * 32]},
+            })))
+            self.assertIsNone(leg.get("tSuccessPushMs"))
+            self.assertIsNone(leg.get("txHash"))
+            fomo_status(rid, "success", "0x" + "12" * 32)
+            self.assertIsNotNone(leg.get("tSuccessPushMs"))
+            self.assertEqual(leg.get("chain"), "robinhood")
 
 
 class TestArcSupport(unittest.TestCase):
