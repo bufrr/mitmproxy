@@ -266,7 +266,13 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # 原始响应为 bodiless 304，Chrome 却把缓存 body 给页面，故 EU 有基线而 HK 没有。仅在精确的
 # 只读 swaps GET 删除 If-None-Match/If-Modified-Since，取得真实 200；304/空响应不建/不覆盖快照。
 # 其它请求、header、host/path/method、订单/执行流量和其它平台均不修改；响应状态只计数不记值。
-ADDON_VERSION = "2026.11.07-fomo-swaps-revalidate-v10.20"
+# v10.21（2026-11-07，owner 决定）：各平台 t+N 起点 = 首个把交易提交给产品的点击后请求。FOMO 的该请求是
+# 页内 Privy 签名开始的 `POST privy.fomo.family/api/v1/embedded_wallets/<id>/share`：只按 host/path/method
+# 分类，不读 body/header/id。执行腿建立时，上一执行观察之后、本 transport 之前恰一条 share 请求才成为
+# 序列化的 order 锚（tOrderOutMs/chainHead/atWall，orderRequestSource=fomo-privy-sign）；缺失或多条则
+# orderAnchorMissing 给原因，合格时长与链头置空，绝不回退 transport。transport 另出 tExecutionTransportMs。
+# 内部执行腿身份、fanout 折叠与 swaps/Relay 成功关联（仍以 transport 时刻为执行时刻）不变。
+ADDON_VERSION = "2026.11.07-fomo-sign-anchor-v10.21"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -1229,6 +1235,25 @@ _FOMO_SWAPS_PATH_RE = re.compile(
     r"^/v2/users/([0-9a-fA-F]{8}-[0-9a-fA-F-]{27,})/swaps$"
 )
 _FOMO_MINT_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+# Privy embedded-wallet share = in-page signing starts; the trade is committed to the product here.
+FOMO_SIGN_HOST = "privy.fomo.family"
+FOMO_SIGN_PATH_MASK = "/api/v1/embedded_wallets/<id>/share"
+FOMO_SIGNS_PER_RUN = 16
+_FOMO_SIGN_PATH_RE = re.compile(r"^/api/v1/embedded_wallets/[^/]{1,128}/share$")
+FOMO_SIGN_MISSING_REASONS = (
+    "fomo-sign-request-missing",
+    "fomo-sign-request-ambiguous",
+    "fomo-sign-request-overflow",
+)
+
+
+def _fomo_sign_request(host, path, method):
+    """Classify the FOMO Privy share request by host/path/method only; the id segment is masked."""
+    if str(method or "").upper() != "POST" or str(host or "").lower() != FOMO_SIGN_HOST:
+        return None
+    if not _FOMO_SIGN_PATH_RE.fullmatch(path or ""):
+        return None
+    return {"method": "POST", "path": FOMO_SIGN_PATH_MASK}
 
 
 def _fomo_execution_route(host, path, method):
@@ -2851,6 +2876,8 @@ class Store:
         # Values contain only schema-known IDs/metadata, never URLs, headers or bodies.
         self.fomo_previews = {}
         self.fomo_swaps = {}
+        # FOMO Privy share requests per run: hook time/wall/head snapshots only (no path id, body or header).
+        self.fomo_signs = {}
 
     def _freeze_run_locked(self, run_id):
         """关窗即冻结——腿标 windowClosed（后续帧不更新、receipt 回写丢弃），
@@ -2873,6 +2900,7 @@ class Store:
             if leg.get("runId") == run_id:
                 del self.open_legs[p]
         self.fomo_previews.pop(run_id, None)
+        self.fomo_signs.pop(run_id, None)
         for key in list(self.fomo_swaps):
             if key[0] == run_id:
                 self.fomo_swaps.pop(key, None)
@@ -2907,6 +2935,7 @@ class Store:
             self.overflow.pop(rid, None)
             self.run_diag.pop(rid, None)
             self.ws_buffer.pop(rid, None)  # 回收前窗口已 freeze（缓冲已弃），防御性清理
+            self.fomo_signs.pop(rid, None)
             for p, leg in list(self.open_legs.items()):
                 if leg.get("runId") == rid:
                     del self.open_legs[p]
@@ -3541,11 +3570,72 @@ class Store:
                         self._add_event_locked(rid, ev)
                         return rid, prior
                     break
+            sign = (
+                self._fomo_sign_for_execution_locked(rid, ev["t"])
+                if platform == "fomo" and ev.get("orderRequestSource") == "fomo-solana-execution"
+                else None
+            )
             self._add_event_locked(rid, ev)
             leg = self._new_leg_locked(rid, platform, chain, ev)
             if leg is None:
                 return None, None
+            if sign is not None:
+                if sign.get("missing"):
+                    leg["_fomoSignMissing"] = sign["missing"]
+                    self.diag["fomoSignAnchorMissing"] += 1
+                    self.run_diag[rid]["fomoSignAnchorMissing"] += 1
+                else:
+                    leg["_fomoSign"] = sign["request"]
             return rid, leg
+
+    def note_fomo_sign(self, window, ev):
+        """Record one Privy share request in the window captured at hook entry (bounded)."""
+        with self.lock:
+            rid, epoch = window
+            mark = self.marks.get(rid)
+            if (
+                not mark
+                or mark["closed"] is not None
+                or mark.get("epoch") != epoch
+                or ev["t"] < mark["opened"] * 1000
+            ):
+                return False
+            state = self.fomo_signs.setdefault(rid, {"items": [], "overflow": False})
+            self.diag["fomoSignRequests"] += 1
+            self.run_diag[rid]["fomoSignRequests"] += 1
+            if len(state["items"]) >= FOMO_SIGNS_PER_RUN:
+                state["overflow"] = True
+                self.diag["fomoSignOverflow"] += 1
+                self.run_diag[rid]["fomoSignOverflow"] += 1
+                return False
+            state["items"].append(ev)
+            return True
+
+    def _fomo_sign_for_execution_locked(self, rid, t_exec):
+        """Exactly one share request after the previous execution observation and not after this
+        transport is the commit anchor; none/several/overflow keep an explicit missing reason."""
+        state = self.fomo_signs.get(rid) or {"items": [], "overflow": False}
+        if state.get("overflow"):
+            return {"missing": "fomo-sign-request-overflow"}
+        floor = max(
+            (
+                prior.get("_fomoLastTransportMs")
+                for prior in self.legs.get(rid, [])
+                if prior.get("platform") == "fomo"
+                and prior.get("orderRequestSource") == "fomo-solana-execution"
+                and isinstance(prior.get("_fomoLastTransportMs"), (int, float))
+            ),
+            default=None,
+        )
+        hits = [
+            s for s in state["items"]
+            if s["t"] <= t_exec and (floor is None or s["t"] > floor)
+        ]
+        if not hits:
+            return {"missing": "fomo-sign-request-missing"}
+        if len(hits) > 1:
+            return {"missing": "fomo-sign-request-ambiguous"}
+        return {"request": hits[0]}
 
     def note_fomo_preview(self, leg, ids, observed_ms):
         """Latest valid v3 response is only an unfrozen candidate (even after execution)."""
@@ -4174,8 +4264,27 @@ class Store:
             chain_head = _head_with_receipt(x)
             if unresolved_send and chain_head:
                 chain_head = {**chain_head, "status": "broadcast-anchor-unconfirmed"}
+            # v10.21 FOMO：执行腿内部仍以首个 transport 为执行时刻（成功关联不变）；序列化的
+            # order 锚是唯一 Privy share 请求。缺失/歧义 → 合格时长与链头置空，绝不回退 transport。
+            source_out = x.get("orderRequestSource")
+            at_wall = x.get("at_wall")
+            transport_ms = None
+            anchor_missing = None
+            if x.get("platform") == "fomo" and source_out == "fomo-solana-execution":
+                transport_ms = t0
+                sign = x.get("_fomoSign")
+                if sign:
+                    t0 = sign["t"]
+                    source_out = "fomo-privy-sign"
+                    at_wall = sign.get("tw")
+                    chain_head = _head_with_receipt({**x, "_headSnapshots": sign.get("headSnapshots") or {}})
+                else:
+                    anchor_missing = x.get("_fomoSignMissing") or "fomo-sign-request-missing"
+                    chain_head = None
             l1a = _delta(x.get("tSuccessPushMs"), t0)
             l3 = _delta(x.get("tReceiptMs"), t0)
+            if anchor_missing:
+                l1a = l3 = None
             adiag = x.get("_anchorDiag") or {}
             anchor_ev = {
                 # 独立锚键名（值不出缺省模式；full=1 的 orderId/clientOrderId 另列）——
@@ -4212,10 +4321,14 @@ class Store:
                     "dup": bool(x.get("dup")),
                     "pendingBind": bool(x.get("pendingBind")),
                     "tOrderOutMs": t0,
-                    "orderRequestSource": x.get("orderRequestSource"),
+                    "orderRequestSource": source_out,
+                    # v10.21：FOMO 执行 transport（提交上链）是 order 锚之后的独立标记；
+                    # orderAnchorMissing = 无唯一 share 请求时的显式缺失原因
+                    "tExecutionTransportMs": transport_ms,
+                    "orderAnchorMissing": anchor_missing,
                     # v10：链域通道（nodeone/fullnode）首到成功通知——HK 钟、精确 tx 身份
                     # 匹配、与成功判定管线分离；ms 相对本腿 tOrderOutMs（与 hkL1aMs 同锚）
-                    "channelArrivals": [
+                    "channelArrivals": None if anchor_missing else [
                         {"channel": c, "api": v.get("api"), "ms": _delta(v.get("tMs"), t0)}
                         for c, v in sorted((x.get("_channelArrivals") or {}).items())
                         if _delta(v.get("tMs"), t0) is not None
@@ -4257,7 +4370,7 @@ class Store:
                         ),  # dup 腿 → formal 腿 orderFlowId
                     },
                     "incomplete": incomplete,
-                    "atWall": x.get("at_wall"),
+                    "atWall": at_wall,
                 }
             )
         # 授权轮次计数 + 缺失腿占位（incomplete=no-order-observed）。
@@ -4356,6 +4469,8 @@ def _placeholder_leg(platform, chain):
         "dup": False,
         "pendingBind": False,
         "tOrderOutMs": None,
+        "tExecutionTransportMs": None,
+        "orderAnchorMissing": None,
         "tFirstRespMs": None,
         "tSuccessPushMs": None,
         "tReceiptMs": None,
@@ -5102,6 +5217,16 @@ class SpeedexHkTiming:
             if stripped:
                 STORE.note_frame_diag("fomoSwapsConditionalStripped")
             flow.metadata["speedex_fomo_swaps"] = {"window": window, **swaps_scope}
+            return
+
+        if _fomo_sign_request(host, path, method):
+            # Request hook only: no body, header, query or id segment is read or retained.
+            STORE.note_fomo_sign(window, {
+                "t": t_obs,
+                "tw": t_wall,
+                "twms": t_wall_ms,
+                "headSnapshots": HEADS.snapshot(window[0], t_obs),
+            })
             return
 
         fomo_route = _fomo_execution_route(host, path, method)

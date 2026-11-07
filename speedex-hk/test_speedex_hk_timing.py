@@ -157,6 +157,17 @@ def fomo_preview(relay=None, source=None, respond=True):
     return f
 
 
+FOMO_TEST_PRIVY_WALLET = "synthetic-privy-wallet-id-0001"
+
+
+def fomo_sign(wallet=FOMO_TEST_PRIVY_WALLET, body="synthetic-share-body-not-retained", headers=None):
+    """Current in-page Privy signing start; id segment/body/header values are synthetic."""
+    f = FakeFlow("privy.fomo.family", f"/api/v1/embedded_wallets/{wallet}/share", "POST",
+                 req_body=body, resp_body="{}", headers=headers)
+    A.addons[0].request(f)
+    return f
+
+
 def fomo_execution(host="mainnet.hudson.jito.wtf", path="/api/v1/sendTransactionWeb", body="{}", response=True):
     f = FakeFlow(host, path, "POST", req_body=body, resp_body="{}")
     A.addons[0].request(f)
@@ -703,6 +714,7 @@ class TestHkTiming(unittest.TestCase):
         }
         try:
             fomo_preview(relay=rid)
+            fomo_sign()
             fomo_execution()
             fomo_subscribe(rid)
             fomo_status(rid, "pending")  # pending 且缺 fill hash——不算成功
@@ -718,7 +730,8 @@ class TestHkTiming(unittest.TestCase):
         self.assertEqual(legs[0]["anchorRole"], "preview", "preview 永不被 Relay 成功晋升")
         leg = legs[1]
         self.assertEqual(leg["anchorRole"], "order")
-        self.assertEqual(leg["orderRequestSource"], "fomo-solana-execution")
+        self.assertEqual(leg["orderRequestSource"], "fomo-privy-sign")
+        self.assertIsNotNone(leg["tExecutionTransportMs"])
         self.assertEqual(leg["chain"], "robinhood")
         self.assertIsNotNone(leg["hkL1aMs"])
         self.assertIsNotNone(leg["hkL3Ms"], "success 帧 txHashes[0] → EVM 轮询")
@@ -2568,6 +2581,7 @@ class TestR22PreviewRoleAndBudgets(unittest.TestCase):
             previews = [x for x in tl["legs"] if x["platform"] == "fomo"]
             self.assertTrue(previews and all(x.get("anchorRole") == "preview" for x in previews))
             self.assertEqual(len(tl["legs"]), 3, "2 preview + 1 manifest 占位")
+            fomo_sign()
             fomo_execution()
             fomo_execution("sender.helius-rpc.com", "/fast?api-key=synthetic-not-retained")
             self.assertEqual(len(A.STORE.legs["run-fp"]), 3, "Jito+Helius = 同一执行观察")
@@ -2581,7 +2595,7 @@ class TestR22PreviewRoleAndBudgets(unittest.TestCase):
         self.assertEqual(tl["counts"]["observed"], 1)
         exec_legs = [x for x in tl["legs"] if x.get("anchorRole") == "order"]
         self.assertEqual(len(exec_legs), 1)
-        self.assertEqual(exec_legs[0]["orderRequestSource"], "fomo-solana-execution")
+        self.assertEqual(exec_legs[0]["orderRequestSource"], "fomo-privy-sign")
         self.assertIsNotNone(exec_legs[0]["hkL1aMs"])
         self.assertEqual(len(tl["legs"]), 3, "2 preview + 1 execution；占位被消费")
 
@@ -5121,13 +5135,14 @@ class TestR10LateVetoRevocation(unittest.TestCase):
             },
         )
         fomo_preview(relay=self.RELAY_A)
+        fomo_sign()
         fomo_execution()
         fomo_subscribe(self.RELAY_A)
         fomo_status(self.RELAY_A, "success", "0x" + "12" * 32)
         leg = A.STORE.legs[run][1]
         self.assertIsNotNone(leg.get("tSuccessPushMs"), "成功先于否决落定")
         self.assertEqual(leg.get("anchorRole"), "order")
-        recorded = round(leg["tSuccessPushMs"] - leg["tOrderOutMs"], 1)
+        recorded = round(leg["tSuccessPushMs"] - leg["_fomoSign"]["t"], 1)
         fomo_subscribe(self.RELAY_B)
         self.assertTrue(leg.get("_anchorVeto"))
         A.STORE.mark_close(run)
@@ -6987,7 +7002,7 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.11.07-fomo-swaps-revalidate-v10.20")
+        self.assertEqual(A.ADDON_VERSION, "2026.11.07-fomo-sign-anchor-v10.21")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 
@@ -7060,6 +7075,7 @@ class TestFomoV3CurrentPath(unittest.TestCase):
         A.STORE.mark_open(run, manifest=self._manifest(run))
         fomo_swaps([self._old_row()])  # execution 前同 user/mint 基线
         fomo_preview(source="solana")
+        fomo_sign()
         fomo_execution(body="synthetic-signed-body-not-retained")
         orig = A._jsonrpc
         A._jsonrpc = lambda url, m, p, timeout=10: {
@@ -7087,6 +7103,7 @@ class TestFomoV3CurrentPath(unittest.TestCase):
         for forbidden in (
             "synthetic-signed-body-not-retained", FOMO_TEST_UUID, FOMO_TEST_MINT,
             "tokenAddress", "c3ludGhldGljLXR4", "c3ludGhldGljLXNpZw",
+            FOMO_TEST_PRIVY_WALLET, "synthetic-share-body-not-retained", "embedded_wallets",
         ):
             self.assertNotIn(forbidden, serialized, "request/query/account/mint/body 不得持久化")
 
@@ -7264,6 +7281,184 @@ class TestFomoV3CurrentPath(unittest.TestCase):
             fomo_status(rid, "success", "0x" + "12" * 32)
             self.assertIsNotNone(leg.get("tSuccessPushMs"))
             self.assertEqual(leg.get("chain"), "robinhood")
+
+
+class TestFomoPrivySignAnchor(unittest.TestCase):
+    """v10.21: FOMO t+N/L1a' start at the unique post-click Privy share request."""
+
+    def setUp(self):
+        fresh()
+
+    @staticmethod
+    def _manifest(run, chain="solana", rounds=1):
+        return {
+            "version": 1,
+            "runId": run,
+            "rounds": rounds,
+            "legs": [{"platform": "fomo", "chain": chain, "rounds": rounds}],
+        }
+
+    @staticmethod
+    def _old_row():
+        return fomo_swap_row({
+            "id": "old-swap-0000-0000-0000-000000000001",
+            "signature": "4" * 88,
+            "createdAt": "2020-01-01T00:00:00.000Z",
+        })
+
+    def _sol_success(self, run, before_execution):
+        A.STORE.mark_open(run, manifest=self._manifest(run))
+        fomo_swaps([self._old_row()])
+        fomo_preview(source="solana")
+        before_execution()
+        fomo_execution()
+        fomo_execution("cashback.circular.fi", "/transactions")
+        fomo_swaps([self._old_row(), fomo_swap_row()])
+        A.STORE.mark_close(run)
+        return A.STORE.legs[run][-1], A.STORE.timeline(run, full=True)
+
+    def test_classifier_is_exact_host_path_method(self):
+        ok = A._fomo_sign_request("privy.fomo.family", "/api/v1/embedded_wallets/abc/share", "POST")
+        self.assertEqual(ok, {"method": "POST", "path": "/api/v1/embedded_wallets/<id>/share"})
+        for host, path, method in [
+            ("privy.fomo.family", "/api/v1/embedded_wallets/abc/share", "GET"),
+            ("privy.fomo.family", "/api/v1/analytics_events", "POST"),
+            ("privy.fomo.family", "/api/v1/embedded_wallets/abc/share/extra", "POST"),
+            ("privy.fomo.family", "/api/v1/embedded_wallets//share", "POST"),
+            ("auth.privy.io", "/api/v1/embedded_wallets/abc/share", "POST"),
+            ("evilprivy.fomo.family", "/api/v1/embedded_wallets/abc/share", "POST"),
+        ]:
+            with self.subTest(host=host, path=path, method=method):
+                self.assertIsNone(A._fomo_sign_request(host, path, method))
+
+    def test_unique_share_is_order_anchor_and_transport_is_separate_mark(self):
+        run = "run-fomo-sign-anchor"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            leg_box = {}
+
+            def sign():
+                fomo_sign(headers={"Authorization": "synthetic-auth-header-value"})
+                leg_box["sign"] = A.STORE.fomo_signs[run]["items"][-1]
+
+            leg, tl = self._sol_success(run, sign)
+        sign_ev = leg_box["sign"]
+        self.assertEqual(leg["orderRequestSource"], "fomo-solana-execution", "内部执行腿身份不变")
+        self.assertIs(leg["_fomoSign"], sign_ev)
+        self.assertIsNotNone(leg["tSuccessPushMs"], "swaps 成功关联不变")
+        out = tl["legs"][-1]
+        self.assertEqual(tl["counts"], {"requested": 1, "attempted": 1, "observed": 1, "unbound": 0})
+        self.assertEqual(out["orderRequestSource"], "fomo-privy-sign")
+        self.assertEqual(out["tOrderOutMs"], sign_ev["t"])
+        self.assertEqual(out["tExecutionTransportMs"], leg["tOrderOutMs"], "首个 transport 冻结，fanout 不改写")
+        self.assertGreaterEqual(out["tExecutionTransportMs"], out["tOrderOutMs"])
+        self.assertEqual(out["atWall"], sign_ev["tw"])
+        self.assertIsNone(out["orderAnchorMissing"])
+        self.assertEqual(out["hkL1aMs"], round(leg["tSuccessPushMs"] - sign_ev["t"], 1))
+        serialized = json.dumps({"timeline": tl, "diag": A.STORE.diag, "events": A.STORE.events})
+        for forbidden in (FOMO_TEST_PRIVY_WALLET, "synthetic-share-body-not-retained",
+                          "synthetic-auth-header-value", "embedded_wallets"):
+            self.assertNotIn(forbidden, serialized, "share 请求只留时刻，不留 id/body/header/path")
+        self.assertEqual(A.STORE.diag.get("fomoSignRequests"), 1)
+
+    def test_share_head_snapshot_is_the_chain_head(self):
+        run = "run-fomo-sign-head"
+        calls = []
+
+        def snapshot(*_a, **_k):
+            calls.append(1)
+            return {"solana": {"version": 1, "chain": "solana", "height": 99 + len(calls), "status": "ok"}}
+
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None), \
+                patch.object(A.HEADS, "snapshot", snapshot):
+            leg, tl = self._sol_success(run, fomo_sign)
+        out = tl["legs"][-1]
+        sign_height = leg["_fomoSign"]["headSnapshots"]["solana"]["height"]
+        self.assertNotEqual(sign_height, leg["_headSnapshots"]["solana"]["height"])
+        self.assertEqual(out["chainHead"]["height"], sign_height, "链头取 share 请求入口，不取 transport")
+
+    def test_missing_share_withholds_anchor_but_keeps_success_correlation(self):
+        run = "run-fomo-sign-missing"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            leg, tl = self._sol_success(run, lambda: None)
+        self.assertIsNotNone(leg["tSuccessPushMs"], "成功关联不依赖 share 锚")
+        out = tl["legs"][-1]
+        self.assertEqual(tl["counts"]["observed"], 1)
+        self.assertEqual(out["orderRequestSource"], "fomo-solana-execution")
+        self.assertEqual(out["orderAnchorMissing"], "fomo-sign-request-missing")
+        self.assertIsNone(out["hkL1aMs"], "绝不回退 transport 锚")
+        self.assertIsNone(out["hkL3Ms"])
+        self.assertIsNone(out["chainHead"])
+        self.assertIsNone(out["channelArrivals"])
+        self.assertEqual(out["tExecutionTransportMs"], out["tOrderOutMs"])
+        self.assertEqual(A.STORE.diag.get("fomoSignAnchorMissing"), 1)
+
+    def test_several_shares_before_transport_are_ambiguous(self):
+        run = "run-fomo-sign-ambiguous"
+
+        def two():
+            fomo_sign()
+            fomo_sign()
+
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            _, tl = self._sol_success(run, two)
+        out = tl["legs"][-1]
+        self.assertEqual(out["orderAnchorMissing"], "fomo-sign-request-ambiguous")
+        self.assertIsNone(out["hkL1aMs"])
+        self.assertIsNone(out["chainHead"])
+
+    def test_share_after_transport_or_outside_window_never_anchors(self):
+        fomo_sign()  # no open window: dropped
+        self.assertFalse(A.STORE.fomo_signs)
+        run = "run-fomo-sign-late"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            A.STORE.mark_open(run, manifest=self._manifest(run))
+            fomo_execution()
+            fomo_sign()
+            A.STORE.mark_close(run)
+        out = next(x for x in A.STORE.timeline(run)["legs"] if x.get("tExecutionTransportMs") is not None)
+        self.assertEqual(out["orderAnchorMissing"], "fomo-sign-request-missing")
+        self.assertNotIn(run, A.STORE.fomo_signs, "关窗即弃 share 状态")
+
+    def test_each_round_takes_the_share_after_previous_execution(self):
+        run = "run-fomo-sign-rounds"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None), \
+                patch.object(A, "FOMO_EXECUTION_FANOUT_MS", 0):
+            A.STORE.mark_open(run, manifest=self._manifest(run, rounds=2))
+            fomo_sign()
+            fomo_execution()
+            fomo_sign()
+            fomo_execution()
+            A.STORE.mark_close(run)
+            signs = [leg["_fomoSign"]["t"] for leg in A.STORE.legs[run]]
+        out = [x for x in A.STORE.timeline(run)["legs"] if x.get("anchorRole") == "order"]
+        self.assertEqual([x["orderRequestSource"] for x in out], ["fomo-privy-sign", "fomo-privy-sign"])
+        self.assertEqual([x["tOrderOutMs"] for x in out], signs)
+        self.assertLess(signs[0], signs[1])
+
+    def test_share_budget_overflow_is_explicit(self):
+        run = "run-fomo-sign-overflow"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None), patch.object(A, "FOMO_SIGNS_PER_RUN", 1):
+            A.STORE.mark_open(run, manifest=self._manifest(run))
+            fomo_sign()
+            fomo_sign()
+            fomo_execution()
+            A.STORE.mark_close(run)
+        out = next(x for x in A.STORE.timeline(run)["legs"] if x.get("tExecutionTransportMs") is not None)
+        self.assertEqual(out["orderAnchorMissing"], "fomo-sign-request-overflow")
+        self.assertEqual(A.STORE.diag.get("fomoSignOverflow"), 1)
+
+    def test_share_body_is_never_read(self):
+        run = "run-fomo-sign-nobody"
+        A.STORE.mark_open(run, manifest=self._manifest(run))
+        flow = FakeFlow("privy.fomo.family", "/api/v1/embedded_wallets/x/share", "POST", req_body="secret")
+
+        def boom():
+            raise AssertionError("share body must not be read")
+
+        flow.request.get_text = boom
+        A.addons[0].request(flow)
+        self.assertEqual(len(A.STORE.fomo_signs[run]["items"]), 1)
+        self.assertEqual(flow.metadata, {})
 
 
 class TestArcSupport(unittest.TestCase):
