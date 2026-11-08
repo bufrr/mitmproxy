@@ -272,7 +272,10 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # 序列化的 order 锚（tOrderOutMs/chainHead/atWall，orderRequestSource=fomo-privy-sign）；缺失或多条则
 # orderAnchorMissing 给原因，合格时长与链头置空，绝不回退 transport。transport 另出 tExecutionTransportMs。
 # 内部执行腿身份、fanout 折叠与 swaps/Relay 成功关联（仍以 transport 时刻为执行时刻）不变。
-ADDON_VERSION = "2026.11.07-fomo-sign-anchor-v10.21"
+# v10.22（2026-11-08，owner 批准）：OKX Solana 可经 Temporal Nozomi `/api/sendTransaction2` 发送。
+# 只接受官方精确 host + text/plain 裸 base64；query 的 API key 与 headers 永不保存。Nozomi 非 OKX 专属，
+# 其 send 必须经同 signature 的 OKX /multi/broadcast 正向归并才绑槽；孤立 2xx/receipt 不得晋升。
+ADDON_VERSION = "2026.11.08-okx-nozomi-send-v10.22"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -969,10 +972,20 @@ OKX_RPC_HOSTS = {
     "okx.bscnetwork.blockrazor.io": "bsc",
     "rpc.mainnet.arc.io": "arc", "rpc.mainnet.chain.robinhood.com": "robinhood",
 }
-OKX_SOL_SEND_HOSTS = {
+BLOCKRAZOR_SOL_SEND_HOSTS = {
     f"{region}{suffix}.solana.blockrazor.io"
     for region in ("frankfurt", "hongkong", "newyork", "tokyo") for suffix in ("", "2")
 }
+# Temporal Nozomi official endpoints, verified 2026-11-08:
+# https://use.temporal.xyz/nozomi/endpoints
+NOZOMI_SOL_SEND_HOSTS = (
+    {"nozomi.temporal.xyz", "edge.nozomi.temporal.xyz"}
+    | {f"{region}.nozomi.temporal.xyz" for region in
+       ("pit1", "ewr1", "ash1", "lax1", "fra2", "ams1", "lon1", "tyo1", "sgp1")}
+    | {f"{region}.nozomi.temporal.xyz" for region in
+       ("pit", "ewr", "ash", "lax", "fra", "ams", "lon", "tyo", "sgp")}
+)
+OKX_SOL_SEND_HOSTS = BLOCKRAZOR_SOL_SEND_HOSTS | NOZOMI_SOL_SEND_HOSTS
 
 
 def _rlp_decode(b, i=0):
@@ -1103,10 +1116,16 @@ def _okx_rpc_request(host, path, method, headers, body):
     """
     if method != "POST" or len(body) > 262144 or headers.get("origin") != "https://web3.okx.com":
         return None
-    if host in OKX_SOL_SEND_HOSTS and path == "/v2/sendTransaction":
-        # Observed BlockRazor endpoint accepts a bare base64 transaction.
+    blockrazor_sol = host in BLOCKRAZOR_SOL_SEND_HOSTS and path == "/v2/sendTransaction"
+    nozomi_sol = host in NOZOMI_SOL_SEND_HOSTS and path == "/api/sendTransaction2"
+    if blockrazor_sol or nozomi_sol:
+        # Both documented endpoints accept a text/plain bare base64 signed transaction.
         if 80 <= len(body) <= 16400 and re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", body):
             out = {"chain": "solana", "source": "okx-solana-send", "id": None}
+            if nozomi_sol:
+                # Shared transport: only same-signature OKX /multi/broadcast dedup may bind it.
+                out["platformOrderRequired"] = True
+                out["responseKind"] = "http-2xx"
             sig = _sol_wire_first_sig(body)
             if sig:
                 out["reqTxHash"] = sig
@@ -1136,7 +1155,13 @@ def _okx_rpc_response(meta, response):
     非 200/超尺寸/非 JSON-RPC 信封/响应 id 与请求不配 = 传输或流完整性失败，
     该响应不是本平台受理证据；id 匹配的 JSON-RPC error（already known /
     nonce too low 等）= 端点已处理本请求，tx 身份请求侧数学推导已在锚，不标 _reject。
+    Nozomi v2 例外：文档定义任意 2xx 为 transport ack、无 signature body；共享 transport 仍不得自行晋升。
     """
+    if meta.get("responseKind") == "http-2xx":
+        # Nozomi v2: any 2xx is a transport ack and there is no signature body.
+        if not 200 <= response.status_code < 300:
+            return {"_reject": f"http-{response.status_code}"}
+        return {}
     if response.status_code != 200:
         return {"_reject": f"http-{response.status_code}"}
     body = response.get_text() or ""
@@ -3330,6 +3355,67 @@ class Store:
                 return
             self._dedup_order_identity_locked(leg, allow_transfer=True)
 
+    def bind_shared_sol_send(self, leg):
+        """Bind an OKX platform order to the earliest exact shared-transport send.
+
+        Nozomi cannot consume a slot from its own ack/receipt. Once OKX
+        /multi/broadcast supplies the same signature, its chain-proof may complete
+        a pending Solana slot, then transfer the formal slot to the earliest send.
+        """
+        with self.lock:
+            if (
+                leg.get("platform") != "okx"
+                or leg.get("orderRequestSource") != "platform-order"
+                or leg.get("dup")
+                or leg.get("unbound")
+                or leg.get("windowClosed")
+                or leg.get("_anchorVeto")
+                or (leg.get("slot") is None and not leg.get("pendingBind"))
+            ):
+                return False
+            anchor = leg.get("_anchor") or {}
+            tx = anchor.get("txHash")
+            if not tx:
+                return False
+            candidates = []
+            for other in self.legs.get(leg.get("runId"), []):
+                if (
+                    not other.get("_platformOrderRequired")
+                    or other.get("anchorRole") != "send"
+                    or other.get("dup")
+                    or other.get("windowClosed")
+                    or other.get("_anchorVeto")
+                    or (leg.get("chain") and other.get("chain") != leg.get("chain"))
+                    or _ident_norm("txHash", (other.get("_anchor") or {}).get("txHash"))
+                    != _ident_norm("txHash", tx)
+                ):
+                    continue
+                verdict, _ = _anchor_verdict(other.get("_anchor") or {}, anchor)
+                if verdict == "positive":
+                    candidates.append(other)
+            candidates = [x for x in candidates if x.get("tOrderOutMs") <= leg.get("tOrderOutMs")]
+            if not candidates:
+                return False
+            target = min(candidates, key=lambda x: x["tOrderOutMs"])
+            if leg.get("slot") is None:
+                # Solana /broadcast has no numeric chain ID. The exact matched
+                # Nozomi request already proves Solana, so this is not a chain guess.
+                chain = target.get("chain")
+                if not chain:
+                    return False
+                slot = self._bind_slot_locked(leg.get("runId"), "okx", chain)
+                if slot is None:
+                    return False
+                leg["chain"] = chain
+                leg["pendingBind"] = False
+                leg["slot"] = slot
+            target["anchorRole"] = "order"
+            self._transfer_formal_locked(target, leg)
+            for other in candidates:
+                if other is not target:
+                    self._dedup_order_identity_locked(other, allow_transfer=True)
+            return True
+
     def confirm_broadcast_identity(self, leg):
         """A raw RPC response proves identity/acceptance, never platform success.
         Identity-pending requests do not consume slots. On confirmation, deduplicate
@@ -3337,6 +3423,10 @@ class Store:
         """
         with self.lock:
             if leg.get("windowClosed") or leg.get("_anchorVeto") or not (leg.get("_anchor") or {}).get("txHash"):
+                return
+            # Shared Nozomi transport cannot self-prove OKX platform ownership.
+            # Only same-signature /multi/broadcast dedup may transfer a formal slot.
+            if leg.get("_platformOrderRequired") and leg.get("anchorRole") == "send":
                 return
             leg["anchorRole"] = "order"
             if not self._dedup_order_identity_locked(leg, allow_transfer=True):
@@ -5293,6 +5383,8 @@ class SpeedexHkTiming:
         if leg is None:
             return
         flow.metadata["speedex_leg"] = (leg, rid)  # 直接持引用
+        if raw and raw.get("platformOrderRequired"):
+            leg["_platformOrderRequired"] = True
         if fomo_execution:
             flow.metadata["speedex_fomo_execution"] = fomo_execution
         if raw and raw.get("reqTxHash"):
@@ -5316,6 +5408,7 @@ class SpeedexHkTiming:
         if request_ids:
             STORE.update_anchor(leg, request_ids)
             STORE.dedup_order_identity(leg)
+            STORE.bind_shared_sol_send(leg)
             self._drain_ws_buffer(rid, platform)
         # Binance：请求体 clientOrderId 写入请求侧独立锚（成功判定只认锚；
         # 建腿前的去重抽取见上方 ev 构造）
@@ -5454,6 +5547,7 @@ class SpeedexHkTiming:
         if flow.metadata.get("speedex_rpc") and not ids.get("_reject"):
             STORE.confirm_broadcast_identity(leg)
         STORE.dedup_order_identity(leg)
+        STORE.bind_shared_sol_send(leg)
         # 闩锁启动 poller——每腿至多一个，轮询腿锁定 hash
         h = STORE.claim_receipt_poll(leg)
         if h:

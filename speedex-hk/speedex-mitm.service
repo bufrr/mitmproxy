@@ -26,7 +26,7 @@ ExecStart=/opt/speedex-mitm/venv/bin/mitmdump \
   --set body_size_limit=2m \
   --set keep_host_header=false \
   --set block_global=false \
-  --set "allow_hosts=(?:^(.*\\.)?(gmgn\\.ai|ws\\.gmgn\\.ai|web3\\.okx\\.com|wsdexpri\\.okx\\.com|www\\.okx\\.(?:com|ac)|turnkey\\.com|padre\\.gg|binance\\.com|fomo\\.family|relay\\.link)(:\\d+)?$)|(?:^(?:okx\\.(?:bsc-rpc\\.com|(?:rpc|builder)\\.48\\.club|bsc\\.blockrazor\\.xyz|bscnetwork\\.blockrazor\\.io)|(?:frankfurt|hongkong|newyork|tokyo)2?\\.solana\\.blockrazor\\.io|rpc\\.mainnet\\.(?:arc\\.io|chain\\.robinhood\\.com))(:\\d+)?$)|(?:^(?:mainnet\\.(?:hudson|block-engine)\\.jito\\.wtf|sender\\.helius-rpc\\.com|cashback\\.circular\\.fi|sender\\.lamport\\.dev)(:\\d+)?$)" \
+  --set "allow_hosts=(?:^(.*\\.)?(gmgn\\.ai|ws\\.gmgn\\.ai|web3\\.okx\\.com|wsdexpri\\.okx\\.com|www\\.okx\\.(?:com|ac)|turnkey\\.com|padre\\.gg|binance\\.com|fomo\\.family|relay\\.link)(:\\d+)?$)|(?:^(?:okx\\.(?:bsc-rpc\\.com|(?:rpc|builder)\\.48\\.club|bsc\\.blockrazor\\.xyz|bscnetwork\\.blockrazor\\.io)|(?:frankfurt|hongkong|newyork|tokyo)2?\\.solana\\.blockrazor\\.io|rpc\\.mainnet\\.(?:arc\\.io|chain\\.robinhood\\.com))(:\\d+)?$)|(?:^(?:mainnet\\.(?:hudson|block-engine)\\.jito\\.wtf|sender\\.helius-rpc\\.com|cashback\\.circular\\.fi|sender\\.lamport\\.dev|(?:nozomi\\.temporal\\.xyz|(?:edge|pit1|ewr1|ash1|lax1|fra2|ams1|lon1|tyo1|sgp1|pit|ewr|ash|lax|fra|ams|lon|tyo|sgp)\\.nozomi\\.temporal\\.xyz))(:\\d+)?$)" \
   -s /opt/speedex-mitm/speedex_hk_timing.py \
   --quiet
 Restart=always

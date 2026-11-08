@@ -7002,7 +7002,7 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.11.07-fomo-sign-anchor-v10.21")
+        self.assertEqual(A.ADDON_VERSION, "2026.11.08-okx-nozomi-send-v10.22")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 
@@ -7938,6 +7938,168 @@ class TestIdentifiedSendNoPoison(unittest.TestCase):
         row = next(x for x in tl["legs"] if x.get("txHash") == tx2 and not x.get("dup"))
         self.assertEqual(row["incomplete"], "broadcast-anchor-unconfirmed")
         self.assertIsNone(row["hkL1aMs"])
+
+
+class TestNozomiSolSend(unittest.TestCase):
+    def setUp(self):
+        fresh()
+        self.clock = time.monotonic() * 1000 + 10
+        from unittest.mock import patch
+        for target, replacement in [("_mono_ms", lambda: self.clock), ("_poll_receipt", lambda *_: None)]:
+            p = patch.object(A, target, replacement); p.start(); self.addCleanup(p.stop)
+        p = patch.object(A.HEADS, "snapshot", lambda rid, t: {c: {
+            "version": 1, "chain": c, "epoch": rid, "height": 40, "anchorTs": t,
+            "observedTs": t - 1, "sampleAgeMs": 1} for c in A.CHAINS})
+        p.start(); self.addCleanup(p.stop)
+        self.run = "okx-nozomi-window"
+        A.STORE.mark_open(self.run, manifest={"version": 1, "runId": self.run, "legs": [
+            {"platform": "okx", "chain": "solana", "rounds": 1}]})
+        self.clock += 100
+        self.send_at = self.clock
+
+    @staticmethod
+    def _wire_body(seed=0x41):
+        import base64
+        return base64.b64encode(bytes([1]) + bytes([seed]) * 64 + bytes([seed]) * 32).decode()
+
+    def _send(self, host="tyo1.nozomi.temporal.xyz", respond=True, status=204):
+        body = self._wire_body()
+        tx = A._sol_wire_first_sig(body)
+        f = FakeFlow(host, "/api/sendTransaction2?c=synthetic-query-key",
+            req_body=body, resp_body="")
+        f.request.headers = {"origin": "https://web3.okx.com", "x-synthetic": "synthetic-header-value"}
+        f.response.status_code = status
+        A.addons[0].request(f)
+        if respond:
+            A.addons[0].response(f)
+        return f, tx, body
+
+    def _platform_order(self, tx, oid="nozomi-order-1"):
+        f = FakeFlow("web3.okx.com", "/priapi/v6/dx/trade/multi/broadcast",
+            req_body=json.dumps({"chainId": 501, "signedInfoList": [{"txHash": tx}], "orderId": oid}),
+            resp_body=json.dumps({"code": "0", "data": {"transactionHash": tx, "orderId": oid}}))
+        f.request.headers = {"origin": "https://web3.okx.com"}
+        f.response.status_code = 200
+        A.addons[0].request(f); A.addons[0].response(f)
+        return f
+
+    def _success(self, tx, oid="nozomi-order-1"):
+        A.addons[0].websocket_message(ws_frame("wsdexpri.okx.com", json.dumps(
+            {"arg": {"channel": "dex-across-order-info"},
+             "data": {"dexData": {"status": "1", "orderId": oid, "transactionHash": tx}}})))
+
+    def test_exact_hosts_bare_body_and_lookalikes(self):
+        body = self._wire_body()
+        tx = A._sol_wire_first_sig(body)
+        self.assertEqual(len(A.NOZOMI_SOL_SEND_HOSTS), 20)
+        for host in sorted(A.NOZOMI_SOL_SEND_HOSTS):
+            meta = A._okx_rpc_request(host, "/api/sendTransaction2", "POST",
+                {"origin": "https://web3.okx.com"}, body)
+            self.assertIsNotNone(meta, host)
+            self.assertEqual(meta["source"], "okx-solana-send")
+            self.assertEqual(meta["chain"], "solana")
+            self.assertEqual(meta["reqTxHash"], tx)
+            self.assertTrue(meta["platformOrderRequired"])
+            self.assertEqual(meta["responseKind"], "http-2xx")
+        for host in ["tyo1.nozomi.temporal.xyz.evil.invalid", "evil.nozomi.temporal.xyz",
+                     "pit3.nozomi.temporal.xyz", "ewr2.nozomi.temporal.xyz", "evil.invalid"]:
+            self.assertIsNone(A._okx_rpc_request(host, "/api/sendTransaction2", "POST",
+                {"origin": "https://web3.okx.com"}, body), host)
+        for path, method, origin, candidate in [
+            ("/api/sendTransaction2/extra", "POST", "https://web3.okx.com", body),
+            ("/api/sendTransaction2", "GET", "https://web3.okx.com", body),
+            ("/api/sendTransaction2", "POST", "https://evil.invalid", body),
+            ("/api/sendTransaction2", "POST", "https://web3.okx.com", json.dumps({"transaction": body})),
+        ]:
+            self.assertIsNone(A._okx_rpc_request("tyo1.nozomi.temporal.xyz", path, method,
+                {"origin": origin}, candidate))
+        block = A._okx_rpc_request("hongkong.solana.blockrazor.io", "/v2/sendTransaction", "POST",
+            {"origin": "https://web3.okx.com"}, body)
+        self.assertEqual(block["reqTxHash"], tx)
+        self.assertNotIn("platformOrderRequired", block, "BlockRazor promotion behavior is unchanged")
+        self.assertNotIn("responseKind", block)
+
+    def test_x8t6j_replay_anchors_okx_push_at_nozomi_send(self):
+        click = self.send_at - 206
+        f, tx, _ = self._send()
+        leg = f.metadata["speedex_leg"][0]
+        self.assertEqual(leg["anchorRole"], "send", "2xx alone cannot bind shared transport")
+        self.assertIsNone(leg["slot"])
+        self.clock = click + 3001
+        self._success(tx)
+        self.assertEqual(leg["tSuccessPushMs"], self.clock, "early success binds by exact signature")
+        self.clock = click + 3396
+        self._platform_order(tx)
+        self.assertEqual(leg["anchorRole"], "order", "same-signature /multi/broadcast positively merges")
+        self.assertIsNotNone(leg["slot"])
+        self.assertEqual(leg["tOrderOutMs"], self.send_at, "earliest exact send keeps the anchor")
+        self.clock = click + 4000
+        A._settle_receipt(leg, {"rpc": "stub", "chain": "solana", "pollIntervalMs": 800,
+            "status": 1, "slot": 777})
+        A.STORE.mark_close(self.run)
+        tl = A.STORE.timeline(self.run, full=True)
+        rows = [x for x in tl["legs"] if x.get("anchorRole") == "order" and not x.get("dup")]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["orderRequestSource"], "okx-solana-send")
+        self.assertEqual(row["tOrderOutMs"], self.send_at)
+        self.assertEqual(row["hkL1aMs"], 2795, "success +3001 minus Nozomi send +206")
+        self.assertEqual(row["hkL3Ms"], 3794, "receipt +4000 minus Nozomi send +206")
+        self.assertIsNone(row["incomplete"])
+        self.assertEqual(tl["counts"], {"requested": 1, "attempted": 1, "observed": 1, "unbound": 0})
+
+    def test_different_signature_platform_order_does_not_merge(self):
+        f, tx, _ = self._send()
+        leg = f.metadata["speedex_leg"][0]
+        other_tx = A._sol_wire_first_sig(self._wire_body(0x52))
+        self.assertNotEqual(tx, other_tx)
+        self.clock += 1000
+        self._platform_order(other_tx, "different-okx-order")
+        self.assertEqual(leg["anchorRole"], "send")
+        self.assertIsNone(leg["slot"])
+        self.assertFalse(leg["dup"], "different exact signatures never share an OKX slot")
+        A.STORE.mark_close(self.run)
+        tl = A.STORE.timeline(self.run, full=True)
+        row = next(x for x in tl["legs"] if x.get("txHash") == tx)
+        self.assertEqual(row["anchorRole"], "send")
+        self.assertEqual(row["incomplete"], "broadcast-identity-unconfirmed")
+        self.assertIsNone(row.get("authorizedRound"))
+
+    def test_orphan_ack_and_receipt_cannot_consume_okx_slot(self):
+        f, tx, _ = self._send()
+        leg = f.metadata["speedex_leg"][0]
+        self.assertEqual(leg["anchorRole"], "send")
+        self.assertIsNone(leg["slot"])
+        self.clock += 500
+        A._settle_receipt(leg, {"rpc": "stub", "chain": "solana", "pollIntervalMs": 800,
+            "status": 1, "slot": 777})
+        self.assertEqual(leg["tReceiptMs"], self.clock, "receipt evidence is retained")
+        self.assertEqual(leg["anchorRole"], "send", "receipt alone cannot prove OKX ownership")
+        self.assertIsNone(leg["slot"])
+        A.STORE.mark_close(self.run)
+        tl = A.STORE.timeline(self.run, full=True)
+        self.assertEqual(tl["counts"], {"requested": 1, "attempted": 0, "observed": 0, "unbound": 0})
+        row = next(x for x in tl["legs"] if x.get("txHash") == tx)
+        self.assertEqual(row["anchorRole"], "send")
+        self.assertEqual(row["incomplete"], "broadcast-identity-unconfirmed")
+        self.assertIsNone(row.get("authorizedRound"))
+
+    def test_query_headers_and_signed_body_never_reach_surfaces_or_logs(self):
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            f, _, body = self._send()
+            A.STORE.mark_close(self.run)
+            tl = A.STORE.timeline(self.run, full=True)
+        surfaces = json.dumps([A.STORE.events, tl, A.STORE.diag, f.metadata, out.getvalue(), err.getvalue()])
+        self.assertNotIn("synthetic-query-key", surfaces)
+        self.assertNotIn("synthetic-header-value", surfaces)
+        self.assertNotIn("c=", surfaces)
+        self.assertNotIn(body, surfaces)
+        req = next(e for e in A.STORE.events[self.run] if e.get("kind") == "order_req")
+        self.assertEqual(req["host"], "tyo1.nozomi.temporal.xyz")
+        self.assertEqual(req["path"], "/api/sendTransaction2")
 
 
 class TestMergedSendNoPoison(unittest.TestCase):

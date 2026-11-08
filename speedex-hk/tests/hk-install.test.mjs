@@ -184,6 +184,31 @@ test('RHF-19：install.sh 实验目录隔离按规范化真实路径——尾斜
   assert.ok(rLink.stderr.includes('拒绝：实验实例不得使用生产 APP'), `symlink stderr 缺拒绝文案: ${rLink.stderr.slice(0, 120)}`);
 });
 
+
+test('OKX Nozomi v10.22：生产/实验/overlay 只放行 20 个精确主机', () => {
+  const group = '(?:edge|pit1|ewr1|ash1|lax1|fra2|ams1|lon1|tyo1|sgp1|pit|ewr|ash|lax|fra|ams|lon|tyo|sgp)';
+  const unitPattern = String.raw`(?:nozomi\\.temporal\\.xyz|` + group + String.raw`\\.nozomi\\.temporal\\.xyz)`;
+  const hosts = [
+    'nozomi.temporal.xyz', 'edge.nozomi.temporal.xyz',
+    ...['pit1', 'ewr1', 'ash1', 'lax1', 'fra2', 'ams1', 'lon1', 'tyo1', 'sgp1'].map((r) => `${r}.nozomi.temporal.xyz`),
+    ...['pit', 'ewr', 'ash', 'lax', 'fra', 'ams', 'lon', 'tyo', 'sgp'].map((r) => `${r}.nozomi.temporal.xyz`),
+  ];
+  assert.equal(hosts.length, 20);
+  for (const rel of ['deploy/hk-proxy/speedex-mitm.service', 'deploy/hk-proxy/speedex-mitm-exp.service']) {
+    const unit = readSource(rel);
+    assert.ok(unit.includes(unitPattern), `${rel} 缺精确 Nozomi host 组`);
+    const raw = unit.match(/--set "allow_hosts=([^"]+)"/)?.[1];
+    assert.ok(raw, `${rel} 缺 allow_hosts 行`);
+    const allow = new RegExp(raw.replace(/\\\\/g, '\\'));
+    for (const host of hosts) assert.ok(allow.test(`${host}:443`), `${rel} 未命中 ${host}:443`);
+    for (const host of ['tyo1.nozomi.temporal.xyz.evil.example', 'evil.nozomi.temporal.xyz', 'pit3.nozomi.temporal.xyz', 'ewr2.nozomi.temporal.xyz']) {
+      assert.ok(!allow.test(`${host}:443`), `${rel} 不得命中 ${host}:443`);
+    }
+  }
+  const overlay = readSource('deploy/hk-proxy/selective-decrypt.overlay.example');
+  assert.ok(overlay.includes(String.raw`^(?:nozomi\.temporal\.xyz|` + group + String.raw`\.nozomi\.temporal\.xyz)(:\d+)?$`), 'overlay 缺带边界/端口的 Nozomi regex');
+});
+
 test('FOMO v3：生产/实验 allow_hosts 覆盖全部 bundle-proven 第三方执行 transport', () => {
   const required = [
     String.raw`mainnet\\.(?:hudson|block-engine)\\.jito\\.wtf`,

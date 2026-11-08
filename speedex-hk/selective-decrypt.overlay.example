@@ -108,3 +108,10 @@
 # addon 只读 host/path/method、JSON-RPC send method 与受控 ACK，绝不保存 body/header/
 # query/签名。上线前须在默认关闭的实验实例重建连接，逐项验收证书、报价、提交兼容、
 # 平台成功记录与单核 CPU/RSS；不得因 health 200 或一次连通就推定无损。
+
+# 2026-11-08 OKX Solana Temporal Nozomi v2（v10.22；生产与实验 unit 均列精确主机）。
+# 仅 `POST /api/sendTransaction2` + text/plain 裸 base64；query 的 API key 与 headers 永不保存。
+# Nozomi 为共享 transport，send 须与同 signature 的 OKX /multi/broadcast 正向归并才绑槽。
+# [raw] 追加部分（与原 regex 作 OR，保留端口和边界锚）：
+# ^(?:nozomi\.temporal\.xyz|(?:edge|pit1|ewr1|ash1|lax1|fra2|ams1|lon1|tyo1|sgp1|pit|ewr|ash|lax|fra|ams|lon|tyo|sgp)\.nozomi\.temporal\.xyz)(:\d+)?$
+# 不得改成后缀通配；扩围前仍须实验验收证书/ALPN、提交兼容与单核资源水位。
