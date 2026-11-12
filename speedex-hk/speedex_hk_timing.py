@@ -275,7 +275,11 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # v10.22（2026-11-08，owner 批准）：OKX Solana 可经 Temporal Nozomi `/api/sendTransaction2` 发送。
 # 只接受官方精确 host + text/plain 裸 base64；query 的 API key 与 headers 永不保存。Nozomi 非 OKX 专属，
 # 其 send 必须经同 signature 的 OKX /multi/broadcast 正向归并才绑槽；孤立 2xx/receipt 不得晋升。
-ADDON_VERSION = "2026.11.08-okx-nozomi-send-v10.22"
+# v10.23（2026-11-12，owner 批准的诊断）：Relay WS（ws.relay.link）帧诊断计数 relayWsFrames（/health diag、
+# timeline diag 与 FOMO 腿 evidence.relayWs），使「没有任何 request.status.updated 帧」可证；成功门首个失败原因
+# 只计数。F-SOL swaps 关联不再把已由 Relay subscribe 冻结的 RH 执行腿当作候选（此前被误标 swaps-baseline-missing）。
+# 成功判定、锚与采集范围均不变；帧内容、身份值不入计数。
+ADDON_VERSION = "2026.11.12-fomo-relay-ws-diag-v10.23"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -1254,6 +1258,38 @@ def _fomo_resp_ids(text):
 # the execution/order anchor; nearby fanout requests remain aliases of that observation.
 FOMO_EXECUTION_FANOUT_MS = 2000.0
 FOMO_SWAPS_SKEW_MS = 10000
+# v10.23 relayWsFrames: distinct event/status/gate-reason labels per map (excess folds to "other").
+RELAY_WS_DIAG_DISTINCT = 16
+_RELAY_WS_MAPS = ("byEvent", "byStatus", "successGateFail")
+_RELAY_WS_SCALARS = (
+    "total", "decodeFail", "noIdentity", "statusUpdated", "client", "subscribe", "subscribeBound",
+    "subscribeUnbound", "buffered", "noLegMatch", "routeRejected", "staleBeforeOrder", "routed",
+    "successAdopted",
+)
+
+
+def _fold_relay_ws(diag, always=False, global_scope=False):
+    """Flat `relayWs.*` counters → `{..., relayWsFrames: {scalars, byEvent, byStatus, successGateFail}}`.
+
+    always=True emits zero counters too, so an empty Relay stream is a proven 0, not a missing key.
+    """
+    out, rw = {}, {}
+    for k, v in diag.items():
+        if not k.startswith("relayWs."):
+            out[k] = v
+            continue
+        parts = k.split(".", 2)
+        if len(parts) == 3 and parts[1] in _RELAY_WS_MAPS:
+            rw.setdefault(parts[1], {})[parts[2]] = v
+        else:
+            rw[parts[1]] = v
+    if rw or always:
+        for key in _RELAY_WS_SCALARS + (("noWindow",) if global_scope else ()):
+            rw.setdefault(key, 0)
+        for key in _RELAY_WS_MAPS:
+            rw.setdefault(key, {})
+        out["relayWsFrames"] = rw
+    return out
 FOMO_SWAPS_SNAPSHOTS_PER_KEY = 4
 FOMO_SWAPS_KEYS_PER_RUN = 32
 _FOMO_SWAPS_PATH_RE = re.compile(
@@ -1720,34 +1756,48 @@ def _binance_ws_ids(payload):
     return out
 
 
-def _fomo_relay_success(payload, leg):
-    """Fresh Relay success for an execution-bound Robinhood order, never F-SOL/Mobula."""
+def _fomo_relay_gate(payload, leg):
+    """Relay success gate for an execution-bound Robinhood order, never F-SOL/Mobula.
+
+    None = every check passes. Otherwise the first failing check as a fixed label
+    (v10.23 diagnostics only: `relayWsFrames.successGateFail`, never a success input).
+    """
     obj = _decode_ws(payload)
     if not isinstance(obj, dict) or obj.get("event") != "request.status.updated":
-        return False
-    if leg.get("orderRequestSource") != "fomo-solana-execution" or not leg.get("_fomoRelayFrozen"):
-        return False
+        return "not-status-updated"
+    if leg.get("orderRequestSource") != "fomo-solana-execution":
+        return "leg-not-execution"
+    if not leg.get("_fomoRelayFrozen"):
+        return "leg-not-relay-frozen"
     d = obj.get("data") if isinstance(obj.get("data"), dict) else {}
     if str(d.get("status") or "").lower() != "success":
-        return False
+        return "status-not-success"
     rid = d.get("requestId")
     if not isinstance(rid, str) or not re.fullmatch(r"0[xX][0-9a-fA-F]{64}", rid):
-        return False
+        return "request-id-invalid"
     if not leg.get("orderId") or rid.lower() != str(leg.get("orderId")).lower():
-        return False
+        return "request-id-mismatch"
     try:
         if int(d.get("destinationChainId")) != 4663:
-            return False
+            return "destination-chain"
     except (TypeError, ValueError):
-        return False
+        return "destination-chain"
     hashes = d.get("txHashes")
     if not isinstance(hashes, list) or not hashes or not _transaction_id_value(hashes[0]) or not str(hashes[0]).lower().startswith("0x"):
-        return False
+        return "fill-hash-invalid"
     published = obj.get("publishedAt")
     if isinstance(published, bool) or not isinstance(published, (int, float)):
-        return False
+        return "published-at-missing"
     wall = leg.get("tOrderOutWallMs")
-    return isinstance(wall, (int, float)) and published >= wall - 5000
+    if not isinstance(wall, (int, float)):
+        return "execution-wall-missing"
+    if published < wall - 5000:
+        return "published-at-stale"
+    return None
+
+
+def _fomo_relay_success(payload, leg):
+    return _fomo_relay_gate(payload, leg) is None
 
 
 def _fomo_ws(payload, leg):
@@ -3833,6 +3883,10 @@ class Store:
                 and not leg.get("unbound")
                 and not leg.get("_anchorVeto")
                 and not leg.get("incomplete")
+                # v10.23：已由 Relay subscribe 冻结（orderId 锚）的 RH 执行腿走 Relay 成功门，
+                # 不是 F-SOL swaps 候选——此前会被误标 swaps-baseline-missing 或挤成 ambiguous。
+                and not leg.get("_fomoRelayFrozen")
+                and (leg.get("_anchor") or {}).get("orderId") is None
                 and isinstance(leg.get("tOrderOutMs"), (int, float))
                 and leg["tOrderOutMs"] <= t_obs
             ]
@@ -4080,6 +4134,43 @@ class Store:
                 self.ws_buffer.pop(run_id, None)
             return taken
 
+    def note_relay_ws(self, key, sub=None, run_id=None, leg=None, global_only=False):
+        """v10.23 Relay WS (ws.relay.link) frame diagnostics: counts only, never a success input.
+
+        Flat `relayWs.<key>[.<sub>]` counters in `diag` and per-run `run_diag` (run = the leg's run,
+        else the newest open window), folded into `relayWsFrames` on output. `sub` is a bounded
+        token (event/status/gate reason); unknown shapes and the 17th distinct value fold to "other".
+        A leg also gets `_relayWs` (routed / successGateFail / successAdopted) for its timeline evidence.
+        """
+        name = f"relayWs.{key}"
+        tok = None
+        if sub is not None:
+            tok = sub if isinstance(sub, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,48}", sub) else "other"
+        with self.lock:
+            if tok is not None:
+                prefix = name + "."
+                if (prefix + tok) not in self.diag and sum(1 for k in self.diag if k.startswith(prefix)) >= RELAY_WS_DIAG_DISTINCT:
+                    tok = "other"
+                name = prefix + tok
+            self.diag[name] += 1
+            if global_only:
+                return
+            rid = (leg or {}).get("runId") or run_id
+            if rid is None:
+                rids = self._open_run_ids_locked(time.monotonic())
+                rid = rids[0] if rids else None
+            if rid is not None:
+                self.run_diag[rid][name] += 1
+            if leg is not None:
+                rw = leg.setdefault("_relayWs", {})
+                if key == "successGateFail":
+                    gate = rw.setdefault("successGateFail", {})
+                    gate[name.rsplit(".", 1)[-1]] = gate.get(name.rsplit(".", 1)[-1], 0) + 1
+                elif key == "successAdopted":
+                    rw["successAdopted"] = True
+                else:
+                    rw[key] = rw.get(key, 0) + 1
+
     def note_frame_diag(self, key):
         """路由层之外（缓冲拒绝/终态）的帧诊断计数——与 route_ws_frame 同
         口径（全局 + 最新开窗 run）。"""
@@ -4278,6 +4369,11 @@ class Store:
                 )
                 c["_anchorDiag"] = dict(x.get("_anchorDiag") or {})
                 c["_anchor"] = dict(x.get("_anchor") or {})
+                if x.get("_relayWs"):
+                    rw = dict(x["_relayWs"])
+                    if "successGateFail" in rw:
+                        rw["successGateFail"] = dict(rw["successGateFail"])
+                    c["_relayWs"] = rw
                 legs.append(c)
             mark = dict(self.marks.get(run_id) or {})
             gone = not legs and not mark and run_id in self.gone
@@ -4458,6 +4554,14 @@ class Store:
                         "mergedIntoFlowId": x.get(
                             "_mergedIntoFlowId"
                         ),  # dup 腿 → formal 腿 orderFlowId
+                        # v10.23：本腿 Relay 帧诊断（私有 raw；public DTO 未登记 → drop）
+                        **({"relayWs": {
+                            "routed": x["_relayWs"].get("routed", 0),
+                            "subscribeBound": x["_relayWs"].get("subscribeBound", 0),
+                            "staleBeforeOrder": x["_relayWs"].get("staleBeforeOrder", 0),
+                            "successGateFail": dict(x["_relayWs"].get("successGateFail") or {}),
+                            "successAdopted": bool(x["_relayWs"].get("successAdopted")),
+                        }} if x.get("_relayWs") else {}),
                     },
                     "incomplete": incomplete,
                     "atWall": at_wall,
@@ -4519,8 +4623,13 @@ class Store:
             },
             "legs": out + placeholders,
             # per-run 诊断计数——带身份却无腿可归属的帧 / 锚冲突拒收 / 身份冲突 /
-            # 歧义（缺失可见；空 dict = 本 run 无此类事件）
-            "diag": rdiag,
+            # 歧义（缺失可见；空 dict = 本 run 无此类事件）。v10.23：relayWs.* 折叠为
+            # relayWsFrames；FOMO run（manifest 或腿）恒出该键，0 = 本窗未见 Relay 帧。
+            "diag": _fold_relay_ws(
+                rdiag,
+                always=any(x.get("platform") == "fomo" for x in legs)
+                or any((m or {}).get("platform") == "fomo" for m in (mark.get("manifestLegs") or [])),
+            ),
             # 方法版本 + 采集环境身份（sidecar 自证采集口径）
             **_collection_identity(),
         }
@@ -5636,6 +5745,12 @@ class SpeedexHkTiming:
 
     def _handle_ws_message(self, flow, msg, t_obs):
         if not STORE.any_open():
+            try:
+                h0 = flow.request.pretty_host
+                if h0 == "ws.relay.link" or h0.endswith(".ws.relay.link"):
+                    STORE.note_relay_ws("noWindow", global_only=True)
+            except Exception:
+                pass
             return
         host = flow.request.pretty_host
         # v10：链域通道（www.okx.com/.ac /fullnode|/nodeone）——成功通知到达时刻（HK 钟）
@@ -5675,15 +5790,22 @@ class SpeedexHkTiming:
             # FOMO：页面出站 subscribe 帧带 filters.id——把 ws 通道与 requestId 绑定
             # （出站页面数据，与请求/响应同为独立锚）
             if platform == "fomo":
+                STORE.note_relay_ws("client")
                 obj = _decode_ws(payload)
                 if isinstance(obj, dict) and obj.get("type") == "subscribe":
+                    STORE.note_relay_ws("subscribe")
                     fid = ((obj.get("filters") or {}).get("id")) or None
-                    if fid:
-                        leg = STORE.bind_fomo_subscribe(fid)
-                        if leg is not None:
-                            # subscribe 也是锚源——建立后重审早到缓冲帧
-                            self._drain_ws_buffer(leg.get("runId"), "fomo")
+                    leg = STORE.bind_fomo_subscribe(fid) if fid else None
+                    STORE.note_relay_ws("subscribeBound" if leg is not None else "subscribeUnbound", leg=leg)
+                    if leg is not None:
+                        # subscribe 也是锚源——建立后重审早到缓冲帧
+                        self._drain_ws_buffer(leg.get("runId"), "fomo")
             return
+        if platform == "fomo":
+            try:
+                self._note_relay_server_frame(payload)
+            except Exception:
+                pass
         # TG 帧探针（2026-10-03 LA 排查：bsc/sol tg 推送 0/5——帧到没到代理一锤
         # 定音）。计数恒开（/health diag 可查）；SPEEDEX_TG_DEBUG=1 时逐帧一行。
         if platform == "gmgn":
@@ -5734,6 +5856,24 @@ class SpeedexHkTiming:
             except Exception:
                 pass
 
+    @staticmethod
+    def _note_relay_server_frame(payload):
+        """v10.23: classify one inbound Relay frame for relayWsFrames (labels/counts only)."""
+        STORE.note_relay_ws("total")
+        obj = _decode_ws(payload)
+        if not isinstance(obj, dict):
+            STORE.note_relay_ws("decodeFail")
+            return
+        event = obj.get("event") if isinstance(obj.get("event"), str) else obj.get("type")
+        STORE.note_relay_ws("byEvent", event if isinstance(event, str) else "(none)")
+        if obj.get("event") == "request.status.updated":
+            STORE.note_relay_ws("statusUpdated")
+            d = obj.get("data") if isinstance(obj.get("data"), dict) else {}
+            status = d.get("status")
+            STORE.note_relay_ws("byStatus", status.lower() if isinstance(status, str) else "(none)")
+        if not any(_fomo_ws_ids(payload).get(k) is not None for k in _IDENTITY_KEYS):
+            STORE.note_relay_ws("noIdentity")
+
     def _ws_units(self, platform, payload):
         """入站帧 → 处理单元列表 [{ids, success}…]。规则带
         ws_entries（okx/gmgn）时逐 entry 产出（success = 同 entry 状态判定）；
@@ -5776,6 +5916,7 @@ class SpeedexHkTiming:
         按锚身份路由到目标腿——候选为所有开窗腿（不只平台
         最新腿）；dup 腿命中归到 formal 腿；冲突/否决 → 不归属并由路由层计 diag。"""
         leg, route = STORE.route_ws_frame(platform, ids, defer_nomatch=allow_buffer)
+        relay = platform == "fomo"  # v10.23 relayWsFrames（只计数）
         if not leg:
             if route == "no-leg-match" and allow_buffer:
                 if not STORE.buffer_ws_unit(
@@ -5791,6 +5932,12 @@ class SpeedexHkTiming:
                     STORE.note_frame_diag(
                         "wsFrameNoLegMatch"
                     )  # 无锚待定腿/超预算——零命中即终态
+                    if relay:
+                        STORE.note_relay_ws("noLegMatch")
+                elif relay and not rebuffered:
+                    STORE.note_relay_ws("buffered")
+            elif relay:
+                STORE.note_relay_ws("noLegMatch" if route == "no-leg-match" else "routeRejected")
             return
         t_order = leg.get("tOrderOutMs")
         if (
@@ -5801,6 +5948,8 @@ class SpeedexHkTiming:
             # 新鲜性门：信号源时间先于该腿的下单请求 = 不可能是本单的
             # 回应（陈旧/重放疑似——缓冲帧尤其要防「先到帧撞上后建腿的未来锚」）。
             # 不采纳；与零命中同路回缓冲/计数（该腿永不可能成为本帧的合法目标）。
+            if relay and not rebuffered:
+                STORE.note_relay_ws("staleBeforeOrder", leg=leg)
             if allow_buffer:
                 if not STORE.buffer_ws_unit(
                     platform,
@@ -5817,7 +5966,11 @@ class SpeedexHkTiming:
         try:
             # 整帧重放甄别（如 padre 的跨批 FILLED 重放）——陈旧帧 ids/成功一概不认
             fresh_fn = RULES[platform].get("ws_frame_fresh")
+            if relay:
+                STORE.note_relay_ws("routed", leg=leg)
             if fresh_fn and not fresh_fn(payload, leg, ids):
+                if relay:
+                    STORE.note_relay_ws("successGateFail", _fomo_relay_gate(payload, leg) or "unknown", leg=leg)
                 return
             # 强关联门：陈旧/跨批重放帧不得把别轮的 hash 挂到本轮腿，
             # 也不得触发对不存在 tx 的 receipt 轮询假成功：
@@ -5949,6 +6102,8 @@ class SpeedexHkTiming:
             # FOMO /swaps/v3 preview 永不进入此晋升路径
             if leg.get("anchorRole") in ("preview", "sign"):
                 STORE._promote_leg_locked(leg)
+        if platform == "fomo":
+            STORE.note_relay_ws("successAdopted", leg=leg)
         # 事件记进腿自己的 run（不 open_run_ids()[0] 取最旧窗）
         STORE.add_event(
             leg["runId"],
@@ -6073,7 +6228,7 @@ class _Ctrl(BaseHTTPRequestHandler):
                 "seenReq": SpeedexHkTiming.seen_req,
                 "at": _wall_iso(),
                 "diag": {
-                    **diag,
+                    **_fold_relay_ws(diag, always=True, global_scope=True),
                     "headPoll": HEADS.diag_snapshot(),
                     "headWs": HEADS.ws_diag_snapshot(),
                 },  # 关窗后拒绝的下单请求计数等诊断 + 链头轮询可观测（head-v4）

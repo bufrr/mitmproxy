@@ -7002,7 +7002,7 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.11.08-okx-nozomi-send-v10.22")
+        self.assertEqual(A.ADDON_VERSION, "2026.11.12-fomo-relay-ws-diag-v10.23")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 
@@ -9339,6 +9339,144 @@ class TestFullnodeTxProbe(unittest.TestCase):
         # 记录无 secret 形键/值（公开链上数据）
         for r in logged:
             self.assertNotIn("authorization", json.dumps(r).lower())
+
+
+class TestFomoRelayWsDiagV1023(unittest.TestCase):
+    """v10.23: Relay WS frame diagnostics prove "zero frames"; Relay-frozen RH legs leave F-SOL swaps eligibility."""
+
+    RID = "0x" + "9a" * 32
+    FILL = "0x" + "12" * 32
+
+    def setUp(self):
+        fresh()
+
+    @staticmethod
+    def _manifest(run, chain="robinhood", rounds=1):
+        return {"version": 1, "runId": run, "rounds": rounds, "legs": [{"platform": "fomo", "chain": chain, "rounds": rounds}]}
+
+    def _rh_leg(self, run):
+        A.STORE.mark_open(run, manifest=self._manifest(run))
+        fomo_preview(relay=self.RID)
+        fomo_sign()
+        fomo_execution()
+        fomo_subscribe(self.RID)
+        legs = [x for x in A.STORE.legs[run] if x.get("anchorRole") == "order"]
+        self.assertEqual(len(legs), 1)
+        self.assertTrue(legs[0].get("_fomoRelayFrozen"))
+        return legs[0]
+
+    def test_zero_relay_frames_is_a_proven_zero_and_swaps_no_longer_mislabel(self):
+        run = "run-relay-zero"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            leg = self._rh_leg(run)
+            # The page's swaps poll without a pre-execution baseline used to stamp the RH leg.
+            fomo_swaps([fomo_swap_row()])
+            self.assertIsNone(leg.get("incomplete"), "Relay-frozen RH leg is not an F-SOL swaps candidate")
+            self.assertEqual(A.STORE.diag.get("fomoSwapsBaselineMissing", 0), 0)
+            A.STORE.mark_close(run)
+            tl = A.STORE.timeline(run)
+        rw = tl["diag"]["relayWsFrames"]
+        self.assertEqual(rw["total"], 0)
+        self.assertEqual(rw["statusUpdated"], 0)
+        self.assertEqual(rw["subscribe"], 1)
+        self.assertEqual(rw["subscribeBound"], 1)
+        self.assertEqual(rw["byEvent"], {})
+        self.assertEqual(rw["successGateFail"], {})
+        order = [x for x in tl["legs"] if x["anchorRole"] == "order"][0]
+        self.assertEqual(order["incomplete"], "no-success-observed")
+        self.assertEqual(order["evidence"]["relayWs"], {
+            "routed": 0, "subscribeBound": 1, "staleBeforeOrder": 0, "successGateFail": {}, "successAdopted": False,
+        })
+        self.assertNotIn(self.RID[2:], json.dumps(tl), "no identity value in default timeline")
+
+    def test_frames_events_status_and_gate_reasons_are_counted(self):
+        run = "run-relay-frames"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            leg = self._rh_leg(run)
+            A.addons[0].websocket_message(ws_frame("ws.relay.link", json.dumps({"type": "connection.ack"})))
+            A.addons[0].websocket_message(ws_frame("ws.relay.link", b"\xff\xfe not json"))
+            fomo_status(self.RID, "pending")
+            fomo_status(self.RID, "success", self.FILL, published_at=0)
+            fomo_status(self.RID, "success", self.FILL, destination=792703809)
+            fomo_status("0x" + "77" * 32, "success", self.FILL)  # another order's frame
+            self.assertIsNone(leg.get("tSuccessPushMs"))
+            fomo_status(self.RID, "success", self.FILL)
+            self.assertIsNotNone(leg.get("tSuccessPushMs"), "existing success gate unchanged")
+            A.STORE.mark_close(run)
+            tl = A.STORE.timeline(run)
+        rw = tl["diag"]["relayWsFrames"]
+        self.assertEqual(rw["total"], 7)
+        self.assertEqual(rw["statusUpdated"], 5)
+        self.assertEqual(rw["byStatus"], {"pending": 1, "success": 4})
+        self.assertEqual(rw["byEvent"].get("request.status.updated"), 5)
+        self.assertEqual(rw["byEvent"].get("connection.ack"), 1)
+        self.assertEqual(rw["decodeFail"], 1)
+        self.assertEqual(rw["noIdentity"], 1)
+        self.assertEqual(rw["successGateFail"], {"status-not-success": 1, "published-at-stale": 1, "destination-chain": 1})
+        self.assertEqual(rw["successAdopted"], 1)
+        self.assertGreaterEqual(rw["noLegMatch"] + rw["buffered"] + rw["routeRejected"], 1, "foreign order frame is not routed to the leg")
+        order = [x for x in tl["legs"] if x["anchorRole"] == "order"][0]
+        self.assertEqual(order["evidence"]["relayWs"]["successGateFail"], rw["successGateFail"])
+        self.assertTrue(order["evidence"]["relayWs"]["successAdopted"])
+        self.assertEqual(order["evidence"]["relayWs"]["routed"], 4)
+        serialized = json.dumps(tl)
+        self.assertNotIn("77" * 32, serialized)
+        self.assertNotIn("12" * 32, serialized, "default timeline keeps only the short fill hash")
+
+    def test_health_relay_frames_global_and_no_window(self):
+        A.addons[0].websocket_message(ws_frame("ws.relay.link", json.dumps({"event": "request.status.updated", "data": {}})))
+        code, body = _http_json("GET", "http://127.0.0.1:8072/health")
+        self.assertEqual(code, 200)
+        rw = body["diag"]["relayWsFrames"]
+        self.assertEqual(rw["noWindow"], 1)
+        self.assertEqual(rw["total"], 0, "no window → not classified")
+        self.assertNotIn("relayWs.noWindow", body["diag"])
+        fresh()
+        code, body = _http_json("GET", "http://127.0.0.1:8072/health")
+        self.assertEqual(body["diag"]["relayWsFrames"]["total"], 0, "always present: zero is explicit")
+
+    def test_bounded_labels_and_non_fomo_runs_unchanged(self):
+        run = "run-relay-labels"
+        A.STORE.mark_open(run, manifest=self._manifest(run))
+        for i in range(A.RELAY_WS_DIAG_DISTINCT + 3):
+            A.addons[0].websocket_message(ws_frame("ws.relay.link", json.dumps({"event": f"evt-{i}"})))
+        A.addons[0].websocket_message(ws_frame("ws.relay.link", json.dumps({"event": "x" * 200})))
+        tl = A.STORE.timeline(run)
+        by_event = tl["diag"]["relayWsFrames"]["byEvent"]
+        self.assertLessEqual(len(by_event), A.RELAY_WS_DIAG_DISTINCT + 1)
+        self.assertEqual(by_event["other"], 4)
+        fresh()
+        A.STORE.mark_open("run-okx-only", manifest={"version": 1, "runId": "run-okx-only", "rounds": 1, "legs": [{"platform": "okx", "chain": "bsc", "rounds": 1}]})
+        self.assertNotIn("relayWsFrames", A.STORE.timeline("run-okx-only")["diag"])
+
+    def test_gate_reason_labels_match_success_predicate(self):
+        leg = {"orderRequestSource": "fomo-solana-execution", "_fomoRelayFrozen": True, "orderId": self.RID, "tOrderOutWallMs": 1000}
+
+        def frame(**over):
+            data = {"status": "success", "requestId": self.RID, "destinationChainId": 4663, "txHashes": [self.FILL]}
+            data.update(over.pop("data", {}))
+            obj = {"event": "request.status.updated", "data": data, "publishedAt": 2000}
+            obj.update(over)
+            return json.dumps(obj)
+
+        cases = [
+            (json.dumps({"event": "other"}), leg, "not-status-updated"),
+            (frame(), {**leg, "orderRequestSource": "fomo-privy-sign"}, "leg-not-execution"),
+            (frame(), {**leg, "_fomoRelayFrozen": False}, "leg-not-relay-frozen"),
+            (frame(data={"status": "pending"}), leg, "status-not-success"),
+            (frame(data={"requestId": "0x12"}), leg, "request-id-invalid"),
+            (frame(), {**leg, "orderId": "0x" + "33" * 32}, "request-id-mismatch"),
+            (frame(data={"destinationChainId": "x"}), leg, "destination-chain"),
+            (frame(data={"txHashes": []}), leg, "fill-hash-invalid"),
+            (frame(publishedAt=None), leg, "published-at-missing"),
+            (frame(), {**leg, "tOrderOutWallMs": None}, "execution-wall-missing"),
+            (frame(publishedAt=-5000), leg, "published-at-stale"),
+            (frame(), leg, None),
+        ]
+        for payload, lg, want in cases:
+            with self.subTest(want=want):
+                self.assertEqual(A._fomo_relay_gate(payload, lg), want)
+                self.assertEqual(A._fomo_relay_success(payload, lg), want is None)
 
 
 if __name__ == "__main__":
