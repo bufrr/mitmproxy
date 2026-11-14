@@ -279,7 +279,25 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # timeline diag 与 FOMO 腿 evidence.relayWs），使「没有任何 request.status.updated 帧」可证；成功门首个失败原因
 # 只计数。F-SOL swaps 关联不再把已由 Relay subscribe 冻结的 RH 执行腿当作候选（此前被误标 swaps-baseline-missing）。
 # 成功判定、锚与采集范围均不变；帧内容、身份值不入计数。
-ADDON_VERSION = "2026.11.12-fomo-relay-ws-diag-v10.23"
+# v10.24（2026-11-12，owner 批准「use fomo status as signal」）：Relay WS 不再下发 request.status.updated
+# （v10.23 relayWsFrames.statusUpdated=0），F-RH 成功改认 FOMO 自有 `GET prod-api.fomo.family/swaps/v2/status
+# ?relaySwapId=<0x+64hex>`（批 1794454758474-4hemv probe 证实 schema：query 只此一键；body 仅
+# {success,message,responseObject:{status},statusCode}，无 id/链/hash）。关联按请求：同一 flow 的 query
+# relaySwapId 必须等于腿已由 subscribe 冻结的 Relay 锚（orderId）；只认 HTTP 200 + JSON success=true +
+# responseObject.status=="SUCCESS" 的首个响应，且请求与响应均不早于腿的 order 锚、开窗中；时间 = 响应 hook 入口。
+# 链：冻结的 v3 候选是 Relay preview（既有规则 → robinhood），若带 v2Swap.destinationChainId 则必须 4663。
+# body 无 hash：本通道不写 txHash、不起 receipt 轮询；exact tx 由 EU 侧以同一 Relay id 绑定的 run.tx 核验。
+# 通道 successEvidence.channel="fomo-status-http"（HTTP 轮询响应，非 WS 推送）。Relay WS 路径不变；两者以首个
+# 被采纳的观察为准（first-observation freeze），后到者只计 diag。204/OPTIONS/非 200/非 JSON/其它状态只计数。
+# v10.25（2026-11-13，owner 批准 BSC 适配）：Mobula preview 的链身份只由 destinationNetworkId
+# 证明：4663→robinhood、56→bsc；缺失/未知/畸形保持 None。Solana 原链不作目的地推断，Mobula 仍无 push。
+# v10.26（2026-11-14，review fix）：只有 Relay WS 成功是推送信号，fomo-status-http 只是诊断，不得挡住推送。
+# 腿当前成功来自 status 轮询时，后到的 Relay WS 成功帧若通过 WS 路径全部既有门（锚路由/新鲜度/Relay 成功门/
+# 腿冲突/跨腿去重/开窗/未否决）且其 fill hash 已落为腿的 txHash，即以首个 WS 成功的同一写法替换
+# tSuccessPushMs/wsSha/successEvidence/successAnchorKeys（receipt 轮询、事件、successAdopted 各一次）；
+# 计 fomoStatusReplacedByWs，fomoStatusAdopted 保留。其余已采纳成功（Relay WS、fomo-swaps-rest、其它平台）
+# 仍首个冻结；status 后到仍只计 fomoStatusAfterSuccess。无 status 采纳的腿门限不变。
+ADDON_VERSION = "2026.11.14-fomo-ws-replaces-status-v10.26"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -1245,12 +1263,28 @@ def _fomo_resp_ids(text):
         if not isinstance(v2.get("relayTransaction"), dict):
             return {}
         out = {"chain": "robinhood", "_previewSource": "relay"}
+        dest = v2.get("destinationChainId")
+        if dest is not None and not isinstance(dest, bool):
+            try:
+                out["_previewDestChainId"] = int(dest)
+            except (TypeError, ValueError):
+                out["_previewDestChainId"] = -1  # present but unparseable = not 4663
         rid = v2.get("relaySwapId")
         if isinstance(rid, str) and re.fullmatch(r"0[xX][0-9a-fA-F]{64}", rid):
             out["_previewRelayId"] = rid.lower()
         return out
     if source == "mobula" and isinstance(ro.get("mobulaSwap"), dict):
-        return {"chain": "robinhood", "_previewSource": "mobula"}
+        # Mobula chain identity comes only from its schema-known destinationNetworkId. The shared
+        # Solana origin never proves RH/BSC, and intentId never becomes a Relay/order anchor.
+        dest = ro["mobulaSwap"].get("destinationNetworkId")
+        if isinstance(dest, bool):
+            return {"chain": None, "_previewSource": "mobula"}
+        try:
+            dest = int(dest)
+        except (TypeError, ValueError):
+            return {"chain": None, "_previewSource": "mobula"}
+        chain = "robinhood" if dest == 4663 else "bsc" if dest == 56 else None
+        return {"chain": chain, "_previewSource": "mobula"}
     return {}
 
 
@@ -1389,6 +1423,58 @@ def _fomo_swaps_request(host, raw_path, method):
         return {"userKey": user_key, "token": tokens[0]}
     except Exception:
         return None
+
+
+_HEX32_RE = re.compile(r"0[xX][0-9a-fA-F]{64}")
+
+
+def _fomo_status_request(host, raw_path, method):
+    """v10.24 FOMO `/swaps/v2/status` request: {"preflight"} | {"relayId"} | {"invalid"} | None.
+
+    Proven shape (2026-11-12 probe): GET with exactly one query key `relaySwapId` (0x + 64 hex).
+    Any other shape is counted but never correlated. Nothing beyond the Relay id is retained.
+    """
+    if host != "prod-api.fomo.family":
+        return None
+    try:
+        u = urllib.parse.urlsplit(raw_path or "")
+    except Exception:
+        return None
+    if u.path.rstrip("/") != "/swaps/v2/status":
+        return None
+    m = str(method or "").upper()
+    if m == "OPTIONS":
+        return {"preflight": True}
+    if m != "GET":
+        return {"invalid": "method"}
+    try:
+        query = urllib.parse.parse_qs(u.query, keep_blank_values=True)
+    except Exception:
+        return {"invalid": "query"}
+    ids = query.get("relaySwapId") or []
+    if set(query) != {"relaySwapId"} or len(ids) != 1 or not _HEX32_RE.fullmatch(ids[0]):
+        return {"invalid": "query"}
+    return {"relayId": ids[0].lower()}
+
+
+def _fomo_status_success(code, text):
+    """None = success; otherwise the first failing check as a fixed diag label."""
+    if code != 200:
+        return "http-status"
+    j = _j(text)
+    if not isinstance(j, dict):
+        return "not-json"
+    if j.get("success") is not True:
+        return "envelope-not-success"
+    sc = j.get("statusCode")
+    if sc is not None and (isinstance(sc, bool) or sc != 200):
+        return "envelope-status-code"
+    ro = j.get("responseObject")
+    if not isinstance(ro, dict) or not isinstance(ro.get("status"), str):
+        return "state-missing"
+    if ro["status"] != "SUCCESS":
+        return "state-not-success"
+    return None
 
 
 def _fomo_created_ms(value):
@@ -1807,6 +1893,25 @@ def _fomo_ws(payload, leg):
 def _fomo_ws_frame_fresh(payload, leg, ids):
     # Apply the complete success gate before any frame-provided hash/chain can settle.
     return _fomo_relay_success(payload, leg)
+
+
+def _fomo_status_success_replaceable(platform, leg, ids):
+    """v10.26 (caller holds STORE.lock): may this Relay WS unit replace the leg's success?
+
+    Only the Relay WS success is a push signal; a `fomo-status-http` adoption is a diagnostic
+    and must not block it. True only when the leg's current success came from the status poll
+    and this unit's fill hash is the leg's own txHash, i.e. the frame already passed routing,
+    the full Relay gate, the leg-conflict check and cross-leg dedup, and the receipt poll was
+    claimed with that hash. Every other adopted success (a Relay WS success, `fomo-swaps-rest`,
+    any OKX/GMGN/Padre/Binance leg) stays frozen.
+    """
+    if platform != "fomo":
+        return False
+    if (leg.get("successEvidence") or {}).get("channel") != "fomo-status-http":
+        return False
+    tx = _transaction_id_value(ids.get("txHash"))
+    h = leg.get("txHash")
+    return bool(tx and h and _ident_norm("txHash", h) == _ident_norm("txHash", tx))
 
 
 def _fomo_ws_ids(payload):
@@ -3791,6 +3896,8 @@ class Store:
             self.fomo_previews[rid] = {
                 "source": "relay",
                 "relayId": ids.get("_previewRelayId"),
+                "chain": ids.get("chain"),
+                "destChainId": ids.get("_previewDestChainId"),
                 "observedMs": observed_ms,
             }
 
@@ -3841,6 +3948,10 @@ class Store:
             anchor["orderId"] = fid
             leg["orderId"] = fid
             leg["_fomoRelayFrozen"] = True
+            # v10.24: the frozen candidate's chain facts (Relay preview → robinhood; optional
+            # v2Swap.destinationChainId) are the HK chain proof for the hashless status signal.
+            leg["_fomoRelayPreviewChain"] = preview.get("chain")
+            leg["_fomoRelayDestChainId"] = preview.get("destChainId")
             return leg
 
     def observe_fomo_swaps(self, window, scope, rows, t_obs, t_wall_ms, body_sha):
@@ -3966,6 +4077,101 @@ class Store:
                 "t": t_obs,
                 "tw": _wall_iso(),
                 "kind": "fomo_swap_success",
+                "platform": "fomo",
+                "host": "prod-api.fomo.family",
+                "sha": body_sha,
+            })
+            return leg
+
+    def _fomo_status_diag_locked(self, rid, key, leg=None):
+        self.diag[key] += 1
+        if rid:
+            self.run_diag[rid][key] += 1
+        if leg is not None:
+            d = leg.setdefault("_fomoStatus", {})
+            d[key] = d.get(key, 0) + 1
+
+    def observe_fomo_status(self, window, relay_id, t_req, t_obs, body_sha):
+        """v10.24 F-RH success from FOMO's own `/swaps/v2/status` 200 SUCCESS response.
+
+        Correlation is by request: the same flow's query relaySwapId must equal the Relay id
+        that a post-execution subscribe already froze on exactly one open execution leg.
+        Request and response must both be at/after that leg's order anchor. Chain proof =
+        the frozen candidate was a Relay preview (→ robinhood) whose optional
+        destinationChainId is 4663. The body carries no hash, so no txHash/receipt poll is
+        produced here: the exact fill tx is checked on the EU side against the same Relay id.
+        A status after any adopted success only counts fomoStatusAfterSuccess. v10.26: this
+        adoption is a diagnostic, not a push; a later fully gated Relay WS success carrying the
+        leg's fill hash replaces it in _adopt_ws_unit (counted fomoStatusReplacedByWs).
+        """
+        rid, epoch = window
+        with self.lock:
+            mark = self.marks.get(rid)
+            if not mark or mark.get("closed") is not None or mark.get("epoch") != epoch:
+                self._fomo_status_diag_locked(None, "fomoStatusWindowClosed")
+                return None
+            legs = [
+                leg for leg in self.legs.get(rid, [])
+                if leg.get("platform") == "fomo"
+                and leg.get("orderRequestSource") == "fomo-solana-execution"
+                and leg.get("_fomoRelayFrozen")
+                and _ident_norm("orderId", (leg.get("_anchor") or {}).get("orderId") or "") == _ident_norm("orderId", relay_id)
+            ]
+            if not legs:
+                self._fomo_status_diag_locked(rid, "fomoStatusNoFrozenLeg")
+                return None
+            if len(legs) != 1:
+                self._fomo_status_diag_locked(rid, "fomoStatusAmbiguousLeg")
+                return None
+            leg = legs[0]
+            if leg.get("windowClosed") or leg.get("_anchorVeto") or leg.get("dup") or leg.get("incomplete"):
+                self._fomo_status_diag_locked(rid, "fomoStatusLegIneligible", leg)
+                return None
+            if leg.get("tSuccessPushMs") is not None:
+                self._fomo_status_diag_locked(rid, "fomoStatusAfterSuccess", leg)
+                return None
+            t_order = leg.get("tOrderOutMs")
+            if (
+                not isinstance(t_order, (int, float))
+                or not isinstance(t_req, (int, float))
+                or t_req < t_order
+                or t_obs < t_order
+            ):
+                self._fomo_status_diag_locked(rid, "fomoStatusBeforeOrder", leg)
+                return None
+            dest = leg.get("_fomoRelayDestChainId")
+            if (
+                leg.get("_fomoRelayPreviewChain") != "robinhood"
+                or (dest is not None and dest != 4663)
+                or leg.get("chain") not in (None, "robinhood")
+            ):
+                self._fomo_status_diag_locked(rid, "fomoStatusChainUnproven", leg)
+                return None
+            leg["chain"] = "robinhood"
+            leg["tSuccessPushMs"] = t_obs
+            leg["wsSha"] = body_sha
+            leg["successAnchorKeys"] = ["orderId"]
+            leg["successEvidence"] = {
+                "version": 1,
+                "platform": "fomo",
+                "channel": "fomo-status-http",
+                "status": "success",
+                "txHash": None,
+                "txDigest": None,
+                "matchedKeys": ["orderId"],
+                "correlation": "status-query-relaySwapId",
+                "observedAtMs": t_obs,
+                "requestObservedAtMs": t_req,
+                "frameSha": body_sha,
+            }
+            if leg.get("pendingBind"):
+                leg["pendingBind"] = False
+                self._promote_leg_locked(leg)
+            self._fomo_status_diag_locked(rid, "fomoStatusAdopted", leg)
+            self._add_event_locked(rid, {
+                "t": t_obs,
+                "tw": _wall_iso(),
+                "kind": "fomo_status_success",
                 "platform": "fomo",
                 "host": "prod-api.fomo.family",
                 "sha": body_sha,
@@ -4562,6 +4768,8 @@ class Store:
                             "successGateFail": dict(x["_relayWs"].get("successGateFail") or {}),
                             "successAdopted": bool(x["_relayWs"].get("successAdopted")),
                         }} if x.get("_relayWs") else {}),
+                        # v10.24: per-leg /swaps/v2/status correlation counters (private raw; not in the public DTO)
+                        **({"fomoStatus": dict(x["_fomoStatus"])} if x.get("_fomoStatus") else {}),
                     },
                     "incomplete": incomplete,
                     "atWall": at_wall,
@@ -5418,6 +5626,21 @@ class SpeedexHkTiming:
             flow.metadata["speedex_fomo_swaps"] = {"window": window, **swaps_scope}
             return
 
+        status_req = _fomo_status_request(host, raw_path, method)
+        if status_req:
+            # v10.24: read-only status poll. Only the query Relay id and the hook-entry time are
+            # kept for pairing this flow's own response; headers/body are never read.
+            if status_req.get("preflight"):
+                STORE.note_frame_diag("fomoStatusPreflight")
+            elif status_req.get("invalid"):
+                STORE.note_frame_diag("fomoStatusRequestInvalid")
+            else:
+                STORE.note_frame_diag("fomoStatusRequest")
+                flow.metadata["speedex_fomo_status"] = {
+                    "window": window, "relayId": status_req["relayId"], "tReq": t_obs,
+                }
+            return
+
         if _fomo_sign_request(host, path, method):
             # Request hook only: no body, header, query or id segment is read or retained.
             STORE.note_fomo_sign(window, {
@@ -5591,6 +5814,28 @@ class SpeedexHkTiming:
                         args=(leg.get("runId"), leg, leg.get("chain"), h, _jsonrpc),
                         daemon=True,
                     ).start()
+            return
+
+        status_meta = flow.metadata.get("speedex_fomo_status")
+        if status_meta:
+            try:
+                code = int(getattr(flow.response, "status_code", None))
+            except (TypeError, ValueError):
+                code = None
+            body = ""
+            if code == 200:
+                try:
+                    body = flow.response.get_text() or ""
+                except Exception:
+                    body = ""
+            fail = _fomo_status_success(code, body)
+            if fail:
+                STORE.note_frame_diag("fomoStatusReject." + fail)
+                return
+            STORE.observe_fomo_status(
+                status_meta["window"], status_meta["relayId"], status_meta["tReq"], t_obs,
+                hashlib.sha256(body.encode()).hexdigest()[:16],
+            )
             return
 
         meta = flow.metadata.get("speedex_leg")
@@ -6031,7 +6276,12 @@ class SpeedexHkTiming:
         except Exception:
             pass
         with STORE.lock:
-            if leg.get("tSuccessPushMs") is not None or leg.get("windowClosed"):
+            # First adopted success stays frozen, except v10.26: a `fomo-status-http` adoption
+            # yields to this Relay WS success when it carries the leg's own fill hash.
+            if leg.get("windowClosed") or (
+                leg.get("tSuccessPushMs") is not None
+                and not _fomo_status_success_replaceable(platform, leg, ids)
+            ):
                 return
         try:
             # 逐 entry 平台（ws_entries）的成功 = 同 entry 状态（路由已保证锚
@@ -6046,13 +6296,18 @@ class SpeedexHkTiming:
         if not ok:
             return
         with STORE.lock:
+            replaces_status = leg.get("tSuccessPushMs") is not None
             if (
-                leg.get("tSuccessPushMs") is not None
+                (replaces_status and not _fomo_status_success_replaceable(platform, leg, ids))
                 or leg.get("windowClosed")
                 or leg.get("_anchorVeto")
             ):
                 # 被否决腿不写成功（route_ws_frame 已排除——此为纵深守卫）
                 return
+            if replaces_status:
+                # v10.26: the status poll stays counted (fomoStatusAdopted); the replacement is
+                # visible in the same per-leg/run counter map.
+                STORE._fomo_status_diag_locked(leg.get("runId"), "fomoStatusReplacedByWs", leg)
             leg["tSuccessPushMs"] = t_obs
             leg["wsSha"] = hashlib.sha256(
                 payload if isinstance(payload, bytes) else str(payload).encode()

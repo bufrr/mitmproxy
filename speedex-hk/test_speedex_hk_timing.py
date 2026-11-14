@@ -122,7 +122,7 @@ FOMO_TEST_MINT = "FxMint" + "6" * 38
 FOMO_TEST_SIG = "5" * 88
 
 
-def fomo_preview(relay=None, source=None, respond=True):
+def fomo_preview(relay=None, source=None, respond=True, mobula_dest=4663):
     """Current /swaps/v3 response variants; all transaction/intent values are synthetic."""
     if relay is not None:
         source = "relay"
@@ -137,6 +137,8 @@ def fomo_preview(relay=None, source=None, respond=True):
     elif source == "mobula":
         ro["mobulaSwap"] = {
             "intentId": "synthetic-intent-not-a-relay-id",
+            "originNetworkId": 1399811149,
+            "destinationNetworkId": mobula_dest,
             "deposit": {"type": "SOLANA", "tx": "c3ludGhldGljLXR4"},
         }
     else:
@@ -4081,7 +4083,7 @@ class TestR8StructuredAnchors(unittest.TestCase):
             },
         })
         out = A._fomo_resp_ids(relay)
-        self.assertEqual(out, {"chain": "robinhood", "_previewSource": "relay", "_previewRelayId": rid})
+        self.assertEqual(out, {"chain": "robinhood", "_previewSource": "relay", "_previewRelayId": rid, "_previewDestChainId": 4663})
         self.assertNotIn("orderId", out, "v3 preview candidate 不是执行锚")
         self.assertEqual(
             A._fomo_resp_ids(json.dumps({
@@ -4092,10 +4094,22 @@ class TestR8StructuredAnchors(unittest.TestCase):
         )
         mobula = A._fomo_resp_ids(json.dumps({
             "success": True,
-            "responseObject": {"source": "mobula", "mobulaSwap": {"intentId": rid, "deposit": {"tx": "synthetic"}}},
+            "responseObject": {"source": "mobula", "mobulaSwap": {"intentId": rid, "destinationNetworkId": 4663, "deposit": {"tx": "synthetic"}}},
         }))
         self.assertEqual(mobula, {"chain": "robinhood", "_previewSource": "mobula"})
         self.assertNotIn("_previewRelayId", mobula, "Mobula intentId 永不进入 Relay 锚")
+        bsc = A._fomo_resp_ids(json.dumps({
+            "success": True,
+            "responseObject": {"source": "mobula", "mobulaSwap": {"intentId": "97f974f-65a9cb8-ee3", "originNetworkId": 1399811149, "destinationNetworkId": 56, "deposit": {"tx": "synthetic"}}},
+        }))
+        self.assertEqual(bsc, {"chain": "bsc", "_previewSource": "mobula"})
+        self.assertNotIn("_previewRelayId", bsc)
+        for dest in (None, 999, "bad", True):
+            unknown = A._fomo_resp_ids(json.dumps({
+                "success": True,
+                "responseObject": {"source": "mobula", "mobulaSwap": {"intentId": "97f974f-65a9cb8-ee3", "destinationNetworkId": dest, "deposit": {"tx": "synthetic"}}},
+            }))
+            self.assertEqual(unknown, {"chain": None, "_previewSource": "mobula"})
         self.assertEqual(A._fomo_resp_ids(json.dumps({"responseObject": {"source": "relay", "v2Swap": {"relaySwapId": "nope"}}})), {})
 
 
@@ -7002,7 +7016,7 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.11.12-fomo-relay-ws-diag-v10.23")
+        self.assertEqual(A.ADDON_VERSION, "2026.11.14-fomo-ws-replaces-status-v10.26")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 
@@ -9477,6 +9491,547 @@ class TestFomoRelayWsDiagV1023(unittest.TestCase):
             with self.subTest(want=want):
                 self.assertEqual(A._fomo_relay_gate(payload, lg), want)
                 self.assertEqual(A._fomo_relay_success(payload, lg), want is None)
+
+
+class TestFomoStatusHttpV1024(unittest.TestCase):
+    """v10.24: F-RH success = FOMO GET /swaps/v2/status?relaySwapId=<frozen Relay id> 200 SUCCESS.
+
+    Replays the shapes proven by probe batch 1794454758474-4hemv (synthetic values): the query has
+    exactly one key relaySwapId; an OPTIONS preflight answers 204; the body is only
+    {success, message, responseObject:{status:'SUCCESS'}, statusCode} with no id/chain/hash.
+    """
+
+    RID = "0x" + "9a" * 32
+
+    def setUp(self):
+        fresh()
+
+    @staticmethod
+    def _manifest(run, rounds=1):
+        return {"version": 1, "runId": run, "rounds": rounds,
+                "legs": [{"platform": "fomo", "chain": "robinhood", "rounds": rounds}]}
+
+    @staticmethod
+    def _preview(rid, dest="omit"):
+        v2 = {"relaySwapId": rid, "relayTransaction": {"type": "SOLANA", "tx": "c3ludGhldGljLXR4"}}
+        if dest != "omit":
+            v2["destinationChainId"] = dest
+        f = FakeFlow("prod-api.fomo.family", "/swaps/v3", "POST", resp_body=json.dumps({
+            "success": True, "statusCode": 200,
+            "responseObject": {"source": "relay", "originChainType": "SOLANA", "v2Swap": v2},
+        }))
+        A.addons[0].request(f)
+        A.addons[0].response(f)
+
+    @staticmethod
+    def _status_request(rid, method="GET", query=None):
+        path = "/swaps/v2/status?" + (query if query is not None else f"relaySwapId={rid}")
+        f = FakeFlow("prod-api.fomo.family", path, method)
+        A.addons[0].request(f)
+        return f
+
+    @staticmethod
+    def _status_response(f, state="SUCCESS", code=200, raw=None):
+        f.response = FakeResp(
+            raw if raw is not None else json.dumps({
+                "success": True, "message": "synthetic-message-not-retained",
+                "responseObject": {"status": state}, "statusCode": 200,
+            }),
+            code,
+        )
+        A.addons[0].response(f)
+
+    def _poll(self, rid, **kw):
+        f = self._status_request(rid)
+        self._status_response(f, **kw)
+        return f
+
+    def _rh_leg(self, run, dest="omit", subscribe=True):
+        A.STORE.mark_open(run, manifest=self._manifest(run))
+        self._preview(self.RID, dest)
+        fomo_sign()
+        fomo_execution()
+        if subscribe:
+            fomo_subscribe(self.RID)
+        legs = [l for l in A.STORE.legs[run] if l.get("orderRequestSource") == "fomo-solana-execution"]
+        self.assertEqual(len(legs), 1)
+        return legs[0]
+
+    def test_request_and_body_parsers_follow_the_proven_shape(self):
+        rid = self.RID
+        self.assertEqual(A._fomo_status_request("prod-api.fomo.family", f"/swaps/v2/status?relaySwapId={rid.upper().replace('0X', '0x')}", "GET"), {"relayId": rid})
+        self.assertEqual(A._fomo_status_request("prod-api.fomo.family", f"/swaps/v2/status?relaySwapId={rid}", "OPTIONS"), {"preflight": True})
+        for path in (
+            f"/swaps/v2/status?relaySwapId={rid}&user=x",
+            f"/swaps/v2/status?relaySwapId={rid}&relaySwapId={rid}",
+            "/swaps/v2/status?relaySwapId=0x1234",
+            "/swaps/v2/status",
+            f"/swaps/v2/status?id={rid}",
+        ):
+            self.assertIn("invalid", A._fomo_status_request("prod-api.fomo.family", path, "GET"), path)
+        self.assertIsNone(A._fomo_status_request("prod-api.fomo.family", "/swaps/v2/fast-fill", "POST"))
+        self.assertIsNone(A._fomo_status_request("evil.example", f"/swaps/v2/status?relaySwapId={rid}", "GET"))
+        ok = json.dumps({"success": True, "message": "m", "responseObject": {"status": "SUCCESS"}, "statusCode": 200})
+        self.assertIsNone(A._fomo_status_success(200, ok))
+        cases = {
+            "http-status": (204, ""),
+            "not-json": (200, "not json"),
+            "envelope-not-success": (200, json.dumps({"success": False, "responseObject": {"status": "SUCCESS"}})),
+            "envelope-status-code": (200, json.dumps({"success": True, "statusCode": 500, "responseObject": {"status": "SUCCESS"}})),
+            "state-missing": (200, json.dumps({"success": True, "responseObject": {}})),
+            "state-not-success": (200, json.dumps({"success": True, "responseObject": {"status": "PENDING"}})),
+        }
+        for want, (code, body) in cases.items():
+            self.assertEqual(A._fomo_status_success(code, body), want)
+        self.assertEqual(A._fomo_status_success(200, json.dumps({"success": True, "responseObject": {"status": "success"}})), "state-not-success", "case as observed")
+
+    def test_positive_first_success_binds_hashless_leg_and_second_is_ignored(self):
+        run = "run-fomo-status-http"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            leg = self._rh_leg(run, dest=4663)
+            self.assertTrue(leg.get("pendingBind"))
+            pre = self._status_request(self.RID, method="OPTIONS")
+            self._status_response(pre, code=204, raw="")
+            self._poll(self.RID, state="PENDING")
+            self.assertIsNone(leg.get("tSuccessPushMs"))
+            f = self._status_request(self.RID)
+            t_req = f.metadata["speedex_fomo_status"]["tReq"]
+            self._status_response(f)
+            first = leg.get("tSuccessPushMs")
+            self.assertIsNotNone(first)
+            self.assertGreaterEqual(first, t_req)
+            self._poll(self.RID)  # second SUCCESS poll
+            self.assertEqual(leg.get("tSuccessPushMs"), first, "first observation frozen")
+            self.assertIsNone(leg.get("txHash"), "status body has no hash; no tx is invented")
+            A.STORE.mark_close(run)
+        tl = A.STORE.timeline(run, full=True)
+        out = [l for l in tl["legs"] if l.get("anchorRole") == "order"]
+        self.assertEqual(len(out), 1)
+        out = out[0]
+        self.assertEqual(out["chain"], "robinhood")
+        self.assertFalse(out["unbound"])
+        self.assertFalse(out["pendingBind"])
+        self.assertEqual(out["orderRequestSource"], "fomo-privy-sign")
+        self.assertEqual(out["orderId"], self.RID)
+        self.assertIsNone(out["txHash"])
+        self.assertAlmostEqual(out["hkL1aMs"], out["tSuccessPushMs"] - out["tOrderOutMs"], places=0)
+        self.assertEqual(out["incomplete"], "no-receipt-observed", "HK has no hash → no HK receipt; EU checks the exact tx")
+        success = out["evidence"]["success"]
+        self.assertEqual(success["channel"], "fomo-status-http")
+        self.assertEqual(success["status"], "success")
+        self.assertEqual(success["correlation"], "status-query-relaySwapId")
+        self.assertEqual(success["matchedKeys"], ["orderId"])
+        self.assertIsNone(success["txHash"])
+        self.assertEqual(success["observedAtMs"], out["tSuccessPushMs"])
+        self.assertEqual(success["frameSha"], out["evidence"]["wsFrameSha"])
+        self.assertEqual(out["evidence"]["successAnchorKeys"], ["orderId"])
+        self.assertEqual(out["evidence"]["fomoStatus"], {"fomoStatusAdopted": 1, "fomoStatusAfterSuccess": 1})
+        self.assertEqual(tl["counts"], {"requested": 1, "attempted": 1, "observed": 1, "unbound": 0})
+        self.assertEqual(A.STORE.diag.get("fomoStatusPreflight"), 1)
+        self.assertEqual(A.STORE.diag.get("fomoStatusRequest"), 3)
+        self.assertEqual(A.STORE.diag.get("fomoStatusReject.state-not-success"), 1)
+        self.assertEqual(A.STORE.diag.get("fomoStatusReject.http-status"), None, "preflight is not a status response")
+        self.assertNotIn("synthetic-message-not-retained", json.dumps({"tl": tl, "events": A.STORE.events, "diag": A.STORE.diag}))
+        # Public (non-full) timeline still hides the Relay id.
+        self.assertIsNone(A.STORE.timeline(run)["legs"][[l.get("anchorRole") for l in A.STORE.timeline(run)["legs"]].index("order")]["orderId"])
+
+    def test_preview_without_destination_chain_still_binds_by_relay_preview(self):
+        run = "run-fomo-status-nodest"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            leg = self._rh_leg(run)
+            self._poll(self.RID)
+            self.assertIsNotNone(leg.get("tSuccessPushMs"))
+            self.assertEqual(leg.get("chain"), "robinhood")
+
+    def test_rejections_keep_the_leg_without_success(self):
+        other = "0x" + "9b" * 32
+        cases = {
+            "wrong-relay-id": ("fomoStatusNoFrozenLeg", lambda self: self._poll(other)),
+            "non-success-state": ("fomoStatusReject.state-not-success", lambda self: self._poll(self.RID, state="FAILURE")),
+            "lowercase-state": ("fomoStatusReject.state-not-success", lambda self: self._poll(self.RID, state="success")),
+            "get-204": ("fomoStatusReject.http-status", lambda self: self._poll(self.RID, code=204, raw="")),
+            "non-json": ("fomoStatusReject.not-json", lambda self: self._poll(self.RID, raw="<html>")),
+            "extra-query-key": ("fomoStatusRequestInvalid", lambda self: self._status_response(
+                self._status_request(self.RID, query=f"relaySwapId={self.RID}&x=1"))),
+        }
+        for name, (diag, act) in cases.items():
+            with self.subTest(name=name), patch.object(A, "_poll_receipt", lambda *a, **k: None):
+                fresh()
+                run = "run-fomo-status-reject-" + name
+                leg = self._rh_leg(run, dest=4663)
+                act(self)
+                self.assertIsNone(leg.get("tSuccessPushMs"))
+                self.assertEqual(A.STORE.diag.get(diag), 1, diag)
+                self.assertEqual(A.STORE.diag.get("fomoStatusAdopted", 0), 0)
+                A.STORE.mark_close(run)
+                tl = A.STORE.timeline(run)
+                self.assertEqual(tl["counts"]["observed"], 0)
+
+    def test_request_before_order_anchor_is_rejected(self):
+        run = "run-fomo-status-early"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            A.STORE.mark_open(run, manifest=self._manifest(run))
+            self._preview(self.RID, 4663)
+            early = self._status_request(self.RID)  # before the execution transport
+            fomo_sign()
+            fomo_execution()
+            fomo_subscribe(self.RID)
+            leg = [l for l in A.STORE.legs[run] if l.get("orderRequestSource") == "fomo-solana-execution"][0]
+            self._status_response(early)
+            self.assertIsNone(leg.get("tSuccessPushMs"))
+            self.assertEqual(A.STORE.diag.get("fomoStatusBeforeOrder"), 1)
+            self._poll(self.RID)  # a later poll still binds
+            self.assertIsNotNone(leg.get("tSuccessPushMs"))
+
+    def test_leg_without_frozen_relay_id_never_succeeds(self):
+        run = "run-fomo-status-unfrozen"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            leg = self._rh_leg(run, dest=4663, subscribe=False)
+            self._poll(self.RID)
+            self.assertIsNone(leg.get("tSuccessPushMs"))
+            self.assertEqual(A.STORE.diag.get("fomoStatusNoFrozenLeg"), 1)
+        # A subscribe that does not equal the latest Relay preview never freezes either.
+        fresh()
+        run = "run-fomo-status-mismatch"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            A.STORE.mark_open(run, manifest=self._manifest(run))
+            self._preview(self.RID, 4663)
+            fomo_sign()
+            fomo_execution()
+            fomo_subscribe("0x" + "9c" * 32)
+            self._poll("0x" + "9c" * 32)
+            self._poll(self.RID)
+            self.assertEqual(A.STORE.diag.get("fomoStatusAdopted", 0), 0)
+            self.assertEqual(A.STORE.diag.get("fomoStatusNoFrozenLeg"), 2)
+
+    def test_chain_not_proven_means_no_success(self):
+        run = "run-fomo-status-wrong-dest"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            leg = self._rh_leg(run, dest=792703809)
+            self._poll(self.RID)
+            self.assertIsNone(leg.get("tSuccessPushMs"))
+            self.assertIsNone(leg.get("chain"))
+            self.assertEqual(A.STORE.diag.get("fomoStatusChainUnproven"), 1)
+        fresh()
+        run = "run-fomo-status-bad-dest"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            leg = self._rh_leg(run, dest="not-a-number")
+            self._poll(self.RID)
+            self.assertIsNone(leg.get("tSuccessPushMs"))
+            self.assertEqual(A.STORE.diag.get("fomoStatusChainUnproven"), 1)
+
+    def test_closed_window_and_ws_precedence(self):
+        run = "run-fomo-status-ws-first"
+        fill = "0x" + "12" * 32
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            leg = self._rh_leg(run, dest=4663)
+            fomo_status(self.RID, "success", fill)  # Relay WS success first (existing gates)
+            ws_t = leg.get("tSuccessPushMs")
+            self.assertIsNotNone(ws_t)
+            self._poll(self.RID)
+            self.assertEqual(leg.get("tSuccessPushMs"), ws_t)
+            self.assertEqual(leg["successEvidence"]["channel"], "request.status.updated")
+            self.assertEqual(A.STORE.diag.get("fomoStatusAfterSuccess"), 1)
+        fresh()
+        run = "run-fomo-status-first"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            leg = self._rh_leg(run, dest=4663)
+            self._poll(self.RID)
+            st = leg.get("tSuccessPushMs")
+            fomo_status(self.RID, "success", fill)
+            # v10.26: the status poll is a diagnostic; a fully gated Relay WS success with the
+            # fill hash replaces it (was: "earliest adopted observation wins").
+            self.assertGreaterEqual(leg.get("tSuccessPushMs"), st)
+            self.assertEqual(leg["successEvidence"]["observedAtMs"], leg.get("tSuccessPushMs"))
+            self.assertEqual(leg["successEvidence"]["channel"], "request.status.updated")
+            self.assertEqual(leg.get("txHash"), fill, "a later gated WS frame may still supply the exact hash")
+        fresh()
+        run = "run-fomo-status-closed"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            leg = self._rh_leg(run, dest=4663)
+            f = self._status_request(self.RID)
+            A.STORE.mark_close(run)
+            self._status_response(f)
+            self.assertIsNone(leg.get("tSuccessPushMs"))
+            self.assertEqual(A.STORE.diag.get("fomoStatusWindowClosed"), 1)
+
+    # ── v10.26 review fix: only the Relay WS success is a push signal; a status adoption yields to it ──
+
+    FILL = "0x" + "12" * 32
+    OTHER = "0x" + "9b" * 32
+    _SUCCESS_FIELDS = ("tSuccessPushMs", "wsSha", "successEvidence", "successAnchorKeys",
+                       "txHash", "chain", "receiptPolling", "_fomoStatus")
+
+    @classmethod
+    def _snap(cls, leg):
+        return json.loads(json.dumps({k: leg.get(k) for k in cls._SUCCESS_FIELDS}))
+
+    @staticmethod
+    def _settle(polls, n):
+        deadline = time.monotonic() + 2.0
+        while len(polls) < n and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.05)  # room for any unexpected extra poller thread
+
+    @staticmethod
+    def _ws_events(run):
+        return [e for e in A.STORE.events[run] if e.get("kind") == "ws_success"]
+
+    def _status_adopted_leg(self, run, polls):
+        leg = self._rh_leg(run, dest=4663)
+        self._poll(self.RID)
+        self.assertEqual(leg["successEvidence"]["channel"], "fomo-status-http")
+        self.assertIsNone(leg.get("txHash"))
+        self.assertEqual(polls, [])
+        return leg
+
+    def test_v1026_valid_ws_success_replaces_status_adoption(self):
+        # Reference: what the WS branch writes for a first success on an identical leg.
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            ref = self._rh_leg("run-fomo-ws-reference", dest=4663)
+            fomo_status(self.RID, "success", self.FILL)
+            ref_ev = json.loads(json.dumps(ref["successEvidence"]))
+            ref_keys = list(ref["successAnchorKeys"])
+        fresh()
+        run = "run-fomo-status-then-ws"
+        polls = []
+        with patch.object(A, "_poll_receipt", lambda *a, **k: polls.append(a[3])):
+            leg = self._status_adopted_leg(run, polls)
+            st, st_sha = leg["tSuccessPushMs"], leg["wsSha"]
+            fomo_status(self.RID, "success", self.FILL)
+            self._settle(polls, 1)
+            ws_t = leg["tSuccessPushMs"]
+            self.assertGreaterEqual(ws_t, st)
+            self.assertNotEqual(leg["wsSha"], st_sha, "wsSha is the Relay frame's, not the status body's")
+            ev = leg["successEvidence"]
+            self.assertEqual(ev["channel"], "request.status.updated")
+            self.assertEqual(ev["txHash"], self.FILL)
+            self.assertEqual(ev["observedAtMs"], ws_t)
+            self.assertEqual(ev["frameSha"], leg["wsSha"])
+            self.assertNotIn("correlation", ev, "no status evidence field survives the replacement")
+            self.assertNotIn("requestObservedAtMs", ev)
+            strip = lambda e: {k: v for k, v in e.items() if k not in ("observedAtMs", "frameSha")}
+            self.assertEqual(strip(ev), strip(ref_ev), "same evidence as a first WS success")
+            self.assertEqual(leg["successAnchorKeys"], ref_keys)
+            self.assertEqual(leg["successAnchorKeys"], ["orderId"])
+            self.assertEqual(leg["txHash"], self.FILL)
+            self.assertEqual(leg["chain"], "robinhood")
+            self.assertEqual(polls, [self.FILL], "receipt poll claimed once, with the WS fill hash")
+            self.assertEqual(leg["_fomoStatus"], {"fomoStatusAdopted": 1, "fomoStatusReplacedByWs": 1})
+            self.assertEqual(A.STORE.diag.get("fomoStatusAdopted"), 1)
+            self.assertEqual(A.STORE.run_diag[run].get("fomoStatusAdopted"), 1)
+            self.assertEqual(A.STORE.diag.get("fomoStatusReplacedByWs"), 1)
+            self.assertEqual(A.STORE.run_diag[run].get("fomoStatusReplacedByWs"), 1)
+            self.assertTrue(leg["_relayWs"]["successAdopted"])
+            self.assertEqual(A.STORE.diag.get("relayWs.successAdopted"), 1)
+            self.assertEqual(len(self._ws_events(run)), 1)
+            self.assertEqual([e["kind"] for e in A.STORE.events[run]].count("fomo_status_success"), 1)
+            # The replacing WS success is now frozen like any first WS success.
+            fomo_status(self.RID, "success", self.FILL)
+            self._poll(self.RID)
+            self._settle(polls, 2)
+            self.assertEqual(leg["tSuccessPushMs"], ws_t)
+            self.assertEqual(polls, [self.FILL])
+            self.assertEqual(len(self._ws_events(run)), 1)
+            self.assertEqual(A.STORE.diag.get("relayWs.successAdopted"), 1)
+            self.assertEqual(leg["_fomoStatus"], {
+                "fomoStatusAdopted": 1, "fomoStatusReplacedByWs": 1, "fomoStatusAfterSuccess": 1,
+            })
+            A.STORE.mark_close(run)
+        tl = A.STORE.timeline(run, full=True)
+        out = [l for l in tl["legs"] if l.get("anchorRole") == "order"]
+        self.assertEqual(len(out), 1)
+        out = out[0]
+        self.assertEqual(out["evidence"]["success"]["channel"], "request.status.updated")
+        self.assertEqual(out["evidence"]["success"]["txHash"], self.FILL)
+        self.assertEqual(out["txHash"], self.FILL)
+        self.assertEqual(out["evidence"]["successAnchorKeys"], ["orderId"])
+        self.assertEqual(out["tSuccessPushMs"], ws_t)
+        self.assertAlmostEqual(out["hkL1aMs"], out["tSuccessPushMs"] - out["tOrderOutMs"], places=0)
+        self.assertEqual(out["evidence"]["fomoStatus"], {
+            "fomoStatusAdopted": 1, "fomoStatusReplacedByWs": 1, "fomoStatusAfterSuccess": 1,
+        })
+        self.assertEqual(tl["diag"].get("fomoStatusReplacedByWs"), 1)
+        self.assertEqual(tl["counts"], {"requested": 1, "attempted": 1, "observed": 1, "unbound": 0})
+
+    def test_v1026_ws_success_without_hash_or_failing_gate_keeps_status(self):
+        cases = {
+            "no-hash": ("fill-hash-invalid", lambda: fomo_status(self.RID, "success", None)),
+            "solana-shaped-hash": ("fill-hash-invalid", lambda: fomo_status(self.RID, "success", "5" * 88)),
+            "stale-published-at": ("published-at-stale", lambda: fomo_status(self.RID, "success", self.FILL, published_at=0)),
+            "wrong-destination": ("destination-chain", lambda: fomo_status(self.RID, "success", self.FILL, destination=792703809)),
+            "not-success": ("status-not-success", lambda: fomo_status(self.RID, "pending", self.FILL)),
+        }
+        for name, (gate, act) in cases.items():
+            polls = []
+            with self.subTest(name=name), patch.object(A, "_poll_receipt", lambda *a, **k: polls.append(a[3])):
+                fresh()
+                run = "run-fomo-status-ws-gate-" + name
+                leg = self._status_adopted_leg(run, polls)
+                before = self._snap(leg)
+                act()
+                self._settle(polls, 0)
+                self.assertEqual(self._snap(leg), before)
+                self.assertEqual(leg["_relayWs"]["successGateFail"], {gate: 1}, "frame reached the WS gate and failed it")
+                self.assertEqual(polls, [])
+                self.assertEqual(self._ws_events(run), [])
+                self.assertIsNone(A.STORE.diag.get("fomoStatusReplacedByWs"))
+
+    def test_v1026_ws_success_for_other_order_keeps_status(self):
+        polls = []
+        run = "run-fomo-status-ws-other-order"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: polls.append(a[3])):
+            leg = self._status_adopted_leg(run, polls)
+            before = self._snap(leg)
+            fomo_status(self.OTHER, "success", self.FILL)
+            self._settle(polls, 0)
+            self.assertEqual(self._snap(leg), before)
+            self.assertEqual((leg.get("_relayWs") or {}).get("routed", 0), 0, "another order's frame never routes here")
+            self.assertEqual(polls, [])
+            self.assertEqual(self._ws_events(run), [])
+            self.assertIsNone(A.STORE.diag.get("fomoStatusReplacedByWs"))
+
+    def test_v1026_ws_first_then_status_still_counts_after_success(self):
+        polls = []
+        run = "run-fomo-ws-then-status"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: polls.append(a[3])):
+            leg = self._rh_leg(run, dest=4663)
+            fomo_status(self.RID, "success", self.FILL)
+            self._settle(polls, 1)
+            before = self._snap(leg)
+            self.assertEqual(before["successEvidence"]["channel"], "request.status.updated")
+            self._poll(self.RID)
+            self._settle(polls, 1)
+            after = self._snap(leg)
+            self.assertEqual(after.pop("_fomoStatus"), {"fomoStatusAfterSuccess": 1})
+            before.pop("_fomoStatus")
+            self.assertEqual(after, before)
+            self.assertEqual(A.STORE.diag.get("fomoStatusAfterSuccess"), 1)
+            self.assertIsNone(A.STORE.diag.get("fomoStatusAdopted"))
+            self.assertIsNone(A.STORE.diag.get("fomoStatusReplacedByWs"))
+            self.assertEqual(polls, [self.FILL])
+            self.assertEqual(len(self._ws_events(run)), 1)
+
+    def test_v1026_second_ws_success_never_replaces_first(self):
+        fill2 = "0x" + "34" * 32
+        for name in ("ws-first", "status-then-ws"):
+            polls = []
+            with self.subTest(name=name), patch.object(A, "_poll_receipt", lambda *a, **k: polls.append(a[3])):
+                fresh()
+                run = "run-fomo-second-ws-" + name
+                if name == "ws-first":
+                    leg = self._rh_leg(run, dest=4663)
+                else:
+                    leg = self._status_adopted_leg(run, polls)
+                fomo_status(self.RID, "success", self.FILL)
+                self._settle(polls, 1)
+                before = self._snap(leg)
+                self.assertEqual(before["successEvidence"]["channel"], "request.status.updated")
+                fomo_status(self.RID, "success", self.FILL)  # same order, same fill, later frame
+                fomo_status(self.RID, "success", fill2)  # same order, conflicting fill
+                self._settle(polls, 1)
+                self.assertEqual(self._snap(leg), before, "first WS success stays frozen")
+                self.assertEqual(A.STORE.diag.get("wsFrameLegConflict"), 1)
+                self.assertEqual(polls, [self.FILL])
+                self.assertEqual(len(self._ws_events(run)), 1)
+                self.assertEqual(A.STORE.diag.get("fomoStatusReplacedByWs"), None if name == "ws-first" else 1)
+
+    def test_v1026_swaps_rest_adoption_unchanged_by_ws_success(self):
+        """Out of scope, behaviour as before: a Relay id frozen onto a `fomo-swaps-rest` leg after
+        its adoption routes a Relay success there, and the existing leg-conflict gate rejects it."""
+        polls = []
+        run = "run-fomo-swaps-then-ws"
+        manifest = {"version": 1, "runId": run, "rounds": 1,
+                    "legs": [{"platform": "fomo", "chain": "solana", "rounds": 1}]}
+        old = fomo_swap_row({"id": "old-swap-0000-0000-0000-000000000001", "signature": "4" * 88,
+                             "createdAt": "2020-01-01T00:00:00.000Z"})
+        with patch.object(A, "_poll_receipt", lambda *a, **k: polls.append(a[3])):
+            A.STORE.mark_open(run, manifest=manifest)
+            fomo_swaps([old])
+            self._preview(self.RID, 4663)
+            fomo_sign()
+            fomo_execution()
+            fomo_swaps([old, fomo_swap_row()])
+            self._settle(polls, 1)
+            leg = [l for l in A.STORE.legs[run] if l.get("orderRequestSource") == "fomo-solana-execution"][0]
+            self.assertEqual(leg["successEvidence"]["channel"], "fomo-swaps-rest")
+            fomo_subscribe(self.RID)
+            self.assertEqual((leg.get("_anchor") or {}).get("orderId"), self.RID)
+            before = self._snap(leg)
+            fomo_status(self.RID, "success", self.FILL)
+            self._settle(polls, 1)
+            self.assertEqual(self._snap(leg), before)
+            self.assertEqual(before["successEvidence"]["channel"], "fomo-swaps-rest")
+            self.assertEqual(before["txHash"], FOMO_TEST_SIG)
+            self.assertEqual(before["chain"], "solana")
+            self.assertEqual(leg["_relayWs"].get("routed"), 1, "the frame routed to the leg")
+            self.assertEqual(A.STORE.diag.get("wsFrameLegConflict"), 1, "rejected by the existing leg-conflict gate")
+            self.assertEqual(polls, [FOMO_TEST_SIG])
+            self.assertEqual(self._ws_events(run), [])
+            self.assertIsNone(A.STORE.diag.get("fomoStatusReplacedByWs"))
+
+    def test_v1026_closed_window_or_vetoed_leg_keeps_status(self):
+        for name in ("window-closed", "anchor-veto"):
+            polls = []
+            with self.subTest(name=name), patch.object(A, "_poll_receipt", lambda *a, **k: polls.append(a[3])):
+                fresh()
+                run = "run-fomo-status-then-ws-" + name
+                leg = self._status_adopted_leg(run, polls)
+                if name == "window-closed":
+                    A.STORE.mark_close(run)
+                    self.assertTrue(leg.get("windowClosed"))
+                else:
+                    fomo_subscribe(self.OTHER)  # a second, different execution subscribe vetoes the leg
+                    self.assertTrue(leg.get("_anchorVeto"))
+                before = self._snap(leg)
+                fomo_status(self.RID, "success", self.FILL)
+                self._settle(polls, 0)
+                self.assertEqual(self._snap(leg), before)
+                self.assertEqual(before["successEvidence"]["channel"], "fomo-status-http")
+                self.assertEqual(polls, [])
+                self.assertEqual(self._ws_events(run), [])
+                self.assertIsNone(A.STORE.diag.get("fomoStatusReplacedByWs"))
+                if name == "anchor-veto":
+                    self.assertEqual(A.STORE.diag.get("wsFrameAnchorVeto"), 1)
+
+    def test_v1026_fill_hash_claimed_by_other_leg_keeps_status(self):
+        """Cross-leg dedup: a gated Relay success whose fill hash another leg of the run already
+        holds does not land the hash on this leg, so it cannot replace the status adoption."""
+        rid_b = self.OTHER
+        polls = []
+        run = "run-fomo-status-ws-claimed-hash"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: polls.append(a[3])):
+            A.STORE.mark_open(run, manifest=self._manifest(run, rounds=2))
+            self._preview(self.RID, 4663)
+            fomo_sign()
+            fomo_execution()
+            fomo_subscribe(self.RID)
+            fomo_status(self.RID, "success", self.FILL)
+            self._settle(polls, 1)
+            execs = [l for l in A.STORE.legs[run] if l.get("orderRequestSource") == "fomo-solana-execution"]
+            self.assertEqual(len(execs), 1)
+            leg_a = execs[0]
+            self.assertEqual(leg_a["txHash"], self.FILL)
+            leg_a["_fomoLastTransportMs"] -= A.FOMO_EXECUTION_FANOUT_MS + 1
+            self._preview(rid_b, 4663)
+            fomo_sign()
+            fomo_execution()
+            fomo_subscribe(rid_b)
+            execs = [l for l in A.STORE.legs[run] if l.get("orderRequestSource") == "fomo-solana-execution"]
+            self.assertEqual(len(execs), 2)
+            leg_b = execs[1]
+            self._poll(rid_b)
+            self.assertEqual(leg_b["successEvidence"]["channel"], "fomo-status-http")
+            before = self._snap(leg_b)
+            fomo_status(rid_b, "success", self.FILL)
+            self._settle(polls, 1)
+            self.assertEqual(leg_b["_relayWs"].get("routed"), 1, "the frame routed to leg B and passed the gate")
+            self.assertEqual(leg_b["_relayWs"].get("successGateFail") or {}, {})
+            self.assertEqual(self._snap(leg_b), before)
+            self.assertIsNone(leg_b.get("txHash"))
+            self.assertEqual(polls, [self.FILL], "only leg A polls the claimed hash")
+            self.assertEqual(len(self._ws_events(run)), 1)
+            self.assertIsNone(A.STORE.diag.get("fomoStatusReplacedByWs"))
 
 
 if __name__ == "__main__":
