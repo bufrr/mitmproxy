@@ -4102,14 +4102,16 @@ class TestR8StructuredAnchors(unittest.TestCase):
             "success": True,
             "responseObject": {"source": "mobula", "mobulaSwap": {"intentId": "97f974f-65a9cb8-ee3", "originNetworkId": 1399811149, "destinationNetworkId": 56, "deposit": {"tx": "synthetic"}}},
         }))
-        self.assertEqual(bsc, {"chain": "bsc", "_previewSource": "mobula"})
+        # v10.27: a schema-shaped intentId is the Mobula status binding candidate (never a Relay id);
+        # the 0x-shaped id above is not the Mobula schema and yields no candidate.
+        self.assertEqual(bsc, {"chain": "bsc", "_previewSource": "mobula", "_previewIntentId": "97f974f-65a9cb8-ee3"})
         self.assertNotIn("_previewRelayId", bsc)
         for dest in (None, 999, "bad", True):
             unknown = A._fomo_resp_ids(json.dumps({
                 "success": True,
                 "responseObject": {"source": "mobula", "mobulaSwap": {"intentId": "97f974f-65a9cb8-ee3", "destinationNetworkId": dest, "deposit": {"tx": "synthetic"}}},
             }))
-            self.assertEqual(unknown, {"chain": None, "_previewSource": "mobula"})
+            self.assertEqual(unknown, {"chain": None, "_previewSource": "mobula", "_previewIntentId": "97f974f-65a9cb8-ee3"})
         self.assertEqual(A._fomo_resp_ids(json.dumps({"responseObject": {"source": "relay", "v2Swap": {"relaySwapId": "nope"}}})), {})
 
 
@@ -7016,7 +7018,7 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.11.14-fomo-ws-replaces-status-v10.26")
+        self.assertEqual(A.ADDON_VERSION, "2026.11.14-fomo-mobula-status-v10.27")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 
@@ -10032,6 +10034,362 @@ class TestFomoStatusHttpV1024(unittest.TestCase):
             self.assertEqual(polls, [self.FILL], "only leg A polls the claimed hash")
             self.assertEqual(len(self._ws_events(run)), 1)
             self.assertIsNone(A.STORE.diag.get("fomoStatusReplacedByWs"))
+
+
+
+class TestFomoMobulaStatusV1027(unittest.TestCase):
+    """v10.27: FOMO Mobula (BSC/RH) success = the page's own toast signal, observed at HK:
+    GET prod-api.fomo.family/swaps/v3/status?provider=mobula&intentId=<preview intentId>&wait=true
+    (CORS preflight first, ~200 ms between attempts) → first HTTP 200 success:true +
+    responseObject.status "SUCCESS". hkL1aMs = Privy share order anchor → that response hook.
+    All ids are synthetic; the intent shape follows the current 7-7-3 lowercase hex schema."""
+
+    INTENT = "a1b2c3d-4e5f607-89a"
+    OTHER = "0f0f0f0-1e1e1e1-2d2"
+
+    def setUp(self):
+        fresh()
+
+    @staticmethod
+    def _manifest(run, chain="bsc", rounds=1):
+        return {"version": 1, "runId": run, "rounds": rounds,
+                "legs": [{"platform": "fomo", "chain": chain, "rounds": rounds}]}
+
+    @staticmethod
+    def _preview(intent, dest=56):
+        f = FakeFlow("prod-api.fomo.family", "/swaps/v3", "POST", resp_body=json.dumps({
+            "success": True, "statusCode": 200,
+            "responseObject": {
+                "source": "mobula", "originChainType": "SOLANA", "tradeInfo": {"provider": "SYNTHETIC"},
+                "mobulaSwap": {"intentId": intent, "originNetworkId": 1399811149,
+                               "destinationNetworkId": dest, "deposit": {"type": "SOLANA", "tx": "c3ludGhldGljLXR4"}},
+            },
+        }))
+        A.addons[0].request(f)
+        A.addons[0].response(f)
+
+    @staticmethod
+    def _status_request(intent, method="GET", query=None):
+        q = query if query is not None else f"provider=mobula&intentId={intent}&wait=true"
+        f = FakeFlow("prod-api.fomo.family", "/swaps/v3/status?" + q, method)
+        A.addons[0].request(f)
+        return f
+
+    @staticmethod
+    def _status_response(f, state="SUCCESS", code=200, raw=None, success=True):
+        f.response = FakeResp(
+            raw if raw is not None else json.dumps({
+                "success": success, "message": "synthetic-message-not-retained",
+                "responseObject": {"status": state}, "statusCode": 200,
+            }),
+            code,
+        )
+        A.addons[0].response(f)
+
+    def _poll(self, intent, hold_s=0.0, **kw):
+        f = self._status_request(intent)
+        if hold_s:
+            time.sleep(hold_s)  # wait=true: the server holds the GET before answering
+        self._status_response(f, **kw)
+        return f
+
+    def _exec_leg(self, run, dest=56, chain="bsc", sign=True):
+        A.STORE.mark_open(run, manifest=self._manifest(run, chain))
+        self._preview(self.INTENT, dest)
+        if sign:
+            fomo_sign()
+        fomo_execution()
+        legs = [l for l in A.STORE.legs[run] if l.get("orderRequestSource") == "fomo-solana-execution"]
+        self.assertEqual(len(legs), 1)
+        return legs[0]
+
+    @staticmethod
+    def _order_out(tl):
+        out = [l for l in tl["legs"] if l.get("anchorRole") == "order"]
+        assert len(out) == 1, out
+        return out[0]
+
+    def test_parsers_follow_the_page_shape(self):
+        ok = f"/swaps/v3/status?provider=mobula&intentId={self.INTENT}&wait=true"
+        self.assertEqual(A._fomo_mobula_status_request("prod-api.fomo.family", ok, "GET"),
+                         {"intentId": self.INTENT, "wait": True})
+        self.assertEqual(A._fomo_mobula_status_request("prod-api.fomo.family", ok, "OPTIONS"), {"preflight": True})
+        self.assertEqual(A._fomo_mobula_status_request("prod-api.fomo.family", ok, "POST"), {"invalid": "method"})
+        for path in (
+            f"/swaps/v3/status?provider=mobula&intentId={self.INTENT}",
+            f"/swaps/v3/status?provider=relay&intentId={self.INTENT}&wait=true",
+            f"/swaps/v3/status?provider=mobula&intentId={self.INTENT}&wait=true&x=1",
+            f"/swaps/v3/status?provider=mobula&intentId={self.INTENT}&intentId={self.INTENT}&wait=true",
+            "/swaps/v3/status?provider=mobula&intentId=0x" + "ab" * 32 + "&wait=true",
+            f"/swaps/v3/status?provider=mobula&intentId={self.INTENT.upper()}&wait=true",
+            "/swaps/v3/status",
+        ):
+            self.assertEqual(A._fomo_mobula_status_request("prod-api.fomo.family", path, "GET"), {"invalid": "query"}, path)
+        self.assertIsNone(A._fomo_mobula_status_request("evil.example", ok, "GET"))
+        self.assertIsNone(A._fomo_mobula_status_request("prod-api.fomo.family", "/swaps/v3", "POST"))
+        self.assertIsNone(A._fomo_mobula_status_request("prod-api.fomo.family", "/swaps/v2/status?relaySwapId=0x" + "9a" * 32, "GET"))
+        self.assertIsNone(A._fomo_status_request("prod-api.fomo.family", ok, "GET"), "v2 parser unchanged")
+        body = lambda state, success=True: json.dumps({"success": success, "responseObject": {"status": state}})
+        self.assertEqual(A._fomo_mobula_status_verdict(200, body("SUCCESS")), ("success", None))
+        self.assertEqual(A._fomo_mobula_status_verdict(200, body("FAILED")), ("failed", "state-failed"))
+        self.assertEqual(A._fomo_mobula_status_verdict(200, body("PENDING")), ("pending", "state-pending"))
+        self.assertEqual(A._fomo_mobula_status_verdict(200, body("success")), ("pending", "state-pending"), "case as the page checks")
+        self.assertEqual(A._fomo_mobula_status_verdict(200, body("SUCCESS", success=False)), ("reject", "envelope-not-success"))
+        self.assertEqual(A._fomo_mobula_status_verdict(204, ""), ("reject", "http-status"))
+        self.assertEqual(A._fomo_mobula_status_verdict(200, "<html>"), ("reject", "not-json"))
+        self.assertEqual(A._fomo_mobula_status_verdict(200, json.dumps({"success": True})), ("reject", "state-missing"))
+
+    def test_realistic_flow_freezes_first_success_and_pushes_order_to_success(self):
+        run = "run-fomo-mobula-status"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            leg = self._exec_leg(run)
+            self.assertTrue(leg.get("pendingBind"), "chain unknown until the Mobula success proves it")
+            pre = self._status_request(self.INTENT, method="OPTIONS")
+            self._status_response(pre, code=204, raw="")
+            self._poll(self.INTENT, hold_s=0.03, state="PENDING")
+            self._poll(self.INTENT, state="PENDING")
+            self.assertIsNone(leg.get("tSuccessPushMs"))
+            f = self._status_request(self.INTENT)
+            t_req = f.metadata["speedex_fomo_mobula_status"]["tReq"]
+            time.sleep(0.03)
+            self._status_response(f)
+            first = leg.get("tSuccessPushMs")
+            self.assertIsNotNone(first)
+            self.assertGreaterEqual(first - t_req, 25, "response hook time includes the server hold")
+            self._poll(self.INTENT)  # late duplicate SUCCESS
+            self.assertEqual(leg.get("tSuccessPushMs"), first, "first observation frozen")
+            self.assertIsNone(leg.get("txHash"))
+            A.STORE.mark_close(run)
+        tl = A.STORE.timeline(run, full=True)
+        out = self._order_out(tl)
+        self.assertEqual(out["chain"], "bsc")
+        self.assertFalse(out["unbound"])
+        self.assertFalse(out["pendingBind"])
+        self.assertEqual(out["orderRequestSource"], "fomo-privy-sign")
+        self.assertIsNone(out["orderAnchorMissing"])
+        self.assertLess(out["tOrderOutMs"], out["tExecutionTransportMs"] + 1e-9)
+        self.assertEqual(out["tSuccessPushMs"], first)
+        self.assertAlmostEqual(out["hkL1aMs"], first - out["tOrderOutMs"], places=0)
+        self.assertIsNone(out["hkL3Ms"])
+        self.assertEqual(out["incomplete"], "no-receipt-observed")
+        self.assertIsNone(out["txHash"])
+        self.assertIsNone(out["orderId"], "intentId never becomes the order/Relay anchor")
+        self.assertEqual(out["mobulaIntentId"], self.INTENT, "full=1 only: EU round-binding key")
+        self.assertIsNone(self._order_out(A.STORE.timeline(run))["mobulaIntentId"], "default timeline hides it")
+        success = out["evidence"]["success"]
+        self.assertEqual(success, {
+            "version": 1, "platform": "fomo", "channel": "fomo-mobula-status-http", "status": "success",
+            "txHash": None, "txDigest": None, "matchedKeys": ["intentId"],
+            "correlation": "status-query-intentId+preview-candidate",
+            "observedAtMs": first, "requestObservedAtMs": t_req, "frameSha": out["evidence"]["wsFrameSha"],
+        })
+        self.assertEqual(out["evidence"]["successAnchorKeys"], ["intentId"])
+        ms = out["evidence"]["fomoMobulaStatus"]
+        self.assertTrue(ms["candidate"])
+        self.assertTrue(ms["bound"])
+        self.assertIsNone(ms["bindMissing"])
+        self.assertEqual(ms["statusRequests"], 4)
+        self.assertEqual(ms["responses"], 4)
+        self.assertEqual(ms["pending"], 2)
+        self.assertEqual(ms["afterSuccess"], 1)
+        self.assertLessEqual(ms["firstRequestMs"], t_req)
+        self.assertGreaterEqual(ms["firstRequestMs"], out["tExecutionTransportMs"])
+        self.assertEqual(ms["firstSuccessResponseMs"], first)
+        self.assertEqual(ms["successRequestMs"], t_req)
+        self.assertAlmostEqual(ms["successHeldMs"], first - t_req, places=0)
+        self.assertGreaterEqual(ms["maxHeldMs"], 25)
+        self.assertIsNone(ms["failedAtMs"])
+        self.assertEqual(ms["l3MissingReason"], "mobula-status-no-fill-hash")
+        self.assertEqual(tl["counts"], {"requested": 1, "attempted": 1, "observed": 1, "unbound": 0})
+        d = A.STORE.diag
+        self.assertEqual(d.get("fomoMobulaStatusPreflight"), 1)
+        self.assertEqual(d.get("fomoMobulaStatusRequest"), 4)
+        self.assertEqual(d.get("fomoMobulaStatusBound"), 1)
+        self.assertEqual(d.get("fomoMobulaStatusRequestRouted"), 3)
+        self.assertEqual(d.get("fomoMobulaStatusPending"), 2)
+        self.assertEqual(d.get("fomoMobulaStatusAdopted"), 1)
+        self.assertEqual(d.get("fomoMobulaStatusAfterSuccess"), 1)
+        self.assertEqual(d.get("fomoMobulaPreviewIntent"), 1)
+        self.assertIsNone(d.get("fomoMobulaStatusReject.http-status"), "preflight is not a status response")
+        self.assertIsNone(d.get("fomoStatusRequest"), "v2 counters untouched")
+        kinds = [e["kind"] for e in A.STORE.events[run]]
+        self.assertEqual(kinds.count("fomo_mobula_status_success"), 1)
+        self.assertEqual(kinds.count("fomo_mobula_status_bound"), 1)
+        tl_hidden = json.loads(json.dumps(tl))
+        for l in tl_hidden["legs"]:
+            l.pop("mobulaIntentId", None)
+        dump = json.dumps({"tl": tl_hidden, "pub": A.STORE.timeline(run), "events": A.STORE.events,
+                           "diag": A.STORE.diag, "runDiag": A.STORE.run_diag}, default=str)
+        for secret in (self.INTENT, "synthetic-message-not-retained", FOMO_TEST_PRIVY_WALLET,
+                       "synthetic-share-body-not-retained", "intentId="):
+            self.assertNotIn(secret, dump)
+
+    def test_wrong_intent_is_not_bound(self):
+        run = "run-fomo-mobula-mismatch"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            leg = self._exec_leg(run)
+            self._poll(self.OTHER)
+            self.assertIsNone(leg.get("tSuccessPushMs"))
+            A.STORE.mark_close(run)
+        out = self._order_out(A.STORE.timeline(run))
+        self.assertIsNone(out["hkL1aMs"])
+        self.assertEqual(out["incomplete"], "no-success-observed")
+        ms = out["evidence"]["fomoMobulaStatus"]
+        self.assertIsNone(A.STORE.timeline(run, full=True)["legs"][[l.get("anchorRole") for l in A.STORE.timeline(run, full=True)["legs"]].index("order")]["mobulaIntentId"], "unbound legs never expose the candidate")
+        self.assertFalse(ms["bound"])
+        self.assertEqual(ms["bindMissing"], "intent-mismatch")
+        self.assertEqual(ms["intentMismatch"], 1)
+        self.assertEqual(A.STORE.diag.get("fomoMobulaStatusIntentMismatch"), 1)
+        self.assertEqual(A.STORE.diag.get("fomoMobulaStatusRespUnbound"), 1)
+        self.assertIsNone(A.STORE.diag.get("fomoMobulaStatusAdopted"))
+
+    def test_post_execution_requote_does_not_rebind(self):
+        run = "run-fomo-mobula-requote"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            leg = self._exec_leg(run)
+            self._preview(self.OTHER)  # page re-quotes after the buy
+            self._poll(self.OTHER)
+            self.assertIsNone(leg.get("tSuccessPushMs"), "latest-after-execution preview is not this leg's candidate")
+            self._poll(self.INTENT)
+            self.assertIsNotNone(leg.get("tSuccessPushMs"))
+            self.assertEqual(leg["successEvidence"]["channel"], "fomo-mobula-status-http")
+
+    def test_failed_records_failure_and_blocks_later_success(self):
+        run = "run-fomo-mobula-failed"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            leg = self._exec_leg(run)
+            self._poll(self.INTENT, state="PENDING")
+            self._poll(self.INTENT, state="FAILED")
+            self.assertIsNone(leg.get("tSuccessPushMs"))
+            self._poll(self.INTENT)
+            self.assertIsNone(leg.get("tSuccessPushMs"), "FAILED ends the page loop; no later success")
+            A.STORE.mark_close(run)
+        tl = A.STORE.timeline(run)
+        out = [l for l in tl["legs"] if l.get("orderRequestSource") == "fomo-privy-sign"][0]
+        self.assertIsNone(out["hkL1aMs"])
+        self.assertIsNone(out["evidence"]["success"])
+        self.assertEqual(out["incomplete"], "mobula-status-failed")
+        ms = out["evidence"]["fomoMobulaStatus"]
+        self.assertIsNotNone(ms["failedAtMs"])
+        self.assertGreaterEqual(ms["failedAtMs"], ms["failedRequestMs"])
+        self.assertEqual(ms["afterFailed"], 1)
+        self.assertIsNone(ms["l3MissingReason"])
+        self.assertEqual(A.STORE.diag.get("fomoMobulaStatusFailed"), 1)
+        self.assertEqual([e["kind"] for e in A.STORE.events[run]].count("fomo_mobula_status_failed"), 1)
+
+    def test_status_before_execution_is_not_bound(self):
+        run = "run-fomo-mobula-early"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            A.STORE.mark_open(run, manifest=self._manifest(run))
+            self._preview(self.INTENT)
+            fomo_sign()
+            self._poll(self.INTENT)  # before any execution transport
+            self.assertEqual(A.STORE.diag.get("fomoMobulaStatusNoExecutionLeg"), 1)
+            fomo_execution()
+            leg = [l for l in A.STORE.legs[run] if l.get("orderRequestSource") == "fomo-solana-execution"][0]
+            self.assertIsNone(leg.get("tSuccessPushMs"), "an earlier SUCCESS response is never replayed")
+            self.assertFalse(leg["_fomoMobula"]["bound"])
+            self._poll(self.INTENT)  # first GET after the transport binds
+            self.assertTrue(leg["_fomoMobula"]["bound"])
+            self.assertIsNotNone(leg.get("tSuccessPushMs"))
+            self.assertGreaterEqual(leg["_fomoMobula"]["firstRequestMs"], leg["tOrderOutMs"])
+
+    def test_missing_order_anchor_keeps_push_missing(self):
+        run = "run-fomo-mobula-nosign"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            leg = self._exec_leg(run, sign=False)
+            self._poll(self.INTENT)
+            self.assertIsNotNone(leg.get("tSuccessPushMs"))
+            A.STORE.mark_close(run)
+        out = self._order_out(A.STORE.timeline(run))
+        self.assertEqual(out["orderRequestSource"], "fomo-solana-execution")
+        self.assertEqual(out["orderAnchorMissing"], "fomo-sign-request-missing")
+        self.assertIsNone(out["hkL1aMs"], "never falls back to the execution transport")
+
+    def test_unproven_chain_is_not_adopted(self):
+        run = "run-fomo-mobula-chain"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            leg = self._exec_leg(run, dest=999)
+            self._poll(self.INTENT)
+            self.assertIsNone(leg.get("tSuccessPushMs"))
+            self.assertEqual(A.STORE.diag.get("fomoMobulaStatusChainUnproven"), 1)
+            self.assertEqual(leg["_fomoMobula"]["chainUnproven"], 1)
+
+    def test_robinhood_destination_binds_robinhood_slot(self):
+        run = "run-fomo-mobula-rh"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            leg = self._exec_leg(run, dest=4663, chain="robinhood")
+            self._poll(self.INTENT)
+            A.STORE.mark_close(run)
+        out = self._order_out(A.STORE.timeline(run))
+        self.assertEqual(out["chain"], "robinhood")
+        self.assertFalse(out["unbound"])
+        self.assertIsNotNone(out["hkL1aMs"])
+
+    def test_two_executions_with_the_same_candidate_are_ambiguous(self):
+        run = "run-fomo-mobula-ambiguous"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            A.STORE.mark_open(run, manifest=self._manifest(run, rounds=2))
+            self._preview(self.INTENT)
+            fomo_sign()
+            fomo_execution()
+            first = [l for l in A.STORE.legs[run] if l.get("orderRequestSource") == "fomo-solana-execution"][0]
+            first["_fomoLastTransportMs"] -= A.FOMO_EXECUTION_FANOUT_MS + 1
+            fomo_sign()
+            fomo_execution()
+            execs = [l for l in A.STORE.legs[run] if l.get("orderRequestSource") == "fomo-solana-execution"]
+            self.assertEqual(len(execs), 2)
+            self._poll(self.INTENT)
+            for leg in execs:
+                self.assertFalse(leg["_fomoMobula"]["bound"])
+                self.assertEqual(leg["_fomoMobula"]["bindMissing"], "ambiguous-execution-candidate")
+                self.assertIsNone(leg.get("tSuccessPushMs"))
+            self.assertEqual(A.STORE.diag.get("fomoMobulaStatusAmbiguousLeg"), 1)
+
+    def test_bound_mobula_leg_is_not_an_fsol_swaps_candidate(self):
+        run = "run-fomo-mobula-swaps"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            leg = self._exec_leg(run)
+            self._poll(self.INTENT, state="PENDING")
+            fomo_swaps([fomo_swap_row()])  # Solana swaps poll without a pre-execution baseline
+            self.assertIsNone(leg.get("incomplete"))
+            self._poll(self.INTENT)
+            self.assertEqual(leg["successEvidence"]["channel"], "fomo-mobula-status-http")
+
+    def test_relay_path_and_v2_status_unchanged(self):
+        rid = "0x" + "9a" * 32
+        run = "run-fomo-relay-unchanged"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            A.STORE.mark_open(run, manifest=self._manifest(run, chain="robinhood"))
+            TestFomoStatusHttpV1024._preview(rid, 4663)
+            fomo_sign()
+            fomo_execution()
+            fomo_subscribe(rid)
+            leg = [l for l in A.STORE.legs[run] if l.get("orderRequestSource") == "fomo-solana-execution"][0]
+            self._poll(self.INTENT)  # a Mobula poll never touches a Relay-frozen leg
+            self.assertIsNone(leg.get("tSuccessPushMs"))
+            self.assertEqual(A.STORE.diag.get("fomoMobulaStatusNoExecutionLeg"), 1)
+            f = TestFomoStatusHttpV1024._status_request(rid)
+            TestFomoStatusHttpV1024._status_response(f)
+            self.assertEqual(leg["successEvidence"]["channel"], "fomo-status-http")
+            A.STORE.mark_close(run)
+        out = self._order_out(A.STORE.timeline(run))
+        self.assertNotIn("fomoMobulaStatus", out["evidence"])
+        self.assertEqual(out["evidence"]["success"]["correlation"], "status-query-relaySwapId")
+
+    def test_closed_window_and_invalid_shapes_are_counted_only(self):
+        run = "run-fomo-mobula-closed"
+        with patch.object(A, "_poll_receipt", lambda *a, **k: None):
+            leg = self._exec_leg(run)
+            bad = self._status_request(self.INTENT, query=f"provider=mobula&intentId={self.INTENT}")
+            self._status_response(bad)
+            self.assertEqual(A.STORE.diag.get("fomoMobulaStatusRequestInvalid"), 1)
+            self.assertIsNone(leg.get("tSuccessPushMs"))
+            f = self._status_request(self.INTENT)
+            A.STORE.mark_close(run)
+            self._status_response(f)
+            self.assertIsNone(leg.get("tSuccessPushMs"), "late response after close is discarded")
+            self.assertEqual(A.STORE.diag.get("fomoMobulaStatusWindowClosed"), 1)
 
 
 if __name__ == "__main__":

@@ -71,3 +71,33 @@ HTTP 200 且无 error，result 为完整 EVM hash；Sol 回应为完整 base58 s
 保留至公开 DTO 与块距说明/导出；旧记录缺失不回填。签名正文、query 和认证头不持久化。
 发布时按 speedex 的受信节点注册表，仅在已授权实验实例追加下方 overlay 主机；生产模板仍默认关闭。
 参考 speedex 主仓 `docs/hk-operations.md`；健康、无资金兼容检查与新资金样本验收分别记录。
+
+## 2026.11.14-fomo-mobula-status-v10.27
+
+FOMO Mobula 路由（BSC/Robinhood）的 HK 成功信号 = 页面自有 toast 条件：
+`GET prod-api.fomo.family/swaps/v3/status?provider=mobula&intentId=<id>&wait=true`（先 CORS 预检）的首个
+HTTP 200 + `success===true` + `responseObject.status==="SUCCESS"` 响应，时刻取响应 hook 入口（HK monotonic）。
+query 键集合必须恰为 `{provider=mobula,intentId,wait}` 且 intentId 为当前 7-7-3 小写 hex 形状，否则只计
+`fomoMobulaStatusRequestInvalid`（OPTIONS 计 `fomoMobulaStatusPreflight`）。
+
+- 候选：带合法 `mobulaSwap.intentId` 的 Mobula preview 更新 run 级 Mobula 候选（Relay 候选不变）；执行腿建立时取
+  transport 及之前最新的候选（成交后的再报价不改绑）。
+- 绑定（请求 hook）：transport 之后首个 intentId 等于腿候选的 GET 绑定该腿，之后同 id 轮询归该腿计数。无合格执行腿、
+  无候选、id 不等、多腿同候选、id 已被他腿绑定 → 不绑定，分别计 `fomoMobulaStatusNoExecutionLeg|NoCandidate|IntentMismatch|AmbiguousLeg`，
+  腿上 `bindMissing` 写 `intent-mismatch|ambiguous-execution-candidate|intent-already-bound|status-request-not-observed`。
+- 成功（响应 hook）：绑定腿首个 SUCCESS 冻结 `tSuccessPushMs`，`successEvidence={version:1, platform:"fomo",
+  channel:"fomo-mobula-status-http", status:"success", txHash:null, txDigest:null, matchedKeys:["intentId"],
+  correlation:"status-query-intentId+preview-candidate", observedAtMs, requestObservedAtMs, frameSha}`；链取候选 preview 的
+  `destinationNetworkId`（56→bsc、4663→robinhood，否则 `fomoMobulaStatusChainUnproven` 不采纳），pendingBind 腿随之补绑槽。
+  `FAILED` 记失败证据（`incomplete=mobula-status-failed`、事件 `fomo_mobula_status_failed`），之后 SUCCESS 只计 `AfterFailed`。
+- 推送值：`hkL1aMs = tSuccessPushMs − Privy share order 锚`（与其它 FOMO 执行腿同一锚规则；缺锚 → null，不回退 transport）。
+- 每腿私有 `evidence.fomoMobulaStatus`：`statusRequests/responses/pending/firstRequestMs/firstSuccessResponseMs/successRequestMs/
+  successHeldMs/maxHeldMs/failedAtMs/failedRequestMs/bindMissing/l3MissingReason`（时刻同 tOrderOutMs 钟域；heldMs = 同 flow
+  响应 hook − 请求 hook，含 wait=true 服务端持有与 HK↔FOMO 往返）。
+- HK-L3′：status body 无 fill hash，不起 receipt，`l3MissingReason="mobula-status-no-fill-hash"`。补齐需要在成功后对
+  目的链 Mobula fill 合约做 intent 事件 log 扫描（同 speedex `matchMobulaFillIntent` 规则），本版未实现。
+- 被 Mobula status 绑定的腿不再是 F-SOL swaps 候选。intentId 不进事件/日志/计数键/默认 timeline；仅 `full=1` timeline 的已绑定腿带
+  `mobulaIntentId`（与 `orderId` 同暴露级，供 EU 授权轮回配；公开投影未登记即丢弃）。
+
+跨仓：speedex `resolvePushForRun` 目前只认 Relay WS 为 FOMO 推送（`fomo-http-poll-not-push`），新通道要出推送必须同步改
+EU 消费侧（hk-timing-client / public-projector / docs/hk-proxy-timing.md）。

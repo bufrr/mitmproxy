@@ -88,6 +88,10 @@ fomo.md + tests/classify-ws.test.mjs 等夹具——改规则同步改本注释�
           绝不作 Relay requestId。F-SOL 成功 = 页面 GET swaps 响应中同 user/mint
           基线之外恰一条新同链记录，record.signature 给 exact tx + Sol receipt；
           缺执行前基线、错 mint、陈旧 createdAt、多记录/多执行候选均不采纳。
+          Mobula（v10.27）成功 = 页面 GET /swaps/v3/status?provider=mobula&intentId=&wait=true
+          的首个 200 + success===true + responseObject.status=="SUCCESS" 响应（响应 hook 入口）；
+          intentId 须等于执行腿 transport 前最新 Mobula preview 的 mobulaSwap.intentId，
+          且为 transport 后首个同 id GET 绑定；FAILED 只记失败；无 fill hash → 无 HK receipt。
 
 成功判定统一锚纪律：成功状态/hash/id 必须与「请求/响应建立的
 独立锚」（leg._anchor：响应抽取 id、binance 请求体 clientOrderId、fomo 页面出站
@@ -297,7 +301,23 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # tSuccessPushMs/wsSha/successEvidence/successAnchorKeys（receipt 轮询、事件、successAdopted 各一次）；
 # 计 fomoStatusReplacedByWs，fomoStatusAdopted 保留。其余已采纳成功（Relay WS、fomo-swaps-rest、其它平台）
 # 仍首个冻结；status 后到仍只计 fomoStatusAfterSuccess。无 status 采纳的腿门限不变。
-ADDON_VERSION = "2026.11.14-fomo-ws-replaces-status-v10.26"
+# v10.27（2026-11-14，owner 决定：FOMO 与 OKX/GMGN 同口径 = HK order 请求 → 平台成功信号）：Mobula 路由
+# （BSC/RH）页面成功信号 = `GET prod-api.fomo.family/swaps/v3/status?provider=mobula&intentId=<id>&wait=true`
+# 的首个 HTTP 200 + success===true + responseObject.status=="SUCCESS" 响应（FAILED 也终止页面轮询）。
+# query 键集合恰为 {provider=mobula,intentId,wait}、intentId 为当前 7-7-3 小写 hex 形状，否则只计数
+# （fomoMobulaStatusRequestInvalid；OPTIONS 计 fomoMobulaStatusPreflight）。Mobula preview 的 mobulaSwap.intentId
+# 是 Mobula 候选（只由带合法 intentId 的 Mobula preview 更新，Relay 候选不变）；执行腿建立时取该 transport
+# 及之前最新的候选。请求 hook：transport 之后首个 intentId 与腿候选相等的 GET 绑定该腿（之后同 id 轮询归该腿计数）；
+# 尚无合格执行腿（NoExecutionLeg）/无候选/不等/多腿同候选/id 已被他腿绑定 → 不绑定并计原因。响应 hook 入口冻结时刻：绑定腿的首个
+# SUCCESS 冻结为腿成功，channel="fomo-mobula-status-http"、correlation="status-query-intentId+preview-candidate"、
+# matchedKeys=["intentId"]、txHash/txDigest null；链 = 候选 preview 的 destinationNetworkId（robinhood/bsc，
+# 否则 fomoMobulaStatusChainUnproven 不采纳）。FAILED 记失败证据（incomplete=mobula-status-failed），之后 SUCCESS
+# 不采纳。腿 evidence.fomoMobulaStatus 记请求数、首请求、首 SUCCESS 响应、该请求的服务端持有时长（同 flow 响应−请求）
+# 与 maxHeldMs，HK monotonic ms。hkL1aMs = Privy share order 锚 → 该成功（既有锚规则，缺锚即 null）。body 无 fill
+# hash → 不起 receipt，L3′ 缺失 l3MissingReason="mobula-status-no-fill-hash"。intentId 不入事件/日志/默认 timeline；
+# 仅 full=1 timeline 的已绑定腿带 mobulaIntentId（与 orderId 同暴露级，EU 授权轮回配键）。
+# 绑定 Mobula 的腿不再是 F-SOL swaps 候选。OKX/GMGN/Relay/v2 status/Solana 其余行为与 allow_hosts 不变。
+ADDON_VERSION = "2026.11.14-fomo-mobula-status-v10.27"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -1276,15 +1296,18 @@ def _fomo_resp_ids(text):
     if source == "mobula" and isinstance(ro.get("mobulaSwap"), dict):
         # Mobula chain identity comes only from its schema-known destinationNetworkId. The shared
         # Solana origin never proves RH/BSC, and intentId never becomes a Relay/order anchor.
+        # v10.27: a schema-shaped intentId is kept only as the Mobula status binding candidate.
+        intent = ro["mobulaSwap"].get("intentId")
+        extra = {"_previewIntentId": intent} if isinstance(intent, str) and _MOBULA_INTENT_RE.fullmatch(intent) else {}
         dest = ro["mobulaSwap"].get("destinationNetworkId")
         if isinstance(dest, bool):
-            return {"chain": None, "_previewSource": "mobula"}
+            return {"chain": None, "_previewSource": "mobula", **extra}
         try:
             dest = int(dest)
         except (TypeError, ValueError):
-            return {"chain": None, "_previewSource": "mobula"}
+            return {"chain": None, "_previewSource": "mobula", **extra}
         chain = "robinhood" if dest == 4663 else "bsc" if dest == 56 else None
-        return {"chain": chain, "_previewSource": "mobula"}
+        return {"chain": chain, "_previewSource": "mobula", **extra}
     return {}
 
 
@@ -1475,6 +1498,63 @@ def _fomo_status_success(code, text):
     if ro["status"] != "SUCCESS":
         return "state-not-success"
     return None
+
+
+# v10.27 Mobula intent id: current schema = 7-7-3 lowercase hex segments (docs/fomo.md §Mobula).
+_MOBULA_INTENT_RE = re.compile(r"[0-9a-f]{7}-[0-9a-f]{7}-[0-9a-f]{3}")
+FOMO_MOBULA_STATUS_PATH = "/swaps/v3/status"
+
+
+def _fomo_mobula_status_request(host, raw_path, method):
+    """v10.27 FOMO Mobula `/swaps/v3/status` request: {"preflight"} | {"intentId"} | {"invalid"} | None.
+
+    The page polls GET ?provider=mobula&intentId=<id>&wait=true (CORS preflight first). Only the
+    exact key set {provider=mobula, intentId, wait} with one value each and a schema-shaped intent
+    id is correlated; every other shape is counted, never used. Nothing else is read or retained.
+    """
+    if host != "prod-api.fomo.family":
+        return None
+    try:
+        u = urllib.parse.urlsplit(raw_path or "")
+    except Exception:
+        return None
+    if u.path.rstrip("/") != FOMO_MOBULA_STATUS_PATH:
+        return None
+    m = str(method or "").upper()
+    if m == "OPTIONS":
+        return {"preflight": True}
+    if m != "GET":
+        return {"invalid": "method"}
+    try:
+        query = urllib.parse.parse_qs(u.query, keep_blank_values=True)
+    except Exception:
+        return {"invalid": "query"}
+    if set(query) != {"provider", "intentId", "wait"} or any(len(v) != 1 for v in query.values()):
+        return {"invalid": "query"}
+    if query["provider"][0] != "mobula" or not _MOBULA_INTENT_RE.fullmatch(query["intentId"][0]):
+        return {"invalid": "query"}
+    return {"intentId": query["intentId"][0], "wait": query["wait"][0] == "true"}
+
+
+def _fomo_mobula_status_verdict(code, text):
+    """("success"|"failed"|"pending"|"reject", label). The page's toast condition is exactly
+    HTTP 200 + success === true + responseObject.status === "SUCCESS"; "FAILED" ends its loop."""
+    if code != 200:
+        return "reject", "http-status"
+    j = _j(text)
+    if not isinstance(j, dict):
+        return "reject", "not-json"
+    ro = j.get("responseObject")
+    if not isinstance(ro, dict) or not isinstance(ro.get("status"), str):
+        return "reject", "state-missing"
+    state = ro["status"]
+    if state == "FAILED":
+        return "failed", "state-failed"
+    if state == "SUCCESS":
+        if j.get("success") is not True:
+            return "reject", "envelope-not-success"
+        return "success", None
+    return "pending", "state-pending"
 
 
 def _fomo_created_ms(value):
@@ -3055,6 +3135,9 @@ class Store:
         # pre-execution swaps snapshots keyed by run/epoch/account-digest/mint.
         # Values contain only schema-known IDs/metadata, never URLs, headers or bodies.
         self.fomo_previews = {}
+        # v10.27: latest Mobula v3 preview per run {intentId, chain, observedMs}; internal binding
+        # candidate only (never serialized into events/timeline).
+        self.fomo_mobula_previews = {}
         self.fomo_swaps = {}
         # FOMO Privy share requests per run: hook time/wall/head snapshots only (no path id, body or header).
         self.fomo_signs = {}
@@ -3080,6 +3163,7 @@ class Store:
             if leg.get("runId") == run_id:
                 del self.open_legs[p]
         self.fomo_previews.pop(run_id, None)
+        self.fomo_mobula_previews.pop(run_id, None)
         self.fomo_signs.pop(run_id, None)
         for key in list(self.fomo_swaps):
             if key[0] == run_id:
@@ -3831,6 +3915,14 @@ class Store:
                     self.run_diag[rid]["fomoSignAnchorMissing"] += 1
                 else:
                     leg["_fomoSign"] = sign["request"]
+            if platform == "fomo" and ev.get("orderRequestSource") == "fomo-solana-execution":
+                # v10.27: the Mobula candidate is the latest Mobula preview response observed at or
+                # before this execution transport; later re-quotes cannot rebind this leg.
+                # Legs without a candidate keep their pre-v10.27 shape (no fomoMobulaStatus block).
+                cand = self.fomo_mobula_previews.get(rid)
+                if cand and cand["observedMs"] <= ev["t"]:
+                    leg["_fomoMobulaIntent"] = dict(cand)
+                    leg["_fomoMobula"] = {"candidate": True, "bound": False}
             return rid, leg
 
     def note_fomo_sign(self, window, ev):
@@ -3885,6 +3977,9 @@ class Store:
     def note_fomo_preview(self, leg, ids, observed_ms):
         """Latest valid v3 response is only an unfrozen candidate (even after execution)."""
         source = ids.get("_previewSource")
+        if source == "mobula":
+            self._note_fomo_mobula_preview(leg, ids, observed_ms)
+            return
         # Match the EU candidate lifecycle: only an actual v2Swap.relaySwapId updates
         # the unfrozen candidate. Solana/Mobula/intent-only previews never clear or replace it.
         if source != "relay" or not ids.get("_previewRelayId"):
@@ -3898,6 +3993,25 @@ class Store:
                 "relayId": ids.get("_previewRelayId"),
                 "chain": ids.get("chain"),
                 "destChainId": ids.get("_previewDestChainId"),
+                "observedMs": observed_ms,
+            }
+
+    def _note_fomo_mobula_preview(self, leg, ids, observed_ms):
+        """v10.27: only a Mobula preview with a schema-shaped intentId updates the Mobula candidate
+        (the Relay candidate is untouched, as before). Malformed/missing ids are counted."""
+        with self.lock:
+            rid = leg.get("runId")
+            if leg.get("windowClosed") or leg.get("anchorRole") != "preview":
+                return
+            if not ids.get("_previewIntentId"):
+                self.diag["fomoMobulaPreviewIntentInvalid"] += 1
+                self.run_diag[rid]["fomoMobulaPreviewIntentInvalid"] += 1
+                return
+            self.diag["fomoMobulaPreviewIntent"] += 1
+            self.run_diag[rid]["fomoMobulaPreviewIntent"] += 1
+            self.fomo_mobula_previews[rid] = {
+                "intentId": ids["_previewIntentId"],
+                "chain": ids.get("chain"),
                 "observedMs": observed_ms,
             }
 
@@ -3997,6 +4111,8 @@ class Store:
                 # v10.23：已由 Relay subscribe 冻结（orderId 锚）的 RH 执行腿走 Relay 成功门，
                 # 不是 F-SOL swaps 候选——此前会被误标 swaps-baseline-missing 或挤成 ambiguous。
                 and not leg.get("_fomoRelayFrozen")
+                # v10.27: a leg bound to a Mobula status poll is a proven Mobula (RH/BSC) order.
+                and not (leg.get("_fomoMobula") or {}).get("bound")
                 and (leg.get("_anchor") or {}).get("orderId") is None
                 and isinstance(leg.get("tOrderOutMs"), (int, float))
                 and leg["tOrderOutMs"] <= t_obs
@@ -4172,6 +4288,206 @@ class Store:
                 "t": t_obs,
                 "tw": _wall_iso(),
                 "kind": "fomo_status_success",
+                "platform": "fomo",
+                "host": "prod-api.fomo.family",
+                "sha": body_sha,
+            })
+            return leg
+
+    def _fomo_mobula_diag_locked(self, rid, key, leg=None, leg_key=None):
+        self.diag[key] += 1
+        if rid:
+            self.run_diag[rid][key] += 1
+        if leg is not None and leg_key:
+            st = leg.setdefault("_fomoMobula", {})
+            st[leg_key] = st.get(leg_key, 0) + 1
+
+    @staticmethod
+    def _fomo_mobula_leg_open(leg):
+        return (
+            leg.get("platform") == "fomo"
+            and leg.get("orderRequestSource") == "fomo-solana-execution"
+            and leg.get("anchorRole") == "order"
+            and not leg.get("windowClosed")
+            and not leg.get("_anchorVeto")
+            and not leg.get("dup")
+            and not leg.get("_fomoRelayFrozen")
+            and (leg.get("_anchor") or {}).get("orderId") is None
+        )
+
+    def bind_fomo_mobula_status(self, window, intent_id, t_req):
+        """v10.27 request hook: route one Mobula `/swaps/v3/status` GET to its execution leg.
+
+        A leg already bound to this intentId takes every later poll (counted). Otherwise the
+        first GET at/after an open execution leg's transport whose intentId equals that leg's
+        candidate (latest Mobula preview observed at/before the transport) binds the leg.
+        No execution leg yet / mismatch / several matching legs / intent already bound →
+        not bound, counted with a reason. Returns the leg or None; the id is never logged.
+        """
+        rid, epoch = window
+        with self.lock:
+            mark = self.marks.get(rid)
+            if not mark or mark.get("closed") is not None or mark.get("epoch") != epoch:
+                self._fomo_mobula_diag_locked(None, "fomoMobulaStatusWindowClosed")
+                return None
+            legs = self.legs.get(rid, [])
+            bound = [
+                leg for leg in legs
+                if (leg.get("_fomoMobula") or {}).get("bound")
+                and (leg.get("_fomoMobulaIntent") or {}).get("intentId") == intent_id
+            ]
+            if bound:
+                leg = bound[0]
+                if leg.get("windowClosed"):
+                    self._fomo_mobula_diag_locked(rid, "fomoMobulaStatusLegIneligible")
+                    return None
+                st = leg["_fomoMobula"]
+                st["statusRequests"] = st.get("statusRequests", 0) + 1
+                # A later execution whose candidate is the same, already bound intent cannot bind.
+                for other in legs:
+                    if (
+                        other is not leg
+                        and not (other.get("_fomoMobula") or {}).get("bound")
+                        and (other.get("_fomoMobulaIntent") or {}).get("intentId") == intent_id
+                        and isinstance(other.get("tOrderOutMs"), (int, float))
+                        and other["tOrderOutMs"] <= t_req
+                    ):
+                        other["_fomoMobula"]["bindMissing"] = "intent-already-bound"
+                self._fomo_mobula_diag_locked(rid, "fomoMobulaStatusRequestRouted")
+                return leg
+            execs = [
+                leg for leg in legs
+                if self._fomo_mobula_leg_open(leg)
+                and isinstance(leg.get("tOrderOutMs"), (int, float))
+                and leg["tOrderOutMs"] <= t_req
+            ]
+            if not execs:
+                self._fomo_mobula_diag_locked(rid, "fomoMobulaStatusNoExecutionLeg")
+                return None
+            candidates = [
+                leg for leg in execs
+                if leg.get("_fomoMobulaIntent") and not leg["_fomoMobula"].get("bound")
+            ]
+            if not candidates:
+                self._fomo_mobula_diag_locked(rid, "fomoMobulaStatusNoCandidate")
+                return None
+            hits = [leg for leg in candidates if leg["_fomoMobulaIntent"]["intentId"] == intent_id]
+            if not hits:
+                one = candidates[0] if len(candidates) == 1 else None
+                self._fomo_mobula_diag_locked(rid, "fomoMobulaStatusIntentMismatch", one, "intentMismatch")
+                return None
+            if len(hits) > 1:
+                for leg in hits:
+                    leg["_fomoMobula"]["bindMissing"] = "ambiguous-execution-candidate"
+                self._fomo_mobula_diag_locked(rid, "fomoMobulaStatusAmbiguousLeg")
+                return None
+            leg = hits[0]
+            if leg.get("incomplete") or leg.get("tSuccessPushMs") is not None:
+                self._fomo_mobula_diag_locked(rid, "fomoMobulaStatusLegIneligible", leg, "ineligible")
+                return None
+            st = leg["_fomoMobula"]
+            st["bound"] = True
+            st.pop("bindMissing", None)
+            st["statusRequests"] = 1
+            st["firstRequestMs"] = t_req
+            self._fomo_mobula_diag_locked(rid, "fomoMobulaStatusBound")
+            self._add_event_locked(rid, {
+                "t": t_req,
+                "tw": _wall_iso(),
+                "kind": "fomo_mobula_status_bound",
+                "platform": "fomo",
+                "host": "prod-api.fomo.family",
+            })
+            return leg
+
+    def observe_fomo_mobula_status(self, window, leg, t_req, t_obs, verdict, label, body_sha):
+        """v10.27 response hook (t_obs frozen at hook entry) for a GET bound to `leg`.
+
+        The FIRST HTTP 200 + success===true + responseObject.status=="SUCCESS" response is the
+        leg's platform success (channel fomo-mobula-status-http). "FAILED" is recorded as failure
+        evidence and ends the leg's status success path. Per leg: response count, pending count,
+        max/success server hold (response − request of the same flow, HK monotonic ms).
+        Chain proof = the bound candidate preview's destinationNetworkId (robinhood/bsc).
+        """
+        rid, epoch = window
+        with self.lock:
+            mark = self.marks.get(rid)
+            if (
+                not mark or mark.get("closed") is not None or mark.get("epoch") != epoch
+                or leg.get("windowClosed")
+            ):
+                self._fomo_mobula_diag_locked(None, "fomoMobulaStatusWindowClosed")
+                return None
+            st = leg.setdefault("_fomoMobula", {})
+            held = round(t_obs - t_req, 1)
+            st["responses"] = st.get("responses", 0) + 1
+            if st.get("maxHeldMs") is None or held > st["maxHeldMs"]:
+                st["maxHeldMs"] = held
+            if verdict == "reject":
+                self._fomo_mobula_diag_locked(rid, "fomoMobulaStatusReject." + label, leg, "rejected")
+                return None
+            if verdict == "pending":
+                self._fomo_mobula_diag_locked(rid, "fomoMobulaStatusPending", leg, "pending")
+                return None
+            if leg.get("tSuccessPushMs") is not None:
+                self._fomo_mobula_diag_locked(rid, "fomoMobulaStatusAfterSuccess", leg, "afterSuccess")
+                return None
+            if st.get("failedAtMs") is not None:
+                self._fomo_mobula_diag_locked(rid, "fomoMobulaStatusAfterFailed", leg, "afterFailed")
+                return None
+            if verdict == "failed":
+                st["failedAtMs"] = t_obs
+                st["failedRequestMs"] = t_req
+                leg["incomplete"] = leg.get("incomplete") or "mobula-status-failed"
+                self._fomo_mobula_diag_locked(rid, "fomoMobulaStatusFailed")
+                self._add_event_locked(rid, {
+                    "t": t_obs,
+                    "tw": _wall_iso(),
+                    "kind": "fomo_mobula_status_failed",
+                    "platform": "fomo",
+                    "host": "prod-api.fomo.family",
+                    "sha": body_sha,
+                })
+                return None
+            if leg.get("_anchorVeto") or leg.get("dup") or leg.get("incomplete"):
+                self._fomo_mobula_diag_locked(rid, "fomoMobulaStatusLegIneligible", leg, "ineligible")
+                return None
+            t_exec = leg.get("tOrderOutMs")
+            if not isinstance(t_exec, (int, float)) or t_req < t_exec or t_obs < t_exec:
+                self._fomo_mobula_diag_locked(rid, "fomoMobulaStatusBeforeExecution", leg, "beforeExecution")
+                return None
+            chain = (leg.get("_fomoMobulaIntent") or {}).get("chain")
+            if chain not in ("robinhood", "bsc") or leg.get("chain") not in (None, chain):
+                self._fomo_mobula_diag_locked(rid, "fomoMobulaStatusChainUnproven", leg, "chainUnproven")
+                return None
+            leg["chain"] = chain
+            leg["tSuccessPushMs"] = t_obs
+            leg["wsSha"] = body_sha
+            leg["successAnchorKeys"] = ["intentId"]
+            leg["successEvidence"] = {
+                "version": 1,
+                "platform": "fomo",
+                "channel": "fomo-mobula-status-http",
+                "status": "success",
+                "txHash": None,
+                "txDigest": None,
+                "matchedKeys": ["intentId"],
+                "correlation": "status-query-intentId+preview-candidate",
+                "observedAtMs": t_obs,
+                "requestObservedAtMs": t_req,
+                "frameSha": body_sha,
+            }
+            st["firstSuccessResponseMs"] = t_obs
+            st["successRequestMs"] = t_req
+            st["successHeldMs"] = held
+            if leg.get("pendingBind"):
+                leg["pendingBind"] = False
+                self._promote_leg_locked(leg)
+            self._fomo_mobula_diag_locked(rid, "fomoMobulaStatusAdopted")
+            self._add_event_locked(rid, {
+                "t": t_obs,
+                "tw": _wall_iso(),
+                "kind": "fomo_mobula_status_success",
                 "platform": "fomo",
                 "host": "prod-api.fomo.family",
                 "sha": body_sha,
@@ -4747,6 +5063,13 @@ class Store:
                     "clientOrderId": (
                         (x.get("_anchor") or {}).get("clientOrderId") if full else None
                     ),
+                    # v10.27 full=1 only (same exposure as orderId): the Mobula intentId a status poll
+                    # bound this leg with — the EU round-binding key (run.mobulaIntentId); never an
+                    # order/Relay anchor, never in the default/public timeline, events or logs.
+                    "mobulaIntentId": (
+                        (x.get("_fomoMobulaIntent") or {}).get("intentId")
+                        if full and (x.get("_fomoMobula") or {}).get("bound") else None
+                    ),
                     "evidence": {
                         "orderFlowId": x.get("orderFlowId"),
                         "wsFrameSha": x.get("wsSha"),
@@ -4770,6 +5093,8 @@ class Store:
                         }} if x.get("_relayWs") else {}),
                         # v10.24: per-leg /swaps/v2/status correlation counters (private raw; not in the public DTO)
                         **({"fomoStatus": dict(x["_fomoStatus"])} if x.get("_fomoStatus") else {}),
+                        # v10.27: per-leg Mobula /swaps/v3/status timing (HK monotonic ms; no intentId)
+                        **({"fomoMobulaStatus": _fomo_mobula_status_evidence(x)} if x.get("_fomoMobula") else {}),
                     },
                     "incomplete": incomplete,
                     "atWall": at_wall,
@@ -4861,6 +5186,43 @@ def _head_with_receipt(leg):
     except ValueError:
         height = None
     return {**sample, "inclusion": {"hash": receipt.get("blockHash"), "height": height}}
+
+
+def _fomo_mobula_status_evidence(leg):
+    """v10.27 private-raw per-leg Mobula status block. All times are HK monotonic ms (same clock
+    as tOrderOutMs); heldMs = response hook − request hook of the same flow. The status body has
+    no fill hash, so HK-L3' stays missing with an explicit reason instead of an invented scan."""
+    st = leg.get("_fomoMobula") or {}
+    out = {
+        "candidate": bool(st.get("candidate")),
+        "bound": bool(st.get("bound")),
+        "bindMissing": st.get("bindMissing") or (
+            None if st.get("bound") else
+            "intent-mismatch" if st.get("intentMismatch") else
+            "status-request-not-observed"
+        ),
+        "statusRequests": st.get("statusRequests", 0),
+        "responses": st.get("responses", 0),
+        "pending": st.get("pending", 0),
+        "firstRequestMs": st.get("firstRequestMs"),
+        "firstSuccessResponseMs": st.get("firstSuccessResponseMs"),
+        "successRequestMs": st.get("successRequestMs"),
+        "successHeldMs": st.get("successHeldMs"),
+        "maxHeldMs": st.get("maxHeldMs"),
+        "failedAtMs": st.get("failedAtMs"),
+        "failedRequestMs": st.get("failedRequestMs"),
+        "l3MissingReason": (
+            "mobula-status-no-fill-hash"
+            if (leg.get("successEvidence") or {}).get("channel") == "fomo-mobula-status-http"
+            and leg.get("tReceiptMs") is None
+            else None
+        ),
+    }
+    for k in ("intentMismatch", "rejected", "afterSuccess", "afterFailed", "ineligible",
+              "beforeExecution", "chainUnproven"):
+        if st.get(k):
+            out[k] = st[k]
+    return out
 
 
 def _placeholder_leg(platform, chain):
@@ -5641,6 +6003,24 @@ class SpeedexHkTiming:
                 }
             return
 
+        mobula_req = _fomo_mobula_status_request(host, raw_path, method)
+        if mobula_req:
+            # v10.27: Mobula status poll. Only the hook-entry time and the bound leg are kept for
+            # this flow's own response; the intentId is compared, never logged; headers/body unread.
+            if mobula_req.get("preflight"):
+                STORE.note_frame_diag("fomoMobulaStatusPreflight")
+            elif mobula_req.get("invalid"):
+                STORE.note_frame_diag("fomoMobulaStatusRequestInvalid")
+            else:
+                STORE.note_frame_diag("fomoMobulaStatusRequest")
+                if not mobula_req.get("wait"):
+                    STORE.note_frame_diag("fomoMobulaStatusRequestNoWait")
+                leg = STORE.bind_fomo_mobula_status(window, mobula_req["intentId"], t_obs)
+                flow.metadata["speedex_fomo_mobula_status"] = {
+                    "window": window, "leg": leg, "tReq": t_obs,
+                }
+            return
+
         if _fomo_sign_request(host, path, method):
             # Request hook only: no body, header, query or id segment is read or retained.
             STORE.note_fomo_sign(window, {
@@ -5834,6 +6214,28 @@ class SpeedexHkTiming:
                 return
             STORE.observe_fomo_status(
                 status_meta["window"], status_meta["relayId"], status_meta["tReq"], t_obs,
+                hashlib.sha256(body.encode()).hexdigest()[:16],
+            )
+            return
+
+        mobula_meta = flow.metadata.get("speedex_fomo_mobula_status")
+        if mobula_meta:
+            try:
+                code = int(getattr(flow.response, "status_code", None))
+            except (TypeError, ValueError):
+                code = None
+            if mobula_meta["leg"] is None:
+                STORE.note_frame_diag("fomoMobulaStatusRespUnbound")
+                return
+            body = ""
+            if code == 200:
+                try:
+                    body = flow.response.get_text() or ""
+                except Exception:
+                    body = ""
+            verdict, label = _fomo_mobula_status_verdict(code, body)
+            STORE.observe_fomo_mobula_status(
+                mobula_meta["window"], mobula_meta["leg"], mobula_meta["tReq"], t_obs, verdict, label,
                 hashlib.sha256(body.encode()).hexdigest()[:16],
             )
             return
