@@ -317,7 +317,7 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # hash → 不起 receipt，L3′ 缺失 l3MissingReason="mobula-status-no-fill-hash"。intentId 不入事件/日志/默认 timeline；
 # 仅 full=1 timeline 的已绑定腿带 mobulaIntentId（与 orderId 同暴露级，EU 授权轮回配键）。
 # 绑定 Mobula 的腿不再是 F-SOL swaps 候选。OKX/GMGN/Relay/v2 status/Solana 其余行为与 allow_hosts 不变。
-ADDON_VERSION = "2026.11.14-fomo-mobula-status-v10.27"
+ADDON_VERSION = "2026.11.14-fomo-provider-signature-v10.28"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -510,6 +510,38 @@ def _sol_wire_first_sig(b64_body):
         raw = base64.b64decode(b64_body, validate=True)
     except Exception:
         return None
+    return _sol_raw_first_sig(raw)
+
+
+def _b58decode(s):
+    """base58 → bytes（前导 '1' = 0x00）；非字母表字符 → None。"""
+    if not isinstance(s, str) or not s:
+        return None
+    n = 0
+    for ch in s:
+        i = _B58_ALPHABET.find(ch)
+        if i < 0:
+            return None
+        n = n * 58 + i
+    body = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
+    pad = len(s) - len(s.lstrip("1"))
+    return b"\x00" * pad + body
+
+
+def _sol_encoded_first_sig(value, encoding):
+    """v10.28: wire tx string with an explicit encoding ("base64" | "base58") → first signature."""
+    if not isinstance(value, str) or not value:
+        return None
+    if encoding == "base64":
+        return _sol_wire_first_sig(value)
+    if encoding == "base58":
+        raw = _b58decode(value)
+        return _sol_raw_first_sig(raw) if raw else None
+    return None
+
+
+def _sol_raw_first_sig(raw):
+    """wire bytes → first signature (base58); legacy/v0 and v1 layouts. Shared by base64/base58."""
     if not raw:
         return None
     if raw[0] == _SOL_TX_V1_VERSION_BYTE:
@@ -600,6 +632,54 @@ def _sol_fullnode_client_frame(flow, payload):
             subs["subs"].pop(str(sid), None)
 
 
+def _sol_sub_response(subs, obj):
+    """subscribe 响应 {"id":reqId,"result":subId} → 绑定 subId→sig（同连接先前登记的 reqId）。"""
+    ident, result = obj.get("id"), obj.get("result")
+    sig = subs["req"].pop(str(ident), None) if ident is not None else None
+    if sig is not None and isinstance(result, (int, str)):
+        subs["subs"][str(result)] = sig
+
+
+def _sol_sub_mapped(subs, params):
+    sub = params.get("subscription") if isinstance(params, dict) else None
+    return subs["subs"].get(str(sub)) if sub is not None else None
+
+
+# v10.28 FOMO provider WS: wss://solana-provider-primary.prod-edge.fomo.family/?token=<…> (the page's
+# @solana/kit rpc-subscriptions; token query never read). Exact host only — not the HTTP send hosts.
+FOMO_PROVIDER_WS_HOST = "solana-provider-primary.prod-edge.fomo.family"
+FOMO_PROVIDER_WS_CHANNEL = "fomo-provider-signature-ws"
+
+
+def _fomo_provider_server_frame(flow, payload):
+    """v10.28 FOMO provider inbound frame → ("subscribed"|"success"|"failed"|None, sig).
+
+    Same connection-level mapping as the OKX fullnode path (_sol_subs): a subscribe response binds
+    subId→sig; a signatureNotification resolves its signature ONLY through that mapping (identity =
+    the page's own signatureSubscribe params[0]). value.err key present: null → success, non-null →
+    failed. Any other shape → (None, None). The frame is never retained.
+    """
+    obj = _decode_ws(payload)
+    if not isinstance(obj, dict):
+        return None, None
+    subs = _sol_subs(flow)
+    method = obj.get("method")
+    if method is None:
+        _sol_sub_response(subs, obj)
+        return "subscribed", None
+    if method != "signatureNotification":
+        return None, None
+    params = obj.get("params")
+    result = params.get("result") if isinstance(params, dict) else None
+    value = result.get("value") if isinstance(result, dict) else None
+    if not isinstance(value, dict) or "err" not in value:
+        return None, None
+    sig = _sol_sub_mapped(subs, params)
+    if not sig:
+        return "unmapped", None
+    return ("success" if value.get("err") is None else "failed"), sig
+
+
 def _sol_fullnode_server_identity(flow, payload):
     """solana fullnode 入站帧 → 精确 tx 签名（schema-known，成功形态才认）：
     - subscribe 响应（{"id":reqId,"result":subId}，无 method）→ 绑定 subId→sig
@@ -615,10 +695,7 @@ def _sol_fullnode_server_identity(flow, payload):
     subs = _sol_subs(flow)
     method = obj.get("method")
     if method is None:
-        ident, result = obj.get("id"), obj.get("result")
-        sig = subs["req"].pop(str(ident), None) if ident is not None else None
-        if sig is not None and isinstance(result, (int, str)):
-            subs["subs"][str(result)] = sig
+        _sol_sub_response(subs, obj)
         return None
     params = obj.get("params")
     result = params.get("result") if isinstance(params, dict) else None
@@ -631,8 +708,7 @@ def _sol_fullnode_server_identity(flow, payload):
         sig = value.get("signature")
         if isinstance(sig, str) and _SOL_SIG_RE.fullmatch(sig):
             return (sig, method)
-        sub = params.get("subscription")
-        mapped = subs["subs"].get(str(sub)) if sub is not None else None
+        mapped = _sol_sub_mapped(subs, params)
         return (mapped, method) if mapped else None
     if method == "transactionNotification":
         meta = result.get("meta")
@@ -1411,6 +1487,73 @@ def _fomo_execution_request(host, path, method, body):
         if isinstance(row, dict) and row.get("method") in methods:
             return route
     return None
+
+
+# v10.28 execution-signature identity (owner rule 2026-11-14): the signed transaction body of a FOMO
+# Solana execution transport is read IN MEMORY only to derive its first signature (public on chain).
+# Nothing else from the body is persisted, logged or hashed. Formats confirmed from FOMO's swaps-v2
+# bundle (signed wire tx = @scure/base base64 of the same bytes for every transport of one buy):
+#   jito-web / lamport  : text/plain body = bare base64 tx
+#   helius / provider   : {"method":"sendTransaction","params":[b64,{"encoding":"base64",…}]}
+#   circular            : {"method":"sendTransaction","params":[b64,{"forward":false,"cashbackAddress":…}]}
+#                         (no encoding key; the page sends base64)
+#   jito bundle         : {"method":"sendBundle","params":[[b64 user tx, jitoTipTx],{"encoding":"base64"}]}
+#                         (params[0][0] is the user tx; [1] is the separate tip tx)
+FOMO_EXEC_SIG_REASONS = (
+    "derived", "body-missing", "not-raw-base64", "not-json-rpc", "batch-unconfirmed",
+    "method-unconfirmed", "params-shape", "encoding-unconfirmed", "decode-failed",
+)
+FOMO_EXEC_SIG_TRANSPORTS_MAX = 8
+_FOMO_EXEC_SIG_FORMATS = {
+    "solana-jito-web": {"raw": True},
+    "solana-lamport-submit": {"raw": True},
+    "solana-helius-submit": {"method": "sendTransaction", "defaultEncoding": None},
+    "solana-fomo-rpc-submit": {"method": "sendTransaction", "defaultEncoding": None},
+    "solana-circular-submit": {"method": "sendTransaction", "defaultEncoding": "base64"},
+    "solana-jito-bundle": {"method": "sendBundle", "defaultEncoding": None, "bundle": True},
+}
+
+
+def _fomo_exec_tx_sig(kind, body):
+    """(first signature | None, reason) for one FOMO execution transport body; reason ∈
+    FOMO_EXEC_SIG_REASONS. Encoding is explicit: params[1].encoding "base64"/"base58", or the
+    transport's code-confirmed default (Circular only); a missing encoding elsewhere is unconfirmed."""
+    fmt = _FOMO_EXEC_SIG_FORMATS.get(kind)
+    if fmt is None:
+        return None, "method-unconfirmed"
+    if not isinstance(body, str) or not body.strip():
+        return None, "body-missing"
+    if fmt.get("raw"):
+        text = body.strip()
+        if text[:1] in ("{", "["):
+            return None, "not-raw-base64"
+        sig = _sol_wire_first_sig(text)
+        return (sig, "derived") if sig else (None, "decode-failed")
+    obj = _j(body)
+    if isinstance(obj, list):
+        return None, "batch-unconfirmed"
+    if not isinstance(obj, dict):
+        return None, "not-json-rpc"
+    if obj.get("method") != fmt["method"]:
+        return None, "method-unconfirmed"
+    params = obj.get("params")
+    if not isinstance(params, list) or not params or len(params) > 2:
+        return None, "params-shape"
+    cfg = params[1] if len(params) == 2 else {}
+    if not isinstance(cfg, dict):
+        return None, "params-shape"
+    encoding = cfg.get("encoding", fmt["defaultEncoding"])
+    if encoding not in ("base64", "base58"):
+        return None, "encoding-unconfirmed"
+    tx = params[0]
+    if fmt.get("bundle"):
+        if not isinstance(tx, list) or not 1 <= len(tx) <= 5:
+            return None, "params-shape"
+        tx = tx[0]
+    if not isinstance(tx, str):
+        return None, "params-shape"
+    sig = _sol_encoded_first_sig(tx, encoding)
+    return (sig, "derived") if sig else (None, "decode-failed")
 
 
 def _fomo_execution_ack(meta, status_code, body):
@@ -3138,6 +3281,9 @@ class Store:
         # v10.27: latest Mobula v3 preview per run {intentId, chain, observedMs}; internal binding
         # candidate only (never serialized into events/timeline).
         self.fomo_mobula_previews = {}
+        # v10.28: latest valid v3 preview source per run {source: solana|relay|mobula, observedMs};
+        # frozen onto an execution leg at its first transport (same rule as the Mobula candidate).
+        self.fomo_preview_source = {}
         self.fomo_swaps = {}
         # FOMO Privy share requests per run: hook time/wall/head snapshots only (no path id, body or header).
         self.fomo_signs = {}
@@ -3164,6 +3310,7 @@ class Store:
                 del self.open_legs[p]
         self.fomo_previews.pop(run_id, None)
         self.fomo_mobula_previews.pop(run_id, None)
+        self.fomo_preview_source.pop(run_id, None)
         self.fomo_signs.pop(run_id, None)
         for key in list(self.fomo_swaps):
             if key[0] == run_id:
@@ -3859,7 +4006,7 @@ class Store:
                     self._freeze_run_locked(r)
             return None
 
-    def order_in_open_window(self, window, platform, chain, ev):
+    def order_in_open_window(self, window, platform, chain, ev, exec_sig=None):
         """解析结束后只复验入口捕获的 runId+epoch；失效则丢弃，绝不重新选窗。
         窗口复验、事件和腿写入同锁，覆盖 close、TTL、新窗与同 runId 重开。"""
         with self.lock:
@@ -3888,12 +4035,20 @@ class Store:
                     if prior.get("platform") != "fomo" or prior.get("orderRequestSource") != "fomo-solana-execution":
                         continue
                     last = prior.get("_fomoLastTransportMs")
+                    # v10.28: a transport carrying the same derived signature is the same transaction
+                    # (e.g. provider fallback after the 2 s Hudson timeout) — never a second order.
+                    same_sig = bool(exec_sig) and prior.get("_fomoExecSig") == exec_sig
+                    near = isinstance(last, (int, float)) and 0 <= ev["t"] - last <= FOMO_EXECUTION_FANOUT_MS
                     if (
-                        prior.get("tSuccessPushMs") is None
+                        (prior.get("tSuccessPushMs") is None or same_sig)
                         and not prior.get("windowClosed")
                         and isinstance(last, (int, float))
-                        and 0 <= ev["t"] - last <= FOMO_EXECUTION_FANOUT_MS
+                        and (same_sig or near)
                     ):
+                        if same_sig and not (near and prior.get("tSuccessPushMs") is None):
+                            # counted only where the time rule alone would have opened a new order
+                            self.diag["fomoExecSigFold"] += 1
+                            self.run_diag[rid]["fomoExecSigFold"] += 1
                         prior["_fomoLastTransportMs"] = ev["t"]
                         ev["kind"] = "fomo_transport_req"
                         self._add_event_locked(rid, ev)
@@ -3923,6 +4078,11 @@ class Store:
                 if cand and cand["observedMs"] <= ev["t"]:
                     leg["_fomoMobulaIntent"] = dict(cand)
                     leg["_fomoMobula"] = {"candidate": True, "bound": False}
+                # v10.28: the route the page signed for = latest preview source at/before the transport.
+                # Only "solana" (v1Swap, same-chain) makes the provider signature WS a success signal.
+                src = self.fomo_preview_source.get(rid)
+                if src and src["observedMs"] <= ev["t"]:
+                    leg["_fomoPreviewSource"] = src["source"]
             return rid, leg
 
     def note_fomo_sign(self, window, ev):
@@ -3977,6 +4137,10 @@ class Store:
     def note_fomo_preview(self, leg, ids, observed_ms):
         """Latest valid v3 response is only an unfrozen candidate (even after execution)."""
         source = ids.get("_previewSource")
+        if source in ("solana", "relay", "mobula"):
+            with self.lock:
+                if not leg.get("windowClosed") and leg.get("anchorRole") == "preview":
+                    self.fomo_preview_source[leg.get("runId")] = {"source": source, "observedMs": observed_ms}
         if source == "mobula":
             self._note_fomo_mobula_preview(leg, ids, observed_ms)
             return
@@ -4166,6 +4330,12 @@ class Store:
             row = hits[0]
             if leg.get("chain") not in (None, "solana"):
                 leg["incomplete"] = "swap-record-chain-conflict"
+                return None
+            # v10.28: with a derived execution signature the record must carry that exact signature.
+            if leg.get("_fomoExecSig") and row["signature"] != leg["_fomoExecSig"]:
+                leg["incomplete"] = "swap-record-sig-conflict"
+                self.diag["fomoSwapsExecSigConflict"] += 1
+                self.run_diag[rid]["fomoSwapsExecSigConflict"] += 1
                 return None
             leg["chain"] = "solana"
             leg["txHash"] = row["signature"]
@@ -4491,6 +4661,213 @@ class Store:
                 "platform": "fomo",
                 "host": "prod-api.fomo.family",
                 "sha": body_sha,
+            })
+            return leg
+
+    # ── v10.28 FOMO Solana: execution signature → provider signatureSubscribe → signatureNotification ──
+    _FOMO_REST_INCOMPLETE = frozenset((
+        "swaps-baseline-missing", "ambiguous-execution-candidate", "ambiguous-swap-record",
+        "execution-wall-clock-missing",
+    ))
+
+    def _fomo_provider_diag_locked(self, rid, key, leg=None, leg_key=None):
+        self.diag[key] += 1
+        if rid:
+            self.run_diag[rid][key] += 1
+        if leg is not None and leg_key:
+            st = leg.setdefault("_fomoProvider", {})
+            st[leg_key] = st.get(leg_key, 0) + 1
+
+    def note_fomo_exec_sig(self, leg, kind, sig, reason):
+        """v10.28: record one execution transport's derived first signature on its (fanout-folded) leg.
+
+        Only the signature (public on chain) is kept, as the private `_fomoExecSig`; per transport a
+        bounded {transport, sigDerived, reason}. Every derived signature of one execution must agree,
+        else the leg has no identity (`fomo-exec-sig-conflict`). Undecodable formats are counted only.
+        """
+        with self.lock:
+            if leg.get("windowClosed"):
+                return
+            rid = leg.get("runId")
+            st = leg.setdefault("_fomoExecSigDiag", {"transports": [], "overflow": 0, "conflict": False})
+            label = reason if reason in FOMO_EXEC_SIG_REASONS else "decode-failed"
+            self._fomo_provider_diag_locked(rid, "fomoExecSig." + label)
+            if len(st["transports"]) < FOMO_EXEC_SIG_TRANSPORTS_MAX:
+                st["transports"].append({"transport": kind, "sigDerived": sig is not None, "reason": label})
+            else:
+                st["overflow"] += 1
+                self._fomo_provider_diag_locked(rid, "fomoExecSigTransportOverflow")
+            if sig is None or st["conflict"]:
+                return
+            cur = leg.get("_fomoExecSig")
+            if cur is None:
+                leg["_fomoExecSig"] = sig
+                self._fomo_provider_diag_locked(rid, "fomoExecSigIdentity")
+            elif cur != sig:
+                st["conflict"] = True
+                leg["_fomoExecSig"] = None
+                self._fomo_provider_diag_locked(rid, "fomoExecSigConflict")
+
+    def _fomo_exec_sig_legs_locked(self, sig):
+        out = []
+        for rid in self._open_run_ids_locked(time.monotonic()):
+            for leg in self.legs.get(rid, []):
+                if (
+                    leg.get("platform") == "fomo"
+                    and leg.get("orderRequestSource") == "fomo-solana-execution"
+                    and leg.get("anchorRole") == "order"
+                    and leg.get("_fomoExecSig") == sig
+                ):
+                    out.append(leg)
+        return out
+
+    def bind_fomo_provider_subscribe(self, sig, t_sub):
+        """v10.28 client frame: the page's signatureSubscribe(params[0]=sig) on the FOMO provider WS
+        binds the one open execution leg whose derived signature equals sig. The subscribe must come at
+        or after that leg's first execution transport. No leg / several legs / earlier / closed or vetoed
+        leg → not bound, counted. Returns the leg or None; the signature is never logged."""
+        with self.lock:
+            hits = self._fomo_exec_sig_legs_locked(sig)
+            rids = self._open_run_ids_locked(time.monotonic())
+            rid0 = rids[0] if rids else None
+            if not hits:
+                self._fomo_provider_diag_locked(rid0, "fomoProviderSubscribeNoLeg")
+                return None
+            if len(hits) > 1:
+                for leg in hits:
+                    leg.setdefault("_fomoProvider", {})["bindMissing"] = "ambiguous-exec-sig"
+                self._fomo_provider_diag_locked(rid0, "fomoProviderSubscribeAmbiguous")
+                return None
+            leg = hits[0]
+            rid = leg.get("runId")
+            if leg.get("windowClosed") or leg.get("_anchorVeto") or leg.get("dup"):
+                self._fomo_provider_diag_locked(rid, "fomoProviderSubscribeLegIneligible")
+                return None
+            t_exec = leg.get("tOrderOutMs")
+            if not isinstance(t_exec, (int, float)) or t_sub < t_exec:
+                self._fomo_provider_diag_locked(rid, "fomoProviderSubscribeBeforeExecution", leg, "subscribeBeforeExecution")
+                return None
+            st = leg.setdefault("_fomoProvider", {})
+            st["subscribes"] = st.get("subscribes", 0) + 1
+            if st.get("bound"):
+                self._fomo_provider_diag_locked(rid, "fomoProviderSubscribeRepeat")
+                return leg
+            st["bound"] = True
+            st.pop("bindMissing", None)
+            st["subscribeMs"] = t_sub
+            self._fomo_provider_diag_locked(rid, "fomoProviderSubscribeBound")
+            self._add_event_locked(rid, {
+                "t": t_sub, "tw": _wall_iso(), "kind": "fomo_provider_subscribe_bound",
+                "platform": "fomo", "host": FOMO_PROVIDER_WS_HOST,
+            })
+            return leg
+
+    def _fomo_provider_gate_locked(self, leg, sig):
+        """None = the leg may take this exact-signature notification as F-SOL platform success."""
+        if leg.get("_anchorVeto") or leg.get("dup"):
+            return "leg-ineligible"
+        if leg.get("_fomoRelayFrozen") or (leg.get("_anchor") or {}).get("orderId") is not None:
+            return "leg-relay-bound"
+        if (leg.get("_fomoMobula") or {}).get("bound"):
+            return "leg-mobula-bound"
+        if leg.get("incomplete") and leg["incomplete"] not in self._FOMO_REST_INCOMPLETE:
+            return "leg-incomplete"
+        if leg.get("_fomoPreviewSource") != "solana":
+            return "preview-not-solana"
+        if leg.get("chain") not in (None, "solana"):
+            return "chain-conflict"
+        if leg.get("txHash") is not None and leg["txHash"] != sig:
+            return "tx-conflict"
+        return None
+
+    def observe_fomo_provider_signature(self, sig, verdict, t_obs, frame_sha):
+        """v10.28 server frame (t_obs frozen at frame arrival, HK monotonic): the first mapped
+        signatureNotification for a bound leg's own signature. value.err null → platform success
+        (channel fomo-provider-signature-ws; the page's "Bought" toast condition); non-null → failure
+        evidence. A `fomo-swaps-rest` success with the same signature is replaced (WS wins); every
+        other adopted success stays frozen. Returns the leg on success adoption, else None."""
+        with self.lock:
+            hits = [
+                leg for leg in self._fomo_exec_sig_legs_locked(sig)
+                if (leg.get("_fomoProvider") or {}).get("bound")
+            ]
+            rids = self._open_run_ids_locked(time.monotonic())
+            rid0 = rids[0] if rids else None
+            if len(hits) != 1:
+                self._fomo_provider_diag_locked(rid0, "fomoProviderNotifyNoLeg")
+                return None
+            leg = hits[0]
+            rid = leg.get("runId")
+            st = leg["_fomoProvider"]
+            st["notifications"] = st.get("notifications", 0) + 1
+            if leg.get("windowClosed"):
+                self._fomo_provider_diag_locked(rid, "fomoProviderWindowClosed")
+                return None
+            if st.get("firstNotifyMs") is not None:
+                self._fomo_provider_diag_locked(rid, "fomoProviderNotifyRepeat")
+                return None
+            if t_obs < st.get("subscribeMs", float("inf")):
+                self._fomo_provider_diag_locked(rid, "fomoProviderNotifyBeforeSubscribe")
+                return None
+            st["firstNotifyMs"] = t_obs
+            if verdict == "failed":
+                st["failure"] = {
+                    "version": 1, "platform": "fomo", "channel": FOMO_PROVIDER_WS_CHANNEL,
+                    "status": "failed", "txHash": sig, "matchedKeys": ["txHash"],
+                    "correlation": "provider-signature-subscribe+exec-sig",
+                    "observedAtMs": t_obs, "frameSha": frame_sha,
+                }
+                if leg.get("tSuccessPushMs") is None and (
+                    not leg.get("incomplete") or leg["incomplete"] in self._FOMO_REST_INCOMPLETE
+                ):
+                    leg["incomplete"] = "fomo-provider-signature-failed"
+                self._fomo_provider_diag_locked(rid, "fomoProviderSignatureFailed")
+                self._add_event_locked(rid, {
+                    "t": t_obs, "tw": _wall_iso(), "kind": "fomo_provider_signature_failed",
+                    "platform": "fomo", "host": FOMO_PROVIDER_WS_HOST, "sha": frame_sha,
+                })
+                return None
+            gate = self._fomo_provider_gate_locked(leg, sig)
+            if gate:
+                st["successGateFail"] = gate
+                self._fomo_provider_diag_locked(rid, "fomoProviderSuccessGate." + gate)
+                return None
+            prior = leg.get("successEvidence") or {}
+            if leg.get("tSuccessPushMs") is not None:
+                if prior.get("channel") != "fomo-swaps-rest" or leg.get("txHash") != sig:
+                    self._fomo_provider_diag_locked(rid, "fomoProviderAfterSuccess")
+                    return None
+                st["replacedRestAtMs"] = leg["tSuccessPushMs"]
+                self._fomo_provider_diag_locked(rid, "fomoProviderReplacedRest")
+            if leg.get("incomplete") in self._FOMO_REST_INCOMPLETE:
+                st["restIncomplete"] = leg["incomplete"]
+                leg["incomplete"] = None
+            leg["chain"] = "solana"
+            leg["txHash"] = sig
+            leg["tSuccessPushMs"] = t_obs
+            leg["wsSha"] = frame_sha
+            leg["successAnchorKeys"] = ["txHash"]
+            digest = hashlib.sha256(sig.encode()).hexdigest()
+            leg["successEvidence"] = {
+                "version": 1,
+                "platform": "fomo",
+                "channel": FOMO_PROVIDER_WS_CHANNEL,
+                "status": "success",
+                "txHash": sig,
+                "txDigest": "-".join(digest[i:i+16] for i in range(0, 64, 16)),
+                "matchedKeys": ["txHash"],
+                "correlation": "provider-signature-subscribe+exec-sig",
+                "observedAtMs": t_obs,
+                "subscribeObservedAtMs": st.get("subscribeMs"),
+                "frameSha": frame_sha,
+            }
+            if leg.get("pendingBind"):
+                leg["pendingBind"] = False
+                self._promote_leg_locked(leg)
+            self._fomo_provider_diag_locked(rid, "fomoProviderSignatureAdopted")
+            self._add_event_locked(rid, {
+                "t": t_obs, "tw": _wall_iso(), "kind": "fomo_provider_signature_success",
+                "platform": "fomo", "host": FOMO_PROVIDER_WS_HOST, "sha": frame_sha,
             })
             return leg
 
@@ -5070,6 +5447,9 @@ class Store:
                         (x.get("_fomoMobulaIntent") or {}).get("intentId")
                         if full and (x.get("_fomoMobula") or {}).get("bound") else None
                     ),
+                    # v10.28 full=1 only (same exposure as orderId): the FOMO execution signature derived
+                    # in memory from the signed transport body; never in the default/public timeline.
+                    "fomoExecutionSig": x.get("_fomoExecSig") if full else None,
                     "evidence": {
                         "orderFlowId": x.get("orderFlowId"),
                         "wsFrameSha": x.get("wsSha"),
@@ -5095,6 +5475,9 @@ class Store:
                         **({"fomoStatus": dict(x["_fomoStatus"])} if x.get("_fomoStatus") else {}),
                         # v10.27: per-leg Mobula /swaps/v3/status timing (HK monotonic ms; no intentId)
                         **({"fomoMobulaStatus": _fomo_mobula_status_evidence(x)} if x.get("_fomoMobula") else {}),
+                        # v10.28: per-transport signature derivation + provider WS correlation (no values)
+                        **({"fomoExecSig": _fomo_exec_sig_evidence(x)} if x.get("_fomoExecSigDiag") else {}),
+                        **({"fomoProviderWs": _fomo_provider_ws_evidence(x, full)} if x.get("_fomoProvider") else {}),
                     },
                     "incomplete": incomplete,
                     "atWall": at_wall,
@@ -5222,6 +5605,46 @@ def _fomo_mobula_status_evidence(leg):
               "beforeExecution", "chainUnproven"):
         if st.get(k):
             out[k] = st[k]
+    return out
+
+
+def _fomo_exec_sig_evidence(leg):
+    """v10.28 private-raw: per-transport derivation labels only (no signature, no body bytes)."""
+    st = leg.get("_fomoExecSigDiag") or {}
+    return {
+        "derived": leg.get("_fomoExecSig") is not None,
+        "conflict": bool(st.get("conflict")),
+        "missingReason": (
+            "fomo-exec-sig-conflict" if st.get("conflict")
+            else None if leg.get("_fomoExecSig") is not None
+            else "fomo-exec-sig-not-derived"
+        ),
+        "transports": [dict(t) for t in st.get("transports") or []],
+        "overflow": st.get("overflow", 0),
+        "previewSource": leg.get("_fomoPreviewSource"),
+    }
+
+
+def _fomo_provider_ws_evidence(leg, full=False):
+    """v10.28 private-raw provider WS block (HK monotonic ms, same clock as tOrderOutMs)."""
+    st = leg.get("_fomoProvider") or {}
+    failure = st.get("failure")
+    if failure:
+        failure = {**failure, "txHash": failure["txHash"] if full else _short_hash(failure["txHash"])}
+    out = {
+        "bound": bool(st.get("bound")),
+        "bindMissing": st.get("bindMissing") or (None if st.get("bound") else "subscribe-not-observed"),
+        "subscribes": st.get("subscribes", 0),
+        "subscribeMs": st.get("subscribeMs"),
+        "notifications": st.get("notifications", 0),
+        "firstNotifyMs": st.get("firstNotifyMs"),
+        "successGateFail": st.get("successGateFail"),
+        "replacedRestAtMs": st.get("replacedRestAtMs"),
+        "restIncomplete": st.get("restIncomplete"),
+        "failure": failure,
+    }
+    if st.get("subscribeBeforeExecution"):
+        out["subscribeBeforeExecution"] = st["subscribeBeforeExecution"]
     return out
 
 
@@ -6031,6 +6454,17 @@ class SpeedexHkTiming:
             })
             return
 
+        if host == FOMO_PROVIDER_WS_HOST and str(method or "").upper() == "POST":
+            # v10.28: the page's fallback getSignatureStatuses polling is diagnostic only (counted by
+            # method name; params/headers/query never retained). Never a success signal.
+            try:
+                rpc = _j(flow.request.get_text() or "")
+            except Exception:
+                rpc = None
+            if isinstance(rpc, dict) and rpc.get("method") == "getSignatureStatuses":
+                STORE.note_frame_diag("fomoProviderStatusPoll")
+            return
+
         fomo_route = _fomo_execution_route(host, path, method)
         raw_candidate = method == "POST" and (host in OKX_RPC_HOSTS or host in OKX_SOL_SEND_HOSTS)
         if not platform and not raw_candidate and not fomo_route:
@@ -6048,6 +6482,9 @@ class SpeedexHkTiming:
         if fomo_route and not fomo_execution:
             STORE.note_frame_diag("fomoExecutionUnproven")
             return
+        # v10.28: derive the execution signature in memory (outside the lock); only the public
+        # signature and a fixed reason label leave this function — never the body or its bytes/hash.
+        exec_sig = _fomo_exec_tx_sig(fomo_execution["kind"], body) if fomo_execution else None
         if not platform and not raw and not fomo_execution:
             return
         if raw:
@@ -6079,7 +6516,8 @@ class SpeedexHkTiming:
             # Lamport's opaque route and every execution query stay unpersisted.
             "path": None if fomo_execution else path,
             "flowId": flow.id,
-            "bodySha": hashlib.sha256(body.encode()).hexdigest()[:16] if body else None,
+            # v10.28: a FOMO execution body is a signed transaction — no hash of it is kept.
+            "bodySha": hashlib.sha256(body.encode()).hexdigest()[:16] if body and not fomo_execution else None,
             "headSnapshots": head_snapshots,
             "orderRequestSource": source,
             **({"anchorRole": "order", "transport": fomo_execution["kind"]} if fomo_execution else {}),
@@ -6091,7 +6529,9 @@ class SpeedexHkTiming:
             bj0 = _j(body) or {}
             if bj0.get("clientOrderId"):
                 ev["clientOrderId"] = str(bj0["clientOrderId"])[:64]
-        rid, leg = STORE.order_in_open_window(window, platform, chain, ev)
+        rid, leg = STORE.order_in_open_window(
+            window, platform, chain, ev, exec_sig=exec_sig[0] if exec_sig else None
+        )
         if leg is None:
             return
         flow.metadata["speedex_leg"] = (leg, rid)  # 直接持引用
@@ -6099,6 +6539,7 @@ class SpeedexHkTiming:
             leg["_platformOrderRequired"] = True
         if fomo_execution:
             flow.metadata["speedex_fomo_execution"] = fomo_execution
+            STORE.note_fomo_exec_sig(leg, fomo_execution["kind"], exec_sig[0], exec_sig[1])
         if raw and raw.get("reqTxHash"):
             # OKX 广播请求体数学推导身份（keccak256(raw)/solana wire 首签名）——
             # 请求到达即知 tx 身份；响应侧 hash 仍是交叉验证（不一致 → 锚冲突否决律）。
@@ -6428,6 +6869,9 @@ class SpeedexHkTiming:
                         STORE.note_channel_arrival(chain, txv, channel,
                             api or ("signatureNotification" if chain == "solana" else "eth_subscription"), t_obs)
             return
+        if host == FOMO_PROVIDER_WS_HOST:
+            self._handle_fomo_provider_ws(flow, msg, t_obs)
+            return
         platform = _classify_ws(host)
         if not platform:
             return
@@ -6502,6 +6946,47 @@ class SpeedexHkTiming:
                 )
             except Exception:
                 pass
+
+    @staticmethod
+    def _handle_fomo_provider_ws(flow, msg, t_obs):
+        """v10.28 FOMO provider WS (exact host). Client signatureSubscribe → reqId→sig mapping (the
+        OKX fullnode helper) + bind to the execution leg with that derived signature; server frames →
+        subscribe-response mapping / mapped signatureNotification → success or failure at frame arrival."""
+        payload = msg.content
+        if msg.from_client:
+            STORE.note_frame_diag("fomoProviderWsClient")
+            _sol_fullnode_client_frame(flow, payload)
+            obj = _decode_ws(payload)
+            if isinstance(obj, dict) and obj.get("method") == "signatureSubscribe":
+                params = obj.get("params")
+                sig = params[0] if isinstance(params, list) and params else None
+                STORE.note_frame_diag("fomoProviderSubscribe")
+                if isinstance(sig, str) and _SOL_SIG_RE.fullmatch(sig):
+                    STORE.bind_fomo_provider_subscribe(sig, t_obs)
+                else:
+                    STORE.note_frame_diag("fomoProviderSubscribeInvalid")
+            return
+        STORE.note_frame_diag("fomoProviderWsServer")
+        kind, sig = _fomo_provider_server_frame(flow, payload)
+        if kind == "unmapped":
+            STORE.note_frame_diag("fomoProviderNotifyUnmapped")
+            return
+        if kind not in ("success", "failed"):
+            return
+        STORE.note_frame_diag("fomoProviderNotify")
+        frame_sha = hashlib.sha256(
+            payload if isinstance(payload, bytes) else str(payload).encode()
+        ).hexdigest()[:16]
+        leg = STORE.observe_fomo_provider_signature(sig, kind, t_obs, frame_sha)
+        if leg is not None:
+            # Exact signature + Solana chain proof → the existing Solana receipt/slot observation.
+            h = STORE.claim_receipt_poll(leg)
+            if h:
+                threading.Thread(
+                    target=_poll_receipt,
+                    args=(leg.get("runId"), leg, leg.get("chain"), h, _jsonrpc),
+                    daemon=True,
+                ).start()
 
     @staticmethod
     def _note_relay_server_frame(payload):

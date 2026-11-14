@@ -101,3 +101,46 @@ query 键集合必须恰为 `{provider=mobula,intentId,wait}` 且 intentId 为�
 
 跨仓：speedex `resolvePushForRun` 目前只认 Relay WS 为 FOMO 推送（`fomo-http-poll-not-push`），新通道要出推送必须同步改
 EU 消费侧（hk-timing-client / public-projector / docs/hk-proxy-timing.md）。
+
+## 2026.11.14-fomo-provider-signature-v10.28
+
+FOMO Solana 同链买入（F-SOL）的 HK 成功信号 = 页面自有 "Bought" toast 条件（swaps-v2 `waitForConfirmation`）：
+`wss://solana-provider-primary.prod-edge.fomo.family/`（@solana/kit rpc-subscriptions；`?token=` query 不读不存）上
+`signatureSubscribe(sig,{commitment:"confirmed"})` 对应的首个 `signatureNotification`，`value.err===null` 为成功，
+时刻取帧到达 hook 入口（HK monotonic）。页面 socket 失败时的 `getSignatureStatuses` HTTP 轮询只计 `fomoProviderStatusPoll`，不是成功信号。
+
+- **执行签名身份（owner 规则 2026-11-14）**：每个 FOMO Solana 执行 transport 的签名交易体只在内存中读取，仅用于推导首签名
+  （链上公开）；body、tx 字节及其 hash 一律不持久化、不记日志（执行 transport 事件的 `bodySha` 自本版起恒 null）。格式取自 FOMO
+  swaps-v2 bundle，同一笔买入所有 transport 携带同一 base64 wire tx：Hudson `sendTransactionWeb` 与 Lamport 为裸 base64 正文；
+  Helius `/fast` 与 provider-{1,3} `sendTransaction` 为 `params:[b64,{encoding:"base64"}]`；Circular `sendTransaction` 的
+  `params[1]` 无 encoding（页面发 base64，按代码确认的缺省解码）；Jito `sendBundle` 取 `params[0][0]`（`[1]` 是独立 tip tx）。
+  显式 `encoding:"base58"` 按 base58 解码；其它缺 encoding / 批量 / 非确认方法均不解码，计 `fomoExecSig.<reason>`。
+- **同签名折叠**：携带与上一执行腿相同推导签名的 transport 即同一笔交易（如 Hudson 2s 超时后的 provider-1/3 回退发送），
+  不受 2s 窗口限制并入该腿，绝不另建 order 腿（`fomoExecSigFold`）；不同签名仍按原 2s 规则。
+- **fanout**：同一逻辑执行（2s 折叠）内所有推导签名必须一致，否则腿无身份（`evidence.fomoExecSig.missingReason=
+  fomo-exec-sig-conflict`，`fomoExecSigConflict`）。签名存私有腿字段 `_fomoExecSig`，只在 `full=1` timeline 以
+  `fomoExecutionSig` 输出（与 orderId 同暴露级）；默认 timeline 只有 `evidence.fomoExecSig={derived,conflict,missingReason,
+  transports:[{transport,sigDerived,reason}]（≤8，余计 overflow）,overflow,previewSource}`。
+- **绑定**：provider WS 客户端 `signatureSubscribe` 的 params[0] 等于某开窗执行腿的推导签名、且不早于该腿首个执行 transport →
+  绑定（`fomoProviderSubscribeBound`）；无腿 / 多腿 / 早于执行 / 否决或关窗 → 不绑定并计数。通知只经同连接 reqId→subId→sig
+  映射还原签名（与 OKX fullnode 同一 `_sol_subs` 映射；OKX 行为不变）。
+- **成功**：绑定腿首个映射通知冻结（之后计 `fomoProviderNotifyRepeat`）。`err===null` 且腿的冻结 preview 来源为 `solana`
+  （执行 transport 及之前最新 v3 preview 为 v1Swap；Relay/Mobula 路由页面同样订阅源链签名，这些腿记
+  `successGateFail=preview-not-solana`，不采纳）→ `tSuccessPushMs`、`chain=solana`、`txHash=sig`、pendingBind 补绑，
+  `successEvidence={version:1, platform:"fomo", channel:"fomo-provider-signature-ws", status:"success", txHash, txDigest,
+  matchedKeys:["txHash"], correlation:"provider-signature-subscribe+exec-sig", observedAtMs, subscribeObservedAtMs, frameSha}`
+  （`subscribeObservedAtMs` 为 raw-only，同 Mobula 的 `requestObservedAtMs`）。`err` 非 null → `evidence.fomoProviderWs.failure`
+  （同形，`status:"failed"`），`incomplete=fomo-provider-signature-failed`，事件 `fomo_provider_signature_failed`。
+- **优先级**：swaps REST（`fomo-swaps-rest`）仍照旧采纳作诊断；同签名的 WS 成功替换 REST 成功（`fomoProviderReplacedRest`，
+  `fomoProviderWs.replacedRestAtMs`），REST 引起的 swaps-* incomplete 移入 `fomoProviderWs.restIncomplete`；其它已采纳成功不被替换。
+  有推导签名时 REST 记录 signature 必须相同，否则 `incomplete=swap-record-sig-conflict`（`fomoSwapsExecSigConflict`）。
+- **推送值**：`hkL1aMs = 帧到达 − Privy share order 锚`（既有 FOMO order 锚规则；缺锚 → null）。
+- **HK-L3′**：WS 成功后以精确签名起既有 Solana receipt/slot 轮询（`claim_receipt_poll`，链已由 preview+精确签名证明）；
+  不在 transport 时提前起轮询（链在成功前未证明），故首次 receipt 观察不早于成功帧。
+- 每腿 `evidence.fomoProviderWs={bound,bindMissing,subscribes,subscribeMs,notifications,firstNotifyMs,successGateFail,
+  replacedRestAtMs,restIncomplete,failure}`（时刻同 tOrderOutMs 钟域）。计数：`fomoProviderWsClient/Server`、`fomoProviderSubscribe(
+  Bound|NoLeg|Ambiguous|BeforeExecution|LegIneligible|Repeat|Invalid)`、`fomoProviderNotify(Unmapped|NoLeg|Repeat|BeforeSubscribe)`、
+  `fomoProviderSignatureAdopted|Failed`、`fomoProviderSuccessGate.<reason>`、`fomoProviderAfterSuccess`、`fomoProviderWindowClosed`。
+
+跨仓：speedex `resolvePushForRun` 只认 Relay WS 为 FOMO 推送；新通道出推送须同步改 EU（shared-push-timing / public-projector /
+docs/hk-proxy-timing.md）。

@@ -7018,7 +7018,7 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.11.14-fomo-mobula-status-v10.27")
+        self.assertEqual(A.ADDON_VERSION, "2026.11.14-fomo-provider-signature-v10.28")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 
@@ -10390,6 +10390,331 @@ class TestFomoMobulaStatusV1027(unittest.TestCase):
             self._status_response(f)
             self.assertIsNone(leg.get("tSuccessPushMs"), "late response after close is discarded")
             self.assertEqual(A.STORE.diag.get("fomoMobulaStatusWindowClosed"), 1)
+
+
+def _synthetic_sol_tx(seed):
+    """Synthetic legacy wire tx: compact-u16 1 · 64B signature · message bytes. Values are not real."""
+    sig = bytes(((seed * 31 + i * 7) % 255) + 1 for i in range(64))
+    msg = bytes([1, 0, 1, 2]) + bytes((seed + i) % 256 for i in range(96))
+    raw = bytes([1]) + sig + msg
+    return raw, A._b58encode(sig)
+
+
+class TestFomoProviderSignatureV1028(unittest.TestCase):
+    """v10.28: FOMO Solana success = the page's own signatureNotification for the exact signature the
+    execution transport carried, over wss://solana-provider-primary.prod-edge.fomo.family (kit
+    signatureSubscribe, commitment confirmed). Bodies follow FOMO's swaps-v2 bundle; all values synthetic."""
+
+    def setUp(self):
+        fresh()
+        self.raw, self.sig = _synthetic_sol_tx(3)
+        self.b64 = __import__("base64").b64encode(self.raw).decode()
+        self.raw2, self.sig2 = _synthetic_sol_tx(9)
+        self.b64_2 = __import__("base64").b64encode(self.raw2).decode()
+        self.receipts = []
+        p = patch.object(A, "_poll_receipt", lambda *a, **k: self.receipts.append((a[2], a[3])))
+        p.start()
+        self.addCleanup(p.stop)
+
+    TIP = "c3ludGhldGljLXRpcC10eA=="
+
+    def bodies(self, b64):
+        rpc = lambda method, params: json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+        return {
+            "solana-jito-web": ("mainnet.hudson.jito.wtf", "/api/v1/sendTransactionWeb?mev_protection_default=true", b64),
+            "solana-jito-bundle": ("mainnet.block-engine.jito.wtf", "/api/v1/bundles?uuid=synthetic",
+                                   rpc("sendBundle", [[b64, self.TIP], {"encoding": "base64"}])),
+            "solana-helius-submit": ("sender.helius-rpc.com", "/fast?api-key=synthetic&rebate_address=synthetic",
+                                     rpc("sendTransaction", [b64, {"encoding": "base64", "skipPreflight": True}])),
+            "solana-circular-submit": ("cashback.circular.fi", "/transactions?api-key=synthetic",
+                                       rpc("sendTransaction", [b64, {"forward": False, "cashbackAddress": "FxCash" + "2" * 38}])),
+            "solana-lamport-submit": ("sender.lamport.dev", "/synthetic-opaque-route", b64),
+            "solana-fomo-rpc-submit": ("solana-provider-3.prod-edge.fomo.family", "/",
+                                       json.dumps({"id": "0", "jsonrpc": "2.0", "method": "sendTransaction", "params": [
+                                           b64, {"encoding": "base64", "skipPreflight": True, "maxRetries": 0,
+                                                 "preflightCommitment": "confirmed"}]})),
+        }
+
+    def send(self, kind, b64=None):
+        host, path, body = self.bodies(b64 or self.b64)[kind]
+        return fomo_execution(host=host, path=path, body=body)
+
+    @staticmethod
+    def manifest(run):
+        return {"version": 1, "runId": run, "rounds": 1, "legs": [{"platform": "fomo", "chain": "solana", "rounds": 1}]}
+
+    def open_buy(self, run, source="solana"):
+        A.STORE.mark_open(run, manifest=self.manifest(run))
+        if source == "relay":
+            fomo_preview(relay="0x" + "9a" * 32)
+        else:
+            fomo_preview(source=source)
+        fomo_sign()
+
+    def exec_legs(self, run):
+        return [l for l in A.STORE.legs[run] if l.get("orderRequestSource") == "fomo-solana-execution"]
+
+    class Ws:
+        def __init__(self):
+            self.f = FakeFlow(A.FOMO_PROVIDER_WS_HOST, "/?token=synthetic-token-not-read", "GET")
+            self.n = 0
+
+        def push(self, obj, from_client=False):
+            self.f.websocket = types.SimpleNamespace(messages=[FakeWSMsg(json.dumps(obj), from_client)])
+            A.addons[0].websocket_message(self.f)
+
+        def subscribe(self, sig, sub_id=42):
+            rid = str(self.n)
+            self.n += 1
+            self.push({"id": rid, "jsonrpc": "2.0", "method": "signatureSubscribe",
+                       "params": [sig, {"commitment": "confirmed"}]}, from_client=True)
+            self.push({"jsonrpc": "2.0", "result": sub_id, "id": rid})
+
+        def notify(self, sub_id=42, err=None):
+            self.push({"jsonrpc": "2.0", "method": "signatureNotification",
+                       "params": {"result": {"context": {"slot": 123}, "value": {"err": err}}, "subscription": sub_id}})
+
+    def test_formats_confirmed_from_bundle(self):
+        for kind, (host, path, body) in self.bodies(self.b64).items():
+            self.assertEqual(A._fomo_exec_tx_sig(kind, body), (self.sig, "derived"), kind)
+        rpc = lambda m, p: json.dumps({"jsonrpc": "2.0", "id": 1, "method": m, "params": p})
+        b58 = A._b58encode(self.raw)
+        self.assertEqual(A._b58decode(b58), self.raw)
+        cases = [
+            ("solana-helius-submit", rpc("sendTransaction", [b58, {"encoding": "base58"}]), (self.sig, "derived")),
+            ("solana-helius-submit", rpc("sendTransaction", [self.b64]), (None, "encoding-unconfirmed")),
+            ("solana-fomo-rpc-submit", rpc("sendTransaction", [self.b64, {"encoding": "json"}]), (None, "encoding-unconfirmed")),
+            ("solana-jito-bundle", rpc("sendTransaction", [self.b64, {"encoding": "base64"}]), (None, "method-unconfirmed")),
+            ("solana-jito-bundle", rpc("sendBundle", [self.b64, {"encoding": "base64"}]), (None, "params-shape")),
+            ("solana-jito-bundle", rpc("sendBundle", [[self.b64] * 6, {"encoding": "base64"}]), (None, "params-shape")),
+            ("solana-fomo-rpc-submit", json.dumps([json.loads(rpc("sendTransaction", [self.b64, {"encoding": "base64"}]))]),
+             (None, "batch-unconfirmed")),
+            ("solana-jito-web", rpc("sendTransaction", [self.b64]), (None, "not-raw-base64")),
+            ("solana-jito-web", "", (None, "body-missing")),
+            ("solana-lamport-submit", "not base64!", (None, "decode-failed")),
+            ("solana-circular-submit", "<html>", (None, "not-json-rpc")),
+        ]
+        for kind, body, want in cases:
+            self.assertEqual(A._fomo_exec_tx_sig(kind, body), want, (kind, body[:40]))
+
+    def test_each_transport_ws_success_with_hk_l1a_and_receipt(self):
+        for i, kind in enumerate(self.bodies(self.b64)):
+            fresh()
+            self.receipts.clear()
+            run = f"run-fomo-provider-{i}"
+            self.open_buy(run)
+            self.send(kind)
+            (leg,) = self.exec_legs(run)
+            self.assertEqual(leg["_fomoExecSig"], self.sig, kind)
+            ws = self.Ws()
+            ws.subscribe(self.sig)
+            self.assertTrue(leg["_fomoProvider"]["bound"], kind)
+            self.assertIsNone(leg.get("tSuccessPushMs"), "subscribe alone is not success")
+            ws.notify()
+            self.assertIsNotNone(leg["tSuccessPushMs"], kind)
+            self.assertEqual(self.receipts, [("solana", self.sig)], "exact signature starts the Solana receipt poll")
+            ev = leg["successEvidence"]
+            self.assertEqual(ev["channel"], "fomo-provider-signature-ws")
+            self.assertEqual(ev["correlation"], "provider-signature-subscribe+exec-sig")
+            self.assertEqual(ev["matchedKeys"], ["txHash"])
+            self.assertEqual(ev["txHash"], self.sig)
+            self.assertLessEqual(ev["subscribeObservedAtMs"], ev["observedAtMs"])
+            full = [x for x in A.STORE.timeline(run, full=True)["legs"] if x.get("anchorRole") == "order"][0]
+            pub = [x for x in A.STORE.timeline(run)["legs"] if x.get("anchorRole") == "order"][0]
+            sign_t = A.STORE.fomo_signs[run]["items"][0]["t"]
+            self.assertEqual(full["orderRequestSource"], "fomo-privy-sign")
+            self.assertAlmostEqual(full["hkL1aMs"], round(leg["tSuccessPushMs"] - sign_t, 1), delta=0.11)
+            self.assertEqual(full["chain"], "solana")
+            self.assertFalse(full["pendingBind"])
+            self.assertEqual(full["txHash"], self.sig)
+            self.assertEqual(full["fomoExecutionSig"], self.sig)
+            self.assertIsNone(pub["fomoExecutionSig"], "execution signature is full=1 only")
+            self.assertNotEqual(pub["evidence"]["success"]["txHash"], self.sig)
+            self.assertEqual(pub["evidence"]["fomoExecSig"]["transports"], [{"transport": kind, "sigDerived": True, "reason": "derived"}])
+            self.assertEqual(A.STORE.timeline(run)["counts"]["observed"], 1)
+
+    def test_fanout_agreement_and_disagreement(self):
+        run = "run-fomo-provider-fanout"
+        self.open_buy(run)
+        for kind in ("solana-jito-web", "solana-helius-submit", "solana-lamport-submit"):
+            self.send(kind)
+        (leg,) = self.exec_legs(run)
+        self.assertEqual(leg["_fomoExecSig"], self.sig)
+        self.assertEqual(len(leg["_fomoExecSigDiag"]["transports"]), 3)
+        fresh()
+        run = "run-fomo-provider-conflict"
+        self.open_buy(run)
+        self.send("solana-jito-web")
+        self.send("solana-helius-submit", b64=self.b64_2)
+        self.send("solana-lamport-submit")
+        (leg,) = self.exec_legs(run)
+        self.assertIsNone(leg["_fomoExecSig"])
+        self.assertTrue(leg["_fomoExecSigDiag"]["conflict"])
+        self.assertEqual(A.STORE.diag.get("fomoExecSigConflict"), 1)
+        ws = self.Ws()
+        ws.subscribe(self.sig)
+        ws.notify()
+        self.assertIsNone(leg.get("tSuccessPushMs"))
+        self.assertEqual(A.STORE.diag.get("fomoProviderSubscribeNoLeg"), 1)
+        out = [x for x in A.STORE.timeline(run)["legs"] if x.get("anchorRole") == "order"][0]
+        self.assertEqual(out["evidence"]["fomoExecSig"]["missingReason"], "fomo-exec-sig-conflict")
+
+    def test_same_signature_after_fanout_window_folds_into_one_order(self):
+        run = "run-fomo-provider-late-fallback"
+        self.open_buy(run)
+        self.send("solana-jito-web")
+        (leg,) = self.exec_legs(run)
+        leg["_fomoLastTransportMs"] -= 2600  # Hudson timed out (2 s); the RPC fallback lands later
+        self.send("solana-fomo-rpc-submit")
+        self.assertEqual(len(self.exec_legs(run)), 1, "same tx is one order, not a second attempt")
+        self.assertEqual(A.STORE.diag.get("fomoExecSigFold"), 1)
+        leg["_fomoLastTransportMs"] -= 2600
+        self.send("solana-fomo-rpc-submit", b64=self.b64_2)  # a different tx outside the window = new leg
+        self.assertEqual(len(self.exec_legs(run)), 2)
+        ws = self.Ws()
+        ws.subscribe(self.sig)
+        ws.notify()
+        self.assertEqual(leg["successEvidence"]["channel"], "fomo-provider-signature-ws")
+
+    def test_subscribe_for_another_signature_or_before_execution_binds_nothing(self):
+        run = "run-fomo-provider-other"
+        self.open_buy(run)
+        ws = self.Ws()
+        ws.subscribe(self.sig, sub_id=7)  # before the transport: no leg carries this signature yet
+        self.send("solana-jito-web")
+        (leg,) = self.exec_legs(run)
+        ws.notify(sub_id=7)
+        ws.subscribe(self.sig2, sub_id=8)
+        ws.notify(sub_id=8)
+        ws.notify(sub_id=99)  # unmapped subscription id
+        self.assertIsNone(leg.get("tSuccessPushMs"))
+        self.assertNotIn("_fomoProvider", leg)
+        self.assertEqual(A.STORE.diag.get("fomoProviderSubscribeNoLeg"), 2)
+        self.assertEqual(A.STORE.diag.get("fomoProviderNotifyUnmapped"), 1)
+        self.assertEqual(self.receipts, [])
+
+    def test_err_non_null_is_failure_evidence(self):
+        run = "run-fomo-provider-failed"
+        self.open_buy(run)
+        self.send("solana-jito-bundle")
+        (leg,) = self.exec_legs(run)
+        ws = self.Ws()
+        ws.subscribe(self.sig)
+        ws.notify(err={"InstructionError": [2, {"Custom": 6001}]})
+        ws.notify()  # a later null-err frame cannot overturn the frozen first notification
+        self.assertIsNone(leg.get("tSuccessPushMs"))
+        self.assertEqual(leg["incomplete"], "fomo-provider-signature-failed")
+        out = [x for x in A.STORE.timeline(run)["legs"] if x.get("anchorRole") == "order"][0]
+        fail = out["evidence"]["fomoProviderWs"]["failure"]
+        self.assertEqual((fail["status"], fail["channel"]), ("failed", "fomo-provider-signature-ws"))
+        self.assertIsNone(out["hkL1aMs"])
+        self.assertEqual(A.STORE.diag.get("fomoProviderNotifyRepeat"), 1)
+
+    def test_rest_alone_still_adopted_and_ws_replaces_it(self):
+        run = "run-fomo-provider-rest"
+        self.open_buy(run)
+        fomo_swaps([])
+        self.send("solana-jito-web")
+        (leg,) = self.exec_legs(run)
+        fomo_swaps([fomo_swap_row({"signature": self.sig})])
+        self.assertEqual(leg["successEvidence"]["channel"], "fomo-swaps-rest")
+        t_rest = leg["tSuccessPushMs"]
+        ws = self.Ws()
+        ws.subscribe(self.sig)
+        ws.notify()
+        self.assertEqual(leg["successEvidence"]["channel"], "fomo-provider-signature-ws")
+        self.assertEqual(leg["_fomoProvider"]["replacedRestAtMs"], t_rest)
+        self.assertEqual(A.STORE.diag.get("fomoProviderReplacedRest"), 1)
+        # REST record with another signature than the execution carried → not adopted
+        fresh()
+        run = "run-fomo-provider-rest-conflict"
+        self.open_buy(run)
+        fomo_swaps([])
+        self.send("solana-jito-web")
+        (leg,) = self.exec_legs(run)
+        fomo_swaps([fomo_swap_row({"signature": self.sig2})])
+        self.assertIsNone(leg.get("tSuccessPushMs"))
+        self.assertEqual(leg["incomplete"], "swap-record-sig-conflict")
+        # REST without any derivable signature (opaque body) still adopts as before
+        fresh()
+        run = "run-fomo-provider-rest-only"
+        self.open_buy(run)
+        fomo_swaps([])
+        fomo_execution()
+        (leg,) = self.exec_legs(run)
+        fomo_swaps([fomo_swap_row()])
+        self.assertEqual(leg["successEvidence"]["channel"], "fomo-swaps-rest")
+
+    def test_relay_or_mobula_route_never_takes_the_origin_signature(self):
+        for source in ("relay", "mobula"):
+            fresh()
+            run = f"run-fomo-provider-{source}"
+            self.open_buy(run, source=source)
+            self.send("solana-jito-web")
+            (leg,) = self.exec_legs(run)
+            ws = self.Ws()
+            ws.subscribe(self.sig)
+            ws.notify()
+            self.assertIsNone(leg.get("tSuccessPushMs"), source)
+            self.assertEqual(leg["_fomoProvider"]["successGateFail"], "preview-not-solana")
+
+    def test_status_poll_is_diagnostic_and_okx_fullnode_path_unchanged(self):
+        run = "run-fomo-provider-poll"
+        self.open_buy(run)
+        self.send("solana-jito-web")
+        f = FakeFlow(A.FOMO_PROVIDER_WS_HOST, "/", "POST", req_body=json.dumps(
+            {"id": "5", "jsonrpc": "2.0", "method": "getSignatureStatuses", "params": [[self.sig]]}))
+        A.addons[0].request(f)
+        self.assertEqual(A.STORE.diag.get("fomoProviderStatusPoll"), 1)
+        (leg,) = self.exec_legs(run)
+        self.assertIsNone(leg.get("tSuccessPushMs"))
+        # A FOMO provider frame never reaches the OKX chain-channel arrival path, and vice versa.
+        okx = FakeFlow("www.okx.com", "/fullnode/sol/discover/ws", "GET")
+        for obj, fc in (({"id": 1, "method": "signatureSubscribe", "params": [self.sig]}, True),
+                        ({"id": 1, "result": 5}, False),
+                        ({"method": "signatureNotification", "params": {"result": {"value": {"err": None}}, "subscription": 5}}, False)):
+            okx.websocket = types.SimpleNamespace(messages=[FakeWSMsg(json.dumps(obj), fc)])
+            A.addons[0].websocket_message(okx)
+        self.assertIsNone(leg.get("tSuccessPushMs"), "OKX fullnode frames are not FOMO success")
+        self.assertIsNone(A.STORE.diag.get("fomoProviderNotify"))
+        sub = {"req": {"1": self.sig}, "subs": {}}
+        fake = types.SimpleNamespace(metadata={A._SOL_SUBS_KEY: sub})
+        self.assertIsNone(A._sol_fullnode_server_identity(fake, json.dumps({"id": 1, "result": 5})))
+        bad = {"method": "signatureNotification", "params": {"result": {"value": {"err": {"x": 1}}}, "subscription": 5}}
+        self.assertIsNone(A._sol_fullnode_server_identity(fake, json.dumps(bad)), "OKX keeps err non-null → None")
+        ok = {"method": "signatureNotification", "params": {"result": {"value": {"err": None}}, "subscription": 5}}
+        self.assertEqual(A._sol_fullnode_server_identity(fake, json.dumps(ok)), (self.sig, "signatureNotification"))
+
+    def test_nothing_from_the_body_is_persisted(self):
+        import base64 as _b64
+        import hashlib as _h
+        run = "run-fomo-provider-privacy"
+        self.open_buy(run)
+        bodies = self.bodies(self.b64)
+        for kind in bodies:
+            self.send(kind)
+        ws = self.Ws()
+        ws.subscribe(self.sig)
+        ws.notify()
+        blob = json.dumps({
+            "events": A.STORE.events.get(run),
+            "full": A.STORE.timeline(run, full=True),
+            "public": A.STORE.timeline(run),
+            "diag": dict(A.STORE.diag),
+            "runDiag": dict(A.STORE.run_diag.get(run) or {}),
+            "legs": [{k: v for k, v in l.items() if k not in ("_dupOf",)} for l in A.STORE.legs[run]],
+        }, default=str)
+        msg_b58 = A._b58encode(self.raw[65:])
+        needles = [self.b64, self.b64[:24], A._b58encode(self.raw), msg_b58[:24], self.TIP]
+        for kind, (_, _, body) in bodies.items():
+            needles.append(_h.sha256(body.encode()).hexdigest()[:16])
+            needles.append(_h.sha256(self.raw).hexdigest()[:16])
+        for n in needles:
+            self.assertNotIn(n, blob)
+        self.assertIn(self.sig, blob, "the public first signature is the one value kept")
+        for ev in A.STORE.events[run]:
+            if ev.get("orderRequestSource") == "fomo-solana-execution" or ev.get("kind") == "fomo_transport_req":
+                self.assertIsNone(ev.get("bodySha"))
 
 
 if __name__ == "__main__":
