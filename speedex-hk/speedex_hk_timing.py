@@ -58,10 +58,13 @@ fomo.md + tests/classify-ws.test.mjs 等夹具——改规则同步改本注释�
           成功帧 wsdexpri dex-(across|swap)-order-info 且 data.dexData.status==="1"
           （status "0"/abnormalStatus "-1" = 创建帧，不算）；hash=dexData.transactionHash。
           data 为 list 时逐 entry 判定（同一 entry 的身份/状态/链才可组合——
-          不 data[0]-only、不跨 entry 拼接）。
+          不 data[0]-only、不跨 entry 拼接）。dexData 无 schema-known 买卖方向字段 →
+          successEvidence.side 恒 null。
   GMGN    下单 POST gmgn.ai /(tapi|td/api|mrtapi)/…/swap_batch_order 或
           /txproxy/v2/send_transaction；成功帧 ws.gmgn.ai 频道 tg_order_info /
-          tg_processed_order_info，条目 st==="successful" 且 si==="buy"，按 h/oi 关联。
+          tg_processed_order_info，条目 st==="successful" 且 si∈{"buy","sell"}，按 h/oi
+          关联；successEvidence.side = 同 entry 的 si（其它 si 不算成功）。买卖同一锚纪律：
+          卖单成功只落在锚（oi/h）正向匹配的腿上。
           data 列表逐 entry 判定（同一 entry 的 h/oi/st/si/ch 才可组合）。
   Padre   下单走 WS msgpack（方法串未钉死）——出站时刻用次优 HTTP：
           POST api.turnkey.com/public/v1/submit/sign_raw_payload；签名调用未证明与
@@ -317,7 +320,10 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # hash → 不起 receipt，L3′ 缺失 l3MissingReason="mobula-status-no-fill-hash"。intentId 不入事件/日志/默认 timeline；
 # 仅 full=1 timeline 的已绑定腿带 mobulaIntentId（与 orderId 同暴露级，EU 授权轮回配键）。
 # 绑定 Mobula 的腿不再是 F-SOL swaps 候选。OKX/GMGN/Relay/v2 status/Solana 其余行为与 allow_hosts 不变。
-ADDON_VERSION = "2026.11.14-fomo-provider-signature-v10.28"
+# v10.29（2026-11-15）：GMGN 卖单出推送——tg_(processed_)order_info 条目 st=="successful" 且 si∈{buy,sell}
+# 为成功（其它 si 不算）；OKX/GMGN successEvidence 新增 side（GMGN = 同 entry si；OKX dexData 无方向字段 → null）。
+# 路由/锚/新鲜度/冻结门不变：卖单成功只落在锚正向匹配的腿；买单成功与 v10.28 相同（另带 side:"buy"）。
+ADDON_VERSION = "2026.11.15-gmgn-sell-push-v10.29"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -1743,10 +1749,11 @@ def _fomo_swap_rows(text):
 
 def _okx_ws_entries(payload):
     """dex-across/dex-swap-order-info 帧 → **逐 entry** 处理单元
-    [{ids, success}…]——data 可为 dict（dexData）或 list（逐元素 dexData/元素本体），
+    [{ids, success, side}…]——data 可为 dict（dexData）或 list（逐元素 dexData/元素本体），
     每个 entry 的身份（orderId/transactionHash|txHash|hash）、状态（status）、链
     （chainId）只取自**同一 entry**；目标在第二 entry 也照常关联（不首-entry-only）。
     success = 同 entry status==="1"（"0"/abnormalStatus "-1" = 创建帧，不算）。
+    side 恒 None：dexData 无 schema-known 买卖方向字段（v10.29，不猜）。
     锚正向匹配由路由层（route_ws_frame）保证——帧自带 id 不得自证关联。
     非订单频道/非 dict 帧 = []（行情噪声静默跳过——**不**计 wsFrameRejected，
     那是「同 entry 自相矛盾整帧拒收」的词汇）；无 entry 身份键的单元同样不路由。"""
@@ -1782,7 +1789,7 @@ def _okx_ws_entries(payload):
             )
             if c:
                 ids["chain"] = c
-        out.append({"ids": ids, "success": type(dd.get("status")) is str and dd.get("status") == "1"})
+        out.append({"ids": ids, "success": type(dd.get("status")) is str and dd.get("status") == "1", "side": None})
     return out
 
 
@@ -1825,8 +1832,9 @@ def _gmgn_ws_entries(payload):
     处理单元——data 列表每个元素独立：身份（oi→orderId / h→txHash）、状态（st）、
     方向（si）、链（ch）只取自同一 entry（docs/gmgn.md：「同 entry h/oi 命中本单
     且 st=successful」同律）；目标在第二 entry 也照常关联（不 data[0]-only）。
-    success = 同 entry st==="successful" 且 si==="buy"（卖单不采纳，classify-ws
-    同律）。锚正向匹配由路由层保证。非订单频道/无 data 列表 = []
+    success = 同 entry st==="successful" 且 si∈{"buy","sell"}（v10.29 起卖单出推送）；
+    side = 同 entry 的 si（"buy"|"sell"），其它 si → side None 且不算成功。
+    锚正向匹配由路由层保证——卖单成功只落在 oi/h 正向匹配的腿上。非订单频道/无 data 列表 = []
     （行情噪声静默跳过——不计 wsFrameRejected）。"""
     obj = _decode_ws(payload)
     if not isinstance(obj, dict):
@@ -1849,11 +1857,12 @@ def _gmgn_ws_entries(payload):
             c = CHAIN_NAME_STR.get(str(d0["ch"]).lower())
             if c:
                 ids["chain"] = c
+        side = str(d0.get("si")) if str(d0.get("si")) in ("buy", "sell") else None
         out.append(
             {
                 "ids": ids,
-                "success": str(d0.get("st")) == "successful"
-                and str(d0.get("si")) == "buy",
+                "success": str(d0.get("st")) == "successful" and side is not None,
+                "side": side,
             }
         )
     return out
@@ -4961,7 +4970,7 @@ class Store:
             return target, reason
 
     def buffer_ws_unit(
-        self, platform, host, payload, ids, success, t, tw, count_diag=True
+        self, platform, host, payload, ids, success, t, tw, count_diag=True, side=None
     ):
         """WS 成功/身份帧可能先于其 HTTP 响应到达（docs/okx.md §2.4：
         Sol 的 /broadcast 常晚于 WS 确认）——零命中且本开窗该平台还有**无锚腿**
@@ -4998,6 +5007,7 @@ class Store:
                     "payload": payload,
                     "ids": {k: v for k, v in (ids or {}).items() if v is not None},
                     "success": success,
+                    "side": side,  # v10.29：同 entry 买卖方向，重审时随成功写入证据
                     "t": t,  # 单调源时间（hook 入口冻结）——采纳时成功时刻用它，不用重审时刻
                     "tw": tw,
                     "epoch": mark.get("epoch"),
@@ -6943,6 +6953,7 @@ class SpeedexHkTiming:
                     unit.get("success"),
                     t_obs,
                     tw_obs,
+                    side=unit.get("side"),
                 )
             except Exception:
                 pass
@@ -7007,8 +7018,8 @@ class SpeedexHkTiming:
             STORE.note_relay_ws("noIdentity")
 
     def _ws_units(self, platform, payload):
-        """入站帧 → 处理单元列表 [{ids, success}…]。规则带
-        ws_entries（okx/gmgn）时逐 entry 产出（success = 同 entry 状态判定）；
+        """入站帧 → 处理单元列表 [{ids, success, side}…]。规则带
+        ws_entries（okx/gmgn）时逐 entry 产出（success = 同 entry 状态判定，side = 同 entry 方向）；
         否则整帧一单元（success=None——采纳时再以 ws_success(payload, 锚视图) 判定）。
         无身份键（orderId/clientOrderId/txHash）的单元不路由（行情
         噪声静默跳过）。返回 None = 整帧拒收（ws_ids 的归一不一致语义）。"""
@@ -7019,7 +7030,7 @@ class SpeedexHkTiming:
             for e in entries_fn(payload) or []:
                 ids = e.get("ids") or {}
                 if any(ids.get(k) is not None for k in _IDENTITY_KEYS):
-                    units.append({"ids": ids, "success": bool(e.get("success"))})
+                    units.append({"ids": ids, "success": bool(e.get("success")), "side": e.get("side")})
             return units
         ids = rule.get("ws_ids", lambda p: {})(payload)
         if ids is None:
@@ -7039,6 +7050,7 @@ class SpeedexHkTiming:
         tw_obs,
         allow_buffer=True,
         rebuffered=False,
+        side=None,
     ):
         """单单元（整帧或单 entry）路由+采纳。零命中且本开窗该平台
         还有无锚腿（响应未到、锚待定）→ 缓冲（保留单调源时间/窗口 epoch/方向），
@@ -7060,6 +7072,7 @@ class SpeedexHkTiming:
                     t_obs,
                     tw_obs,
                     count_diag=not rebuffered,
+                    side=side,
                 ):
                     STORE.note_frame_diag(
                         "wsFrameNoLegMatch"
@@ -7092,6 +7105,7 @@ class SpeedexHkTiming:
                     t_obs,
                     tw_obs,
                     count_diag=not rebuffered,
+                    side=side,
                 ):
                     STORE.note_frame_diag("wsFrameNoLegMatch")
             return
@@ -7210,6 +7224,8 @@ class SpeedexHkTiming:
                     "status": "1" if platform == "okx" else "successful",
                     "txHash": tx, "txDigest": "-".join(digest[i:i+16] for i in range(0, 64, 16)),
                     "observedAtMs": t_obs, "frameSha": leg["wsSha"],
+                    # v10.29: same-entry order side (GMGN si); OKX dexData has no side field → null.
+                    "side": side if side in ("buy", "sell") else None,
                 }
             elif platform == "fomo" and tx:
                 leg["successEvidence"] = {
@@ -7278,6 +7294,7 @@ class SpeedexHkTiming:
                     ent["t"],
                     ent["tw"],
                     rebuffered=True,
+                    side=ent.get("side"),
                 )
             except Exception:
                 pass

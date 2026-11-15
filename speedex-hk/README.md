@@ -144,3 +144,15 @@ FOMO Solana 同链买入（F-SOL）的 HK 成功信号 = 页面自有 "Bought" t
 
 跨仓：speedex `resolvePushForRun` 只认 Relay WS 为 FOMO 推送；新通道出推送须同步改 EU（shared-push-timing / public-projector /
 docs/hk-proxy-timing.md）。
+
+## 2026.11.15-gmgn-sell-push-v10.29
+
+GMGN 卖单出推送：`tg_order_info` / `tg_processed_order_info` 条目 `st==="successful"` 且 `si∈{"buy","sell"}` 为成功，
+其它 `si` 不算。OKX/GMGN `successEvidence` 新增 `side`：GMGN = 同 entry 的 `si`；OKX `dex-*-order-info` 的 dexData 无
+schema-known 买卖方向字段 → 恒 `null`（帧里出现的未登记键不采信）。`version` 仍为 1，其它键不变。
+
+- 路由、锚、新鲜度、早到缓冲、首写冻结、冲突/否决门全部不变：卖单成功只落在响应锚（oi/h）正向匹配的腿上；他单卖出
+  （共同键全不等）零命中，部分相等计 `wsFrameAnchorConflict`，都不落到买单腿。早到缓冲单元保留 `side`。
+- 买单腿成功与 v10.28 完全相同，另带 `side:"buy"`。
+
+跨仓：speedex public-projector 的 success 键白名单未登记 `side`（公开投影丢弃）；EU 卖单推送需由消费侧绑定卖单 run 与腿。

@@ -424,7 +424,8 @@ class TestHkTiming(unittest.TestCase):
         self.assertEqual(
             leg["evidence"]["receipt"]["slot"], 287654321, "R24：Sol receipt 存 slot"
         )
-        # 卖单不采纳（新开窗口前先关旧窗口——单批纪律与生产一致）
+        self.assertEqual(leg["evidence"]["success"]["side"], "buy")
+        # v10.29：卖单出推送（新开窗口前先关旧窗口——单批纪律与生产一致）
         A.STORE.mark_close("run-g")
         A.STORE.mark_open("run-g2")
         f = FakeFlow(
@@ -448,7 +449,34 @@ class TestHkTiming(unittest.TestCase):
                 ),
             )
         )
-        self.assertIsNone(A.STORE.timeline("run-g2")["legs"][0]["hkL1aMs"])
+        sell = A.STORE.timeline("run-g2")["legs"][0]
+        self.assertIsNotNone(sell["hkL1aMs"])
+        self.assertEqual(sell["evidence"]["success"]["side"], "sell")
+        # 其它 si（非 buy/sell）不算成功
+        A.STORE.mark_close("run-g2")
+        A.STORE.mark_open("run-g3")
+        f = FakeFlow(
+            "gmgn.ai",
+            "/tapi/v1/swap_batch_order",
+            "POST",
+            resp_body=json.dumps({"data": {"hash": sig, "orderId": "g3"}}),
+        )
+        A.addons[0].request(f)
+        A.addons[0].response(f)
+        A.addons[0].websocket_message(
+            ws_frame(
+                "ws.gmgn.ai",
+                json.dumps(
+                    {
+                        "channel": "tg_processed_order_info",
+                        "data": [
+                            {"h": sig, "oi": "g3", "st": "successful", "si": "transfer"}
+                        ],
+                    }
+                ),
+            )
+        )
+        self.assertIsNone(A.STORE.timeline("run-g3")["legs"][0]["hkL1aMs"])
 
     def test_padre_msgpack_done(self):
         """PX-01（r8，案例 D）：Padre 出站锚只有 Turnkey sign_raw_payload——其**真实**响应
@@ -7018,7 +7046,7 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.11.14-fomo-provider-signature-v10.28")
+        self.assertEqual(A.ADDON_VERSION, "2026.11.15-gmgn-sell-push-v10.29")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 
@@ -10715,6 +10743,189 @@ class TestFomoProviderSignatureV1028(unittest.TestCase):
         for ev in A.STORE.events[run]:
             if ev.get("orderRequestSource") == "fomo-solana-execution" or ev.get("kind") == "fomo_transport_req":
                 self.assertIsNone(ev.get("bodySha"))
+
+
+class TestGmgnSellPushV1029(unittest.TestCase):
+    """v10.29: GMGN tg_(processed_)order_info entries with st=="successful" and si in {buy, sell} are
+    success; successEvidence carries side (GMGN = same-entry si; OKX dexData has no side field → null).
+    A sell success binds only through the existing anchor routing: only the leg whose response anchor
+    (oi/h) positively matches, never a buy leg of another order. Buy legs keep the v10.28 witness + side."""
+
+    SIG_BUY = "5" * 88
+    SIG_SELL = "4" * 88
+    SIG_OTHER = "3" * 88
+    V1028_KEYS = {"version", "platform", "channel", "status", "txHash", "txDigest", "observedAtMs",
+                  "frameSha", "matchedKeys"}
+
+    def setUp(self):
+        fresh()
+        orig = A._poll_receipt
+        A._poll_receipt = lambda *a, **k: None
+        self.addCleanup(setattr, A, "_poll_receipt", orig)
+
+    def _open(self, run, rounds=2):
+        A.STORE.mark_open(run, manifest={"version": 1, "runId": run, "rounds": rounds,
+                                         "legs": [{"platform": "gmgn", "chain": "solana", "rounds": rounds}]})
+
+    def _order(self, oi, h, respond=True):
+        f = FakeFlow("gmgn.ai", "/tapi/v1/swap_batch_order", "POST", req_body=json.dumps({"chain": "sol"}),
+                     resp_body=json.dumps({"code": 0, "data": {"hash": h, "orderId": oi}}))
+        A.addons[0].request(f)
+        if respond:
+            A.addons[0].response(f)
+        return f
+
+    def _leg(self, run, oi):
+        return next(l for l in A.STORE.legs[run] if (l.get("_anchor") or {}).get("orderId") == oi)
+
+    @staticmethod
+    def _entry(oi, h, si, st="successful"):
+        e = {"st": st, "si": si, "ch": "sol"}
+        if oi:
+            e["oi"] = oi
+        if h:
+            e["h"] = h
+        return e
+
+    def _frame(self, *entries, channel="tg_processed_order_info"):
+        A.addons[0].websocket_message(ws_frame("ws.gmgn.ai", json.dumps({"channel": channel, "data": list(entries)})))
+
+    def test_entries_side_and_success(self):
+        frame = json.dumps({"channel": "tg_order_info", "data": [
+            self._entry("o1", self.SIG_BUY, "buy"),
+            self._entry("o2", self.SIG_SELL, "sell"),
+            self._entry("o3", self.SIG_OTHER, "sell", st="failed"),
+            self._entry("o4", self.SIG_OTHER, "BUY"),
+            self._entry("o5", self.SIG_OTHER, "transfer"),
+            self._entry("o6", self.SIG_OTHER, None),
+            {"oi": "o7", "h": self.SIG_OTHER, "st": "successful"},
+        ]})
+        got = [(u["ids"]["orderId"], u["success"], u["side"]) for u in A._gmgn_ws_entries(frame)]
+        self.assertEqual(got, [
+            ("o1", True, "buy"), ("o2", True, "sell"), ("o3", False, "sell"),
+            ("o4", False, None), ("o5", False, None), ("o6", False, None), ("o7", False, None),
+        ])
+
+    def test_buy_leg_witness_unchanged_plus_side(self):
+        import hashlib
+        run = "run-v1029-buy"
+        self._open(run, rounds=1)
+        self._order("gBuy", self.SIG_BUY)
+        leg = self._leg(run, "gBuy")
+        self._frame(self._entry("gBuy", self.SIG_BUY, "buy"))
+        d = hashlib.sha256(self.SIG_BUY.encode()).hexdigest()
+        self.assertEqual(leg["successEvidence"], {
+            "version": 1, "platform": "gmgn", "channel": "tg_processed_order_info", "status": "successful",
+            "txHash": self.SIG_BUY, "txDigest": "-".join(d[i:i + 16] for i in range(0, 64, 16)),
+            "observedAtMs": leg["tSuccessPushMs"], "frameSha": leg["wsSha"],
+            "matchedKeys": ["orderId", "txHash"], "side": "buy",
+        })
+        self.assertEqual(set(leg["successEvidence"]) - {"side"}, self.V1028_KEYS, "no other schema key changes")
+        tl = A.STORE.timeline(run)
+        self.assertEqual(tl["counts"]["observed"], 1)
+        self.assertEqual(tl["legs"][0]["evidence"]["success"]["side"], "buy")
+        self.assertEqual(tl["legs"][0]["evidence"]["success"]["version"], 1)
+        self.assertEqual(A.STORE.timeline(run, full=True)["legs"][0]["evidence"]["success"]["side"], "buy")
+
+    def test_sell_binds_only_to_its_anchor_leg(self):
+        run = "run-v1029-pair"
+        self._open(run)
+        self._order("gBuy", self.SIG_BUY)
+        self._order("gSell", self.SIG_SELL)
+        buy, sell = self._leg(run, "gBuy"), self._leg(run, "gSell")
+        self.assertIsNot(buy, sell)
+        # The sell success arrives while the buy leg is still open and without success.
+        self._frame(self._entry("gSell", self.SIG_SELL, "sell"))
+        self.assertIsNone(buy.get("tSuccessPushMs"), "sell success never lands on the buy leg")
+        self.assertIsNone(buy.get("successEvidence"))
+        self.assertIsNotNone(sell.get("tSuccessPushMs"))
+        self.assertEqual(sell["successEvidence"]["side"], "sell")
+        self.assertEqual(sell["successEvidence"]["txHash"], self.SIG_SELL)
+        self.assertEqual(sell["successAnchorKeys"], ["orderId", "txHash"])
+        t_sell = sell["tSuccessPushMs"]
+        # The buy success later binds to the buy leg; the sell leg stays frozen.
+        self._frame(self._entry("gBuy", self.SIG_BUY, "buy"))
+        self.assertEqual(buy["successEvidence"]["side"], "buy")
+        self.assertEqual(buy["successEvidence"]["txHash"], self.SIG_BUY)
+        self.assertEqual(sell["tSuccessPushMs"], t_sell)
+        self.assertEqual(sell["successEvidence"]["side"], "sell")
+        tl = A.STORE.timeline(run)
+        self.assertEqual(tl["counts"]["observed"], 2)
+        self.assertEqual(sorted(l["evidence"]["success"]["side"] for l in tl["legs"]), ["buy", "sell"])
+
+    def test_mixed_frame_splits_per_entry(self):
+        run = "run-v1029-mixed"
+        self._open(run)
+        self._order("gBuy", self.SIG_BUY)
+        self._order("gSell", self.SIG_SELL)
+        buy, sell = self._leg(run, "gBuy"), self._leg(run, "gSell")
+        self._frame(self._entry("gSell", self.SIG_SELL, "sell"), self._entry("gBuy", self.SIG_BUY, "buy"),
+                    channel="tg_order_info")
+        self.assertEqual((buy["successEvidence"]["side"], buy["successEvidence"]["txHash"]), ("buy", self.SIG_BUY))
+        self.assertEqual((sell["successEvidence"]["side"], sell["successEvidence"]["txHash"]),
+                         ("sell", self.SIG_SELL))
+
+    def test_sell_without_matching_anchor_never_reaches_buy_leg(self):
+        run = "run-v1029-noleak"
+        self._open(run, rounds=1)
+        self._order("gBuy", self.SIG_BUY)
+        buy = self._leg(run, "gBuy")
+        # Another order's sell (e.g. a platform auto-sell): every shared key differs → miss, not routed.
+        self._frame(self._entry("gOther", self.SIG_OTHER, "sell"))
+        self._frame(self._entry("gOther", None, "sell"))
+        self._frame(self._entry(None, self.SIG_OTHER, "sell"))
+        self.assertEqual(A.STORE.timeline(run)["diag"].get("wsFrameNoLegMatch"), 3)
+        # A sell entry that shares only the buy's hash but carries another order id → conflict, rejected.
+        self._frame(self._entry("gSell", self.SIG_BUY, "sell"))
+        self.assertEqual(A.STORE.timeline(run)["diag"].get("wsFrameAnchorConflict"), 1)
+        self.assertIsNone(buy.get("tSuccessPushMs"))
+        self.assertIsNone(buy.get("successEvidence"))
+        self.assertEqual(buy.get("txHash"), self.SIG_BUY, "anchor hash not overwritten")
+        # The buy leg's own success still adopts exactly as before.
+        self._frame(self._entry("gOther", self.SIG_OTHER, "sell"), self._entry("gBuy", self.SIG_BUY, "buy"))
+        self.assertEqual(buy["successEvidence"]["side"], "buy")
+        self.assertEqual(buy["successEvidence"]["txHash"], self.SIG_BUY)
+        self.assertEqual(A.STORE.timeline(run)["counts"]["observed"], 1)
+
+    def test_early_sell_frame_buffered_keeps_side_and_source_time(self):
+        run = "run-v1029-early"
+        self._open(run)
+        self._order("gBuy", self.SIG_BUY)
+        f = self._order("gSell", self.SIG_SELL, respond=False)
+        time.sleep(0.02)
+        self._frame(self._entry("gSell", self.SIG_SELL, "sell"))  # before the sell response → buffered
+        self.assertEqual(len(A.STORE.ws_buffer.get(run) or []), 1)
+        buf = A.STORE.ws_buffer[run][0]
+        self.assertEqual((buf["success"], buf["side"]), (True, "sell"))
+        t_frame = buf["t"]
+        time.sleep(0.02)
+        A.addons[0].response(f)
+        buy, sell = self._leg(run, "gBuy"), self._leg(run, "gSell")
+        self.assertEqual(sell["tSuccessPushMs"], t_frame, "buffered success keeps its source time")
+        self.assertEqual(sell["successEvidence"]["side"], "sell")
+        self.assertIsNone(buy.get("tSuccessPushMs"))
+
+    def test_okx_side_null(self):
+        """OKX dex-*-order-info dexData has no schema-known side field: side is null, even if a
+        non-schema 'side' key appears in the entry."""
+        h = "0x" + "ab" * 32
+        frame = lambda dd: json.dumps({"arg": {"channel": "dex-across-order-info"}, "data": {"dexData": dd}})
+        dd = {"status": "1", "orderId": "ord1", "transactionHash": h, "chainId": "56", "side": "sell"}
+        self.assertEqual([u["side"] for u in A._okx_ws_entries(frame(dd))], [None])
+        run = "run-v1029-okx"
+        A.STORE.mark_open(run, manifest={"version": 1, "runId": run, "rounds": 1,
+                                         "legs": [{"platform": "okx", "chain": "bsc", "rounds": 1}]})
+        f = FakeFlow("web3.okx.com", "/priapi/v6/dx/trade/multi/broadcast", "POST",
+                     req_body=json.dumps({"data": {"chainId": "56"}}),
+                     resp_body=json.dumps({"code": "0", "data": {"transactionHash": h, "orderId": "ord1"}}))
+        A.addons[0].request(f)
+        A.addons[0].response(f)
+        A.addons[0].websocket_message(ws_frame("wsdexpri.okx.com", frame(dd)))
+        ev = A.STORE.legs[run][0]["successEvidence"]
+        self.assertIn("side", ev)
+        self.assertIsNone(ev["side"])
+        self.assertEqual((ev["version"], ev["status"]), (1, "1"))
+        self.assertEqual(set(ev) - {"side"}, self.V1028_KEYS)
 
 
 if __name__ == "__main__":
