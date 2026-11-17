@@ -323,7 +323,11 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # v10.29（2026-11-15）：GMGN 卖单出推送——tg_(processed_)order_info 条目 st=="successful" 且 si∈{buy,sell}
 # 为成功（其它 si 不算）；OKX/GMGN successEvidence 新增 side（GMGN = 同 entry si；OKX dexData 无方向字段 → null）。
 # 路由/锚/新鲜度/冻结门不变：卖单成功只落在锚正向匹配的腿；买单成功与 v10.28 相同（另带 side:"buy"）。
-ADDON_VERSION = "2026.11.15-gmgn-sell-push-v10.29"
+# v10.30（2026-11-17，owner 决定）：OKX Solana 页面的 Helius Atlas WS（精确 host atlas-mainnet.helius-rpc.com，
+# 生产 allow_hosts 新增）——transactionSubscribe(failed:false) reqId→sig→subId 连接级映射，映射命中且
+# result.signature 等于映射签名的 transactionNotification 记 OKX 腿 channelArrivals {channel:"helius",
+# api:"transactionNotification"}（与 fullnode 同钟同形、首到冻结）。链域到达，不是平台成功。api-key query 不读不存。
+ADDON_VERSION = "2026.11.17-helius-sol-v10.30"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -725,6 +729,78 @@ def _sol_fullnode_server_identity(flow, payload):
         sig = sigs[0] if isinstance(sigs, list) and sigs else None
         return (sig, method) if isinstance(sig, str) and _SOL_SIG_RE.fullmatch(sig) else None
     return None
+
+
+# ── v10.30 Helius Atlas WS（OKX Solana 页面的链确认订阅）─────────────────────
+# 页面开 wss://atlas-mainnet.helius-rpc.com/?api-key=<KEY>；query（api-key）永不读取/记录/持久化，
+# 分派只用 pretty_host（精确等值）。出站 transactionSubscribe(params[0]={signature,…,failed:false})
+# 以 reqId 登记签名；入站回应 {"id":reqId,"result":subId} 绑定 subId→sig（与 _sol_subs 同一回应/映射
+# 函数、独立连接级存储）；transactionNotification（result 只有 slot/signature/transactionIndex，无
+# meta/err）只经映射还原，且 result.signature 必须等于映射签名。failed:false 订阅只推送成功交易，
+# 故这是链域到达（channel=helius），不是平台/订单成功——永不进成功/资格/锚管线。帧体不持久化。
+HELIUS_ATLAS_WS_HOST = "atlas-mainnet.helius-rpc.com"
+HELIUS_CHANNEL = "helius"
+_HELIUS_SUBS_KEY = "speedex_helius_subs"
+
+
+def _helius_subs(flow):
+    return flow.metadata.setdefault(_HELIUS_SUBS_KEY, {"req": {}, "subs": {}})
+
+
+def _helius_client_frame(flow, payload):
+    """Helius 出站帧 → 诊断键或 None。transactionSubscribe 仅当 params[0] 为 dict、signature 形状合法、
+    failed 恰为 False 时登记 reqId→sig（否则清掉同 reqId 的待回应登记）；transactionUnsubscribe 清 subId。"""
+    obj = _decode_ws(payload)
+    if not isinstance(obj, dict):
+        return None
+    method = obj.get("method")
+    ident = obj.get("id")
+    params = obj.get("params")
+    subs = _helius_subs(flow)
+    if method == "transactionSubscribe":
+        flt = params[0] if isinstance(params, list) and params else None
+        sig = flt.get("signature") if isinstance(flt, dict) else None
+        ok = (ident is not None and isinstance(sig, str) and _SOL_SIG_RE.fullmatch(sig) is not None
+              and flt.get("failed") is False)
+        if ok:
+            subs["req"][str(ident)] = sig
+            return "heliusSubscribe"
+        if ident is not None:
+            subs["req"].pop(str(ident), None)
+        return "heliusSubscribeIneligible"
+    if method == "transactionUnsubscribe":
+        sid = params[0] if isinstance(params, list) and params else None
+        if sid is not None:
+            subs["subs"].pop(str(sid), None)
+        return "heliusUnsubscribe"
+    return None
+
+
+def _helius_server_frame(flow, payload):
+    """Helius 入站帧 → (诊断键|None, sig|None)。sig 只在映射命中且 result.signature 等于映射签名时返回。"""
+    obj = _decode_ws(payload)
+    if not isinstance(obj, dict):
+        return None, None
+    subs = _helius_subs(flow)
+    method = obj.get("method")
+    if method is None:
+        if obj.get("id") is not None and str(obj.get("id")) in subs["req"]:
+            _sol_sub_response(subs, obj)
+            return "heliusSubscribeReply", None
+        return None, None
+    if method != "transactionNotification":
+        return None, None
+    params = obj.get("params")
+    result = params.get("result") if isinstance(params, dict) else None
+    if not isinstance(result, dict):
+        return "heliusNotifyInvalid", None
+    mapped = _sol_sub_mapped(subs, params)
+    if not mapped:
+        return "heliusNotifyUnmapped", None
+    sig = result.get("signature")
+    if not isinstance(sig, str) or sig != mapped:
+        return "heliusNotifySigMismatch", None
+    return "heliusNotify", sig
 
 
 def _j(payload):
@@ -5222,10 +5298,11 @@ class Store:
             _maybe_probe_fullnode(leg, h)
             return h
 
-    def note_channel_arrival(self, chain, tx_value, channel, api, t_ms):
+    def note_channel_arrival(self, chain, tx_value, channel, api, t_ms, platform=None):
         """v10：链域通道（nodeone/fullnode，www.okx.com）成功通知到达登记——HK 钟。
         仅精确 tx 身份匹配（锚内 txHash 恒等）的开窗腿；每腿每通道首到冻结。
-        与成功判定管线完全分离：不触成功/资格/锚门，纯到达时刻记录。"""
+        与成功判定管线完全分离：不触成功/资格/锚门，纯到达时刻记录。
+        v10.30：platform 非空时只登记该平台的腿（Helius = OKX Solana 页面的订阅）。"""
         if not tx_value:
             return
         with self.lock:
@@ -5233,6 +5310,8 @@ class Store:
             for rid in self._open_run_ids_locked(now):
                 for leg in self.legs.get(rid, []):
                     if leg.get("dup") or leg.get("windowClosed") or leg.get("_anchorVeto"):
+                        continue
+                    if platform and leg.get("platform") != platform:
                         continue
                     anchor = (leg.get("_anchor") or {}).get("txHash")
                     if anchor is None:
@@ -6838,6 +6917,7 @@ class SpeedexHkTiming:
         # 显式清理防止长驻连接表残留；订阅映射永不在连接间复用）。
         try:
             flow.metadata.pop(_SOL_SUBS_KEY, None)
+            flow.metadata.pop(_HELIUS_SUBS_KEY, None)
         except Exception:
             pass
 
@@ -6881,6 +6961,20 @@ class SpeedexHkTiming:
             return
         if host == FOMO_PROVIDER_WS_HOST:
             self._handle_fomo_provider_ws(flow, msg, t_obs)
+            return
+        if host == HELIUS_ATLAS_WS_HOST:
+            # v10.30：Helius transactionSubscribe(failed:false) → 映射通知 → OKX Solana 腿链域到达（HK 钟）。
+            # 只用 host 分派；query（api-key）与帧体不读不存。
+            if msg.from_client:
+                key = _helius_client_frame(flow, msg.content)
+                sig = None
+            else:
+                key, sig = _helius_server_frame(flow, msg.content)
+            if key:
+                STORE.note_frame_diag(key)
+            if sig:
+                STORE.note_channel_arrival("solana", sig, HELIUS_CHANNEL, "transactionNotification", t_obs,
+                                           platform="okx")
             return
         platform = _classify_ws(host)
         if not platform:

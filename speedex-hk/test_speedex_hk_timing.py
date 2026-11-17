@@ -7046,7 +7046,7 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.11.15-gmgn-sell-push-v10.29")
+        self.assertEqual(A.ADDON_VERSION, "2026.11.17-helius-sol-v10.30")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 
@@ -8579,6 +8579,153 @@ class TestChainChannelArrivals(unittest.TestCase):
         self.conn_send(f, json.dumps({"jsonrpc": "2.0", "method": "signatureNotification",
             "params": {"subscription": 284, "result": {"context": {"slot": 9}, "value": {"err": None}}}}))
         self.assertIsNone(A.STORE.legs[self.run][-1].get("_channelArrivals"), "连接结束清理订阅映射")
+
+
+class TestHeliusAtlasArrival(TestChainChannelArrivals):
+    """v10.30：OKX Solana 页面 Helius Atlas WS 的 transactionSubscribe(failed:false) → 映射
+    transactionNotification → OKX 腿 channelArrivals helius（与 fullnode 同钟同形、首到冻结）。
+    帧形取自真实抓包（okx-capture-20260916025303：字符串 reqId、整数 subId、result 只有 slot/signature/transactionIndex）。
+    继承 TestChainChannelArrivals 的夹具；父类用例随之复跑（fullnode 行为不变）。"""
+
+    API_KEY = "synthetic-helius-key-0f3a9c"
+
+    def helius_conn(self):
+        f = FakeFlow(A.HELIUS_ATLAS_WS_HOST, "/?api-key=" + self.API_KEY, "GET")
+        f.websocket = types.SimpleNamespace(messages=[])
+        return f
+
+    def subscribe(self, f, sig, req_id=None, sub_id=3236739, failed=False, reply=True):
+        req_id = sig if req_id is None else req_id  # 页面用签名本身作 reqId
+        flt = {"signature": sig, "accountInclude": ["B48tXf" + "1" * 38]}
+        if failed is not None:
+            flt["failed"] = failed
+        self.conn_send(f, json.dumps({"jsonrpc": "2.0", "id": req_id, "method": "transactionSubscribe",
+            "params": [flt, {"commitment": "processed", "encoding": "jsonParsed",
+                             "transactionDetails": "signatures", "showRewards": False,
+                             "maxSupportedTransactionVersion": 0}]}), from_client=True)
+        if reply:
+            self.conn_send(f, json.dumps({"jsonrpc": "2.0", "id": req_id, "result": sub_id}))
+
+    def notify(self, f, sig, sub_id=3236739):
+        self.conn_send(f, json.dumps({"jsonrpc": "2.0", "method": "transactionNotification",
+            "params": {"subscription": sub_id, "result": {"slot": 447413644, "signature": sig,
+                                                          "transactionIndex": 430}}}))
+
+    def arrivals(self):
+        return A.STORE.legs[self.run][-1].get("_channelArrivals")
+
+    def test_correlated_notification_records_helius_arrival(self):
+        sig = self.sol_leg()
+        f = self.helius_conn()
+        self.conn_send(f, json.dumps({"jsonrpc": "2.0", "method": "ping"}), from_client=True)
+        self.conn_send(f, json.dumps({"jsonrpc": "2.0", "id": None,
+                                      "error": {"code": -32700, "message": "Parse error"}}))
+        self.subscribe(f, sig)
+        self.clock += 380
+        self.notify(f, sig)
+        self.assertEqual(self.sol_rows(sig)[0]["channelArrivals"],
+            [{"channel": "helius", "api": "transactionNotification", "ms": 380}])
+        # 首到冻结：第二帧不覆盖
+        self.clock += 200
+        self.notify(f, sig)
+        self.assertEqual(self.sol_rows(sig)[0]["channelArrivals"][0]["ms"], 380)
+        leg = A.STORE.legs[self.run][-1]
+        self.assertIsNone(leg.get("tSuccessPushMs"), "链域到达不是平台成功")
+        self.assertIsNone(leg.get("successEvidence"))
+        self.assertEqual(A.STORE.diag.get("heliusNotify"), 2)
+
+    def test_fullnode_and_helius_coexist_fullnode_unchanged(self):
+        sig = self.sol_leg()
+        fn = self.sol_conn()
+        self.sub_pair(fn, sig)
+        h = self.helius_conn()
+        self.subscribe(h, sig, req_id=7, sub_id=284)  # 同 reqId/subId 数值：映射按连接隔离
+        self.clock += 300
+        self.notify(h, sig, sub_id=284)
+        self.clock += 150
+        self.conn_send(fn, json.dumps({"jsonrpc": "2.0", "method": "signatureNotification",
+            "params": {"subscription": 284, "result": {"context": {"slot": 9}, "value": {"err": None}}}}))
+        self.assertEqual(self.sol_rows(sig)[0]["channelArrivals"], [
+            {"channel": "fullnode", "api": "signatureNotification", "ms": 450},
+            {"channel": "helius", "api": "transactionNotification", "ms": 300},
+        ])
+        # Helius 通知帧形（无 meta/err）在 fullnode 连接上不被认
+        g = self.sol_conn()
+        self.assertIsNone(A._sol_fullnode_server_identity(g, json.dumps({"jsonrpc": "2.0",
+            "method": "transactionNotification", "params": {"subscription": 1,
+            "result": {"slot": 9, "signature": sig, "transactionIndex": 1}}})))
+
+    def test_uncorrelated_frames_record_nothing(self):
+        sig = self.sol_leg()
+        other = A._b58encode(bytes((i * 11 + 5) & 0xFF for i in range(64)))
+        cases = {
+            "other subscription": lambda f: (self.subscribe(f, sig), self.notify(f, sig, sub_id=999)),
+            "different signature in result": lambda f: (self.subscribe(f, sig), self.notify(f, other)),
+            "subscribed to other signature": lambda f: (self.subscribe(f, other), self.notify(f, other)),
+            "failed missing": lambda f: (self.subscribe(f, sig, failed=None), self.notify(f, sig)),
+            "failed true": lambda f: (self.subscribe(f, sig, failed=True), self.notify(f, sig)),
+            "failed string": lambda f: (self.subscribe(f, sig, failed="false"), self.notify(f, sig)),
+            "no reply": lambda f: (self.subscribe(f, sig, reply=False), self.notify(f, sig)),
+            "error reply": lambda f: (self.subscribe(f, sig, reply=False),
+                self.conn_send(f, json.dumps({"jsonrpc": "2.0", "id": sig, "error": {"code": -32602}})),
+                self.notify(f, sig)),
+            "unsubscribed": lambda f: (self.subscribe(f, sig),
+                self.conn_send(f, json.dumps({"jsonrpc": "2.0", "id": 9, "method": "transactionUnsubscribe",
+                                              "params": [3236739]}), from_client=True),
+                self.notify(f, sig)),
+            "connection ended": lambda f: (self.subscribe(f, sig), A.addons[0].websocket_end(f),
+                self.notify(f, sig)),
+            "notification without subscribe": lambda f: self.notify(f, sig),
+        }
+        for name, scenario in cases.items():
+            with self.subTest(name):
+                scenario(self.helius_conn())
+                self.assertIsNone(self.arrivals(), name)
+        # 相似 host 不分派
+        f = FakeFlow("atlas-mainnet.helius-rpc.com.evil.example", "/", "GET")
+        f.websocket = types.SimpleNamespace(messages=[])
+        self.subscribe(f, sig)
+        self.notify(f, sig)
+        self.assertIsNone(self.arrivals())
+        self.assertGreaterEqual(A.STORE.diag.get("heliusNotifyUnmapped", 0), 1)
+        self.assertGreaterEqual(A.STORE.diag.get("heliusNotifySigMismatch", 0), 1)
+        self.assertGreaterEqual(A.STORE.diag.get("heliusSubscribeIneligible", 0), 3)
+
+    def test_non_okx_leg_not_matched(self):
+        sig = self.sol_leg()
+        A.STORE.legs[self.run][-1]["platform"] = "gmgn"
+        f = self.helius_conn()
+        self.subscribe(f, sig)
+        self.notify(f, sig)
+        self.assertIsNone(self.arrivals(), "Helius 只登记 OKX 腿")
+
+    def test_api_key_never_persisted(self):
+        sig = self.sol_leg()
+        f = self.helius_conn()
+        A.addons[0].request(f)  # WS 升级请求（带 ?api-key=）走 request/response 钩子
+        A.addons[0].response(f)
+        self.subscribe(f, sig)
+        self.clock += 120
+        self.notify(f, sig)
+        self.assertTrue(self.arrivals())
+        with patch.dict(os.environ, {"SPEEDEX_HK_ALLOW_HOSTS": r"^atlas-mainnet\.helius-rpc\.com(:\d+)?$"}):
+            surfaces = {
+                "timeline": A.STORE.timeline(self.run),
+                "timelineFull": A.STORE.timeline(self.run, full=True),
+                "events": dict(A.STORE.events),
+                "diag": dict(A.STORE.diag),
+                "runDiag": {k: dict(v) for k, v in A.STORE.run_diag.items()},
+                "collectionIdentity": A._collection_identity(),
+                "health": _http_json("GET", "http://127.0.0.1:8072/health")[1],
+                "timelineHttp": _http_json("GET", f"http://127.0.0.1:8072/timeline/{self.run}?full=1")[1],
+            }
+        for name, value in surfaces.items():
+            dumped = json.dumps(value, default=str)
+            self.assertNotIn(self.API_KEY, dumped, name)
+            self.assertNotIn("api-key", dumped, name)
+        legs_dump = json.dumps(A.STORE.legs[self.run], default=str)
+        self.assertNotIn(self.API_KEY, legs_dump)
+        self.assertNotIn(A._HELIUS_SUBS_KEY, legs_dump)
 
 
 class TestWsRawRelay(unittest.TestCase):

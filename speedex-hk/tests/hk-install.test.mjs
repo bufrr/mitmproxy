@@ -233,3 +233,26 @@ test('FOMO v3：生产/实验 allow_hosts 覆盖全部 bundle-proven 第三方�
     assert.ok(overlay.includes(host), `overlay 缺 FOMO transport ${host}`);
   }
 });
+
+test('Helius Atlas v10.30：生产 allow_hosts 只加精确 atlas-mainnet.helius-rpc.com（带端口组、无通配），sender 照旧', () => {
+  const rel = 'deploy/hk-proxy/speedex-mitm.service';
+  const unit = readSource(rel);
+  assert.ok(unit.includes(String.raw`atlas-mainnet\\.helius-rpc\\.com`), `${rel} 缺精确 atlas host`);
+  assert.ok(!unit.includes('*.helius-rpc.com') && !unit.includes(String.raw`(.*\\.)?helius-rpc`), `${rel} 不得用通配 helius 扩围`);
+  const raw = unit.match(/--set "allow_hosts=([^"]+)"/)?.[1];
+  assert.ok(raw, `${rel} 缺 allow_hosts 行`);
+  const allow = new RegExp(raw.replace(/\\\\/g, '\\'));
+  for (const host of ['atlas-mainnet.helius-rpc.com', 'atlas-mainnet.helius-rpc.com:443', 'sender.helius-rpc.com', 'sender.helius-rpc.com:443']) {
+    assert.ok(allow.test(host), `${rel} 实际 regex 未命中 ${host}`);
+  }
+  for (const host of [
+    'atlas-mainnet.helius-rpc.com.evil.example:443', 'evil.atlas-mainnet.helius-rpc.com:443',
+    'mainnet.helius-rpc.com:443', 'atlas-devnet.helius-rpc.com:443', 'xatlas-mainnet.helius-rpc.com:443',
+    'atlas-mainnet.helius-rpc.com:443x', 'helius-rpc.com:443',
+  ]) {
+    assert.ok(!allow.test(host), `${rel} 不得命中 ${host}`);
+  }
+  // 实验 unit 不镜像生产（OKX 保持透传）——Helius Atlas 只服务 OKX Solana 页面，不并入实验 unit
+  const exp = readSource('deploy/hk-proxy/speedex-mitm-exp.service');
+  assert.ok(!exp.includes('atlas-mainnet'), '实验 unit 不得加入 atlas host（OKX 透传）');
+});

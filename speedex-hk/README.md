@@ -156,3 +156,25 @@ schema-known 买卖方向字段 → 恒 `null`（帧里出现的未登记键不�
 - 买单腿成功与 v10.28 完全相同，另带 `side:"buy"`。
 
 跨仓：speedex public-projector 的 success 键白名单未登记 `side`（公开投影丢弃）；EU 卖单推送需由消费侧绑定卖单 run 与腿。
+
+## 2026.11.17-helius-sol-v10.30
+
+OKX Solana 链域到达新增 Helius 通道（owner 决定 2026-11-17）。2026-11-11 起 OKX FULLNODE `signatureNotification` 静默，
+OKX Solana 腿 `channelArrivals` 全空；页面另开 `wss://atlas-mainnet.helius-rpc.com/?api-key=…` 做确认订阅。
+
+- **allow_hosts**：生产 `speedex-mitm.service` 新增精确 `atlas-mainnet\\.helius-rpc\\.com`（同组锚定 + `(:\\d+)?`）。不放行
+  helius-rpc.com 其它子域；`sender.helius-rpc.com`（FOMO 执行 transport）不变。实验 unit 不镜像生产的 OKX 解密，不加。
+- **映射**：分派只用 `pretty_host` 精确等值。出站 `transactionSubscribe`：`params[0]` 为对象、`signature` 合法 base58、
+  `failed` 恰为 `false` 时登记 reqId→sig（否则清掉同 reqId 待回应）；入站 `{"id":reqId,"result":subId}` 绑定 subId→sig；
+  `transactionUnsubscribe` 清 subId；连接结束清全部。存储为连接级 `flow.metadata`，与 fullnode `_sol_subs` 分开。
+- **到达**：`transactionNotification`（result 只有 `slot/signature/transactionIndex`，无 meta/err）只在 subscription 命中映射且
+  `result.signature` 等于映射签名时，经 `note_channel_arrival(..., platform="okx")` 记该签名锚的开窗 OKX 腿
+  `channelArrivals` `{channel:"helius", api:"transactionNotification", ms}`——与 fullnode 同钟（帧到达 hook 入口，HK monotonic，
+  ms 相对 tOrderOutMs）、同形、每腿每通道首到冻结。`failed:false` 订阅只推成功交易，但这仍是链域到达，不进成功/资格/锚管线。
+- **诊断计数**（`/health diag` 与 run diag）：`heliusSubscribe|SubscribeIneligible|SubscribeReply|Unsubscribe`、
+  `heliusNotify|NotifyUnmapped|NotifySigMismatch|NotifyInvalid`；到达本身计入既有 `chainChannelArrivals`。
+- **秘密**：api-key query 不读、不记、不入事件/diag/timeline/health/captureIdentity；帧体不持久化。离线测试钉住全部持久化面。
+
+跨仓：EU 消费侧目前只认 `nodeone|fullnode`——`scripts/lib/public-projector.mjs` channelArrivals.channel 枚举（公开投影丢弃）、
+`web/shared-push-timing.mjs` `chainArrivalEligible`（不参与 earliestHkSignal 供值）、`web/history-view.js` `CHAIN_DOMAIN_LABEL`
+（不出推送源行）。登记 `helius`（标签 HELIUS）后才展示/供值；同步 docs/hk-proxy-timing.md。
