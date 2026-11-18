@@ -178,3 +178,22 @@ OKX Solana 腿 `channelArrivals` 全空；页面另开 `wss://atlas-mainnet.heli
 跨仓：EU 消费侧目前只认 `nodeone|fullnode`——`scripts/lib/public-projector.mjs` channelArrivals.channel 枚举（公开投影丢弃）、
 `web/shared-push-timing.mjs` `chainArrivalEligible`（不参与 earliestHkSignal 供值）、`web/history-view.js` `CHAIN_DOMAIN_LABEL`
 （不出推送源行）。登记 `helius`（标签 HELIUS）后才展示/供值；同步 docs/hk-proxy-timing.md。
+
+## 2026.11.18-late-send-merge-v10.31
+
+OKX Solana late same-signature sends merge into the formal leg (LA batch 1794929320826-was1x r4).
+
+- **Cause**: the Solana `/multi/broadcast` leg has no chain at request time → `pendingBind`, no slot. Nozomi sends that arrive
+  after it with the same signature run request-time dedup while no bound formal exists, so they stay `anchorRole:"send"`,
+  non-dup (shared transport cannot self-promote; `bind_shared_sol_send` only takes sends at or before the platform order).
+  The formal binds later at receipt backfill and nothing revisits them → every later OKX Solana order leg on the chain is
+  `broadcast-anchor-unconfirmed` with `hkL1aMs:null`.
+- **Fix**: when an OKX formal order leg binds a slot (receipt backfill, promotion, `bind_shared_sol_send`, reopen), send legs of
+  the same run that arrived at or after it with an identical anchor `txHash` go through the existing dedup
+  (`_dedup_order_identity_locked`: chain, all shared keys, veto gates) → `dup:true`, `mergedIntoFlowId` = formal; their
+  in-flight receipt pollers redirect to the formal leg. Sends earlier than the formal still go only through
+  `bind_shared_sol_send` (earliest send keeps the anchor).
+- **Unchanged**: a send with no tx identity, a tx matching no bound leg, a formal that never binds, or a merge overturned by
+  identity conflict / formal veto (`_multiOrderSuspect`, never re-merged) still poisons later legs (juk09/7ngeq boundary).
+  Merged send legs keep their own `incomplete:"broadcast-identity-unconfirmed"` (same as existing merged fan-out sends).
+  Timeline/DTO shape unchanged.

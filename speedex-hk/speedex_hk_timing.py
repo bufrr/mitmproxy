@@ -327,7 +327,10 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # 生产 allow_hosts 新增）——transactionSubscribe(failed:false) reqId→sig→subId 连接级映射，映射命中且
 # result.signature 等于映射签名的 transactionNotification 记 OKX 腿 channelArrivals {channel:"helius",
 # api:"transactionNotification"}（与 fullnode 同钟同形、首到冻结）。链域到达，不是平台成功。api-key query 不读不存。
-ADDON_VERSION = "2026.11.17-helius-sol-v10.30"
+# v10.31 (2026-11-18): an OKX formal leg that binds its slot late (Solana /multi/broadcast pendingBind ->
+# receipt backfill) merges later same-txHash send legs as dup (_merge_late_sends_locked); before, they
+# stayed unresolved sends and poisoned every later OKX order on the chain (broadcast-anchor-unconfirmed).
+ADDON_VERSION = "2026.11.18-late-send-merge-v10.31"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -3665,6 +3668,45 @@ class Store:
         self._mark_dup_of_locked(leg, formal)
         return True
 
+    def _merge_late_sends_locked(self, formal):
+        """(lock held) v10.31: a formal OKX leg that binds its slot late (pendingBind ->
+        receipt backfill) absorbs same-run send legs that arrived after it with an
+        identical txHash; their request-time dedup ran while it had no slot. Earlier
+        sends stay with bind_shared_sol_send (earliest send keeps the anchor);
+        reopened (_multiOrderSuspect) legs are never re-merged."""
+        if (
+            formal.get("platform") != "okx"
+            or formal.get("anchorRole") != "order"
+            or formal.get("dup")
+            or formal.get("slot") is None
+            or formal.get("_anchorVeto")
+            or formal.get("windowClosed")
+        ):
+            return
+        tx = (formal.get("_anchor") or {}).get("txHash")
+        t0 = formal.get("tOrderOutMs")
+        if not tx or not isinstance(t0, (int, float)):
+            return
+        for other in self.legs.get(formal.get("runId"), []):
+            other_tx = (other.get("_anchor") or {}).get("txHash")
+            if (
+                other is formal
+                or other.get("platform") != "okx"
+                or other.get("anchorRole") != "send"
+                or other.get("slot") is not None
+                or other.get("dup")
+                or other.get("windowClosed")
+                or other.get("_anchorVeto")
+                or other.get("_multiOrderSuspect")
+                or not isinstance(other.get("tOrderOutMs"), (int, float))
+                or other["tOrderOutMs"] < t0
+                or not other_tx
+                or _ident_norm("txHash", other_tx) != _ident_norm("txHash", tx)
+            ):
+                continue
+            # Same gates as request-time dedup (chain, all shared keys, veto).
+            self._dedup_order_identity_locked(other)
+
     def _dup_identity_conflict_locked(self, leg, formal):
         """（须持锁）dup 腿与其 formal 的同单证明是否被后续身份证据
         推翻——共同身份键（orderId/clientOrderId/txHash）两侧都有值且不等 = 冲突
@@ -3717,6 +3759,7 @@ class Store:
             )
             if b is not None:
                 leg["slot"] = b
+                self._merge_late_sends_locked(leg)
             else:
                 leg["unbound"] = True
                 self.diag["orderReqUnbound"] += 1
@@ -3885,6 +3928,7 @@ class Store:
             for other in candidates:
                 if other is not target:
                     self._dedup_order_identity_locked(other, allow_transfer=True)
+            self._merge_late_sends_locked(target)
             return True
 
     def confirm_broadcast_identity(self, leg):
@@ -3929,6 +3973,7 @@ class Store:
         b = self._bind_slot_locked(leg["runId"], leg["platform"], chain)
         if b is not None:
             leg["slot"] = b  # 槽位绑定不写 round（授权轮号不由到达序推导）
+            self._merge_late_sends_locked(leg)
         else:
             leg["unbound"] = True
             self.diag["orderReqUnbound"] += 1
@@ -3959,6 +4004,7 @@ class Store:
             b = self._bind_slot_locked(leg["runId"], leg["platform"], chain)
             if b is not None:
                 leg["slot"] = b  # 槽位绑定不写 round（授权轮号不由到达序推导）
+                self._merge_late_sends_locked(leg)
             else:
                 leg["unbound"] = True
                 self.diag["orderReqUnbound"] += 1

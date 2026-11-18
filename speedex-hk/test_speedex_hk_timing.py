@@ -7046,7 +7046,7 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.11.17-helius-sol-v10.30")
+        self.assertEqual(A.ADDON_VERSION, "2026.11.18-late-send-merge-v10.31")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 
@@ -8268,6 +8268,118 @@ class TestMergedSendNoPoison(unittest.TestCase):
         self.assertIsNone(row["hkL3Ms"])
         orow = next(x for x in tl["legs"] if x["txHash"] == orphan_tx)
         self.assertEqual(orow["incomplete"], "broadcast-identity-unconfirmed")
+
+    def _nozomi_send(self, seed):
+        body = self._wire_body(seed)
+        f = FakeFlow("tyo1.nozomi.temporal.xyz", "/api/sendTransaction2", req_body=body, resp_body="")
+        f.request.headers = {"origin": "https://web3.okx.com"}
+        f.response.status_code = 204
+        A.addons[0].request(f); A.addons[0].response(f)
+        return f.metadata["speedex_leg"][0], A._sol_wire_first_sig(body)
+
+    def _late_send_round(self, late_seed):
+        """v10.31 (batch was1x r4): platform order is pendingBind when two Nozomi sends
+        arrive later; its slot binds only at receipt backfill."""
+        tx = A._sol_wire_first_sig(self._wire_body(0x31))
+        formal = self._platform_order(tx, "o4").metadata["speedex_leg"][0]
+        self.assertTrue(formal["pendingBind"])
+        self.assertIsNone(formal["slot"])
+        self.clock += 600
+        sends = [self._nozomi_send(late_seed)[0] for _ in range(2)]
+        for s in sends:
+            self.assertEqual(s["anchorRole"], "send")
+            self.assertFalse(s["dup"], "no bound formal yet")
+        self.clock += 250
+        self._success(tx, "o4")
+        self.clock += 100
+        A._settle_receipt(formal, {"rpc": "stub", "chain": "solana",
+            "pollIntervalMs": 800, "status": 1, "slot": 777})
+        self.assertIsNotNone(formal["slot"])
+        return formal, sends, tx
+
+    def test_late_same_tx_sends_merge_when_formal_binds(self):
+        formal, sends, tx = self._late_send_round(0x31)
+        for s in sends:
+            self.assertTrue(s["dup"])
+            self.assertIs(s["_dupOf"], formal)
+            self.assertIsNone(s["slot"])
+        # In-flight send pollers settle onto the formal leg without overwriting it.
+        t_receipt = formal["tReceiptMs"]
+        self.clock += 50
+        A._settle_receipt(sends[0], {"rpc": "stub", "chain": "solana",
+            "pollIntervalMs": 800, "status": 1, "slot": 777})
+        A._settle_incomplete(sends[1], "receipt poll timeout")
+        self.assertEqual(formal["tReceiptMs"], t_receipt)
+        self.assertIsNone(formal["incomplete"])
+        self.assertFalse(sends[0]["receiptPolling"])
+        self.assertFalse(sends[1]["receiptPolling"])
+        self.assertIsNone(sends[0]["tReceiptMs"])
+        self.clock += 1000
+        self._sol_round(0x55, "o5")
+        A.STORE.mark_close(self.run)
+        tl = A.STORE.timeline(self.run, full=True)
+        rows = [x for x in tl["legs"] if x["anchorRole"] == "order" and not x["dup"]]
+        self.assertEqual(len(rows), 2)
+        first = next(x for x in rows if x["txHash"] == tx)
+        self.assertEqual(first["hkL1aMs"], 850)
+        later = next(x for x in rows if x["txHash"] != tx)
+        self.assertIsNone(later["incomplete"])
+        self.assertEqual(later["hkL1aMs"], 210)
+        late = [x for x in tl["legs"] if x.get("orderRequestSource") == "okx-solana-send"
+                and x.get("txHash") == tx]
+        self.assertEqual(len(late), 2)
+        for row in late:
+            self.assertTrue(row["dup"])
+            self.assertEqual(row["evidence"]["mergedIntoFlowId"], first["evidence"]["orderFlowId"])
+        self.assertFalse(any(x["incomplete"] == "broadcast-anchor-unconfirmed" for x in tl["legs"]))
+        self.assertEqual(tl["counts"]["attempted"], 2)
+        self.assertEqual(tl["counts"]["observed"], 2)
+
+    def test_late_different_tx_send_still_poisons(self):
+        formal, sends, tx = self._late_send_round(0x32)
+        for s in sends:
+            self.assertFalse(s["dup"], "different signature never merges")
+        self.clock += 1000
+        self._sol_round(0x55, "o5")
+        A.STORE.mark_close(self.run)
+        tl = A.STORE.timeline(self.run, full=True)
+        later = next(x for x in tl["legs"] if x["anchorRole"] == "order" and not x["dup"]
+                     and x["txHash"] != tx)
+        self.assertEqual(later["incomplete"], "broadcast-anchor-unconfirmed")
+        self.assertIsNone(later["hkL1aMs"])
+
+    def test_late_send_merge_overturned_by_formal_veto_poisons(self):
+        formal, sends, _ = self._late_send_round(0x31)
+        self.assertTrue(all(s["dup"] for s in sends))
+        A.STORE.update_anchor(formal, {"txHash": A._sol_wire_first_sig(self._wire_body(0x33))})
+        self.assertTrue(formal["_anchorVeto"])
+        for s in sends:
+            self.assertFalse(s["dup"], "formal veto reopens the merged sends")
+        self.clock += 1000
+        self._sol_round(0x55, "o5")
+        for s in sends:
+            self.assertFalse(s["dup"], "a reopened send is never re-merged")
+        A.STORE.mark_close(self.run)
+        tl = A.STORE.timeline(self.run, full=True)
+        later = next(x for x in tl["legs"] if x["anchorRole"] == "order" and not x["dup"]
+                     and not x["anchorVeto"])
+        self.assertEqual(later["incomplete"], "broadcast-anchor-unconfirmed")
+        self.assertIsNone(later["hkL1aMs"])
+
+    def test_late_sends_poison_when_formal_never_binds(self):
+        tx = A._sol_wire_first_sig(self._wire_body(0x31))
+        formal = self._platform_order(tx, "o4").metadata["speedex_leg"][0]
+        self.clock += 600
+        send, _ = self._nozomi_send(0x31)
+        self.clock += 1000
+        self._sol_round(0x55, "o5")
+        self.assertTrue(formal["pendingBind"])
+        self.assertFalse(send["dup"])
+        A.STORE.mark_close(self.run)
+        tl = A.STORE.timeline(self.run, full=True)
+        later = next(x for x in tl["legs"] if x["anchorRole"] == "order" and not x["dup"]
+                     and x["txHash"] != tx)
+        self.assertEqual(later["incomplete"], "broadcast-anchor-unconfirmed")
 
     def test_evm_merged_send_does_not_poison_either(self):
         """EVM 同律：已确认扇出 + 页中止 dup send 的轮次不毒化下一轮平台单。"""
