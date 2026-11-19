@@ -197,3 +197,33 @@ OKX Solana late same-signature sends merge into the formal leg (LA batch 1794929
   identity conflict / formal veto (`_multiOrderSuspect`, never re-merged) still poisons later legs (juk09/7ngeq boundary).
   Merged send legs keep their own `incomplete:"broadcast-identity-unconfirmed"` (same as existing merged fan-out sends).
   Timeline/DTO shape unchanged.
+
+## 2026.11.19-gmgn-trade-hash-v10.32
+
+GMGN chain-domain arrival from the page's `TradeHash` race leg (GMGN live page code, 2026-11-19). On `wss://ws.gmgn.ai`,
+channel `wallet_trade_data`, an entry `{"t":"hash","ch":…,"h":<block height>,"d":{"h":<txHash>,"s":1,"ec":""}}` is the
+page's success toast leg; it usually arrives 30–70 ms before `tg_processed_order_info`, and on BSC 87–387 ms after the tx's block
+(a post-execution signal).
+
+- **Capture scope**: `ws.gmgn.ai` is already decrypted (production `allow_hosts`) and classified `gmgn` (`RULES.gmgn.ws_hosts`);
+  `allow_hosts` unchanged.
+- **First-entry rule** (owner decision; GMGN page `entries.filter(t==="hash").find(e => e.d.h === txHash)`): per frame and per
+  hash, only the first `t=="hash"` entry with a non-empty string `d.h` decides, and it is a success iff its `d.s` is truthy.
+  Later entries with the same hash (`_ident_norm` txHash: EVM case-insensitive) are ignored: `s:0` then `s:1` records nothing,
+  `s:1` then `s:0` records.
+- **Arrival**: for each deciding entry with truthy `d.s`,
+  `note_channel_arrival(chain, d.h, "gmgn_trade_hash", "wallet_trade_data", tObs, platform="gmgn")` records
+  `channelArrivals {channel:"gmgn_trade_hash", api:"wallet_trade_data", ms}` on the open GMGN leg (buy or post-round sell) whose
+  anchor `txHash` equals `d.h` exactly — same HK monotonic clock (hook entry), same anchor (`ms` relative to `tOrderOutMs`)
+  and first-arrival freeze as `fullnode`/`helius`. The entry's top-level `h` (block height) is never a hash. `chain` = the same
+  entry's `ch` when it maps to a known chain (a conflicting leg chain records nothing), else the leg's chain. Falsy `d.s`
+  (failure carries `d.ec`), missing/non-string `d.h`, another hash (e.g. a sell's approve tx) or a non-GMGN leg record nothing.
+- **Unchanged**: arrival record only — never platform success, eligibility, anchors, `hkL1aMs` or incompleteness; the frame
+  still goes through the unit pipeline, where `wallet_trade_data` yields no unit.
+- **Diagnostics** (`/health diag` and run diag): `gmgnTradeHashEntries` (deciding success entries seen in an open window),
+  `gmgnTradeHashArrivals` (new first arrivals); arrivals also count in the existing `chainChannelArrivals`.
+- **Privacy**: only the arrival fields above are stored; the frame body, wallet (`wa`), block height and token data are not.
+
+Cross-repo: the EU consumers register `gmgn_trade_hash` — `scripts/lib/public-projector.mjs` channelArrivals.channel enum,
+`web/shared-push-timing.mjs` `chainArrivalEligible` (GMGN legs, supplies a value on BSC only) and the history push-source label
+`TRADE_HASH` (`web/history-view.js`). The speedex side applies the same first-entry rule.

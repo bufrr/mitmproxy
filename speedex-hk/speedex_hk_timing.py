@@ -330,7 +330,12 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # v10.31 (2026-11-18): an OKX formal leg that binds its slot late (Solana /multi/broadcast pendingBind ->
 # receipt backfill) merges later same-txHash send legs as dup (_merge_late_sends_locked); before, they
 # stayed unresolved sends and poisoned every later OKX order on the chain (broadcast-anchor-unconfirmed).
-ADDON_VERSION = "2026.11.18-late-send-merge-v10.31"
+# v10.32 (2026-11-19): GMGN ws.gmgn.ai `wallet_trade_data` t=="hash" entries (per frame and hash, the first
+# entry with a string d.h decides; success iff its d.s is truthy, as GMGN's page find()) record a chain-domain
+# arrival on the GMGN leg whose anchor txHash equals d.h (channel "gmgn_trade_hash", api "wallet_trade_data",
+# same HK clock/anchor as fullnode/helius, first arrival frozen). Arrival record only:
+# never success/eligibility/anchor/hkL1aMs. Diag: gmgnTradeHashEntries / gmgnTradeHashArrivals.
+ADDON_VERSION = "2026.11.19-gmgn-trade-hash-v10.32"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -1944,6 +1949,51 @@ def _gmgn_ws_entries(payload):
                 "side": side,
             }
         )
+    return out
+
+
+GMGN_TRADE_HASH_CHANNEL = "gmgn_trade_hash"
+
+
+def _gmgn_trade_hash_entries(payload):
+    """v10.32: `wallet_trade_data` frame → [(chain|None, txHash)] for GMGN page TradeHash successes.
+    First-entry rule (owner decision, GMGN page `entries.filter(t==="hash").find(e => e.d.h === txHash)`): per
+    frame and per hash, only the FIRST t=="hash" entry with a non-empty string d.h decides; it is a success iff
+    its d.s is truthy (failure carries d.ec). Later entries with the same hash (normalized as `_ident_norm`
+    txHash) are ignored either way. The entry's top-level `h` is a block height, never the tx hash.
+    chain = same-entry `ch` when it maps to a known chain, else None (the leg's chain decides). Only the hash
+    leaves this function; the frame body (wallet `wa`, tokens) is not kept.
+    Substring pre-filter first: ws.gmgn.ai carries dense market frames that must not pay another JSON decode."""
+    if isinstance(payload, (bytes, bytearray)):
+        if b"wallet_trade_data" not in payload:
+            return []
+    elif not isinstance(payload, str) or "wallet_trade_data" not in payload:
+        return []
+    obj = _decode_ws(payload)
+    if not isinstance(obj, dict) or obj.get("channel") != "wallet_trade_data":
+        return []
+    data = obj.get("data")
+    if not isinstance(data, list):
+        return []
+    out = []
+    decided = set()
+    for e in data:
+        if not isinstance(e, dict) or e.get("t") != "hash":
+            continue
+        d = e.get("d")
+        if not isinstance(d, dict):
+            continue
+        h = d.get("h")
+        if not isinstance(h, str) or not h:
+            continue
+        key = _ident_norm("txHash", h)
+        if key in decided:
+            continue  # the first entry with this hash already decided
+        decided.add(key)
+        if not d.get("s"):
+            continue
+        ch = e.get("ch")
+        out.append((CHAIN_NAME_STR.get(ch.lower()) if isinstance(ch, str) else None, h))
     return out
 
 
@@ -5348,9 +5398,11 @@ class Store:
         """v10：链域通道（nodeone/fullnode，www.okx.com）成功通知到达登记——HK 钟。
         仅精确 tx 身份匹配（锚内 txHash 恒等）的开窗腿；每腿每通道首到冻结。
         与成功判定管线完全分离：不触成功/资格/锚门，纯到达时刻记录。
-        v10.30：platform 非空时只登记该平台的腿（Helius = OKX Solana 页面的订阅）。"""
+        v10.30：platform 非空时只登记该平台的腿（Helius = OKX Solana 页面的订阅）。
+        v10.32: returns the number of legs that got a new (first) arrival for this channel."""
+        recorded = 0
         if not tx_value:
-            return
+            return recorded
         with self.lock:
             now = time.monotonic()
             for rid in self._open_run_ids_locked(now):
@@ -5370,6 +5422,8 @@ class Store:
                     if channel not in arr:
                         arr[channel] = {"tMs": t_ms, "api": api}
                         self.diag["chainChannelArrivals"] = self.diag.get("chainChannelArrivals", 0) + 1
+                        recorded += 1
+        return recorded
 
     def id_claimed(self, run_id, key, value, except_leg=None):
         """同 run 内某 id/hash 是否已被其他腿占用（防陈旧/跨批重放帧把旧值挂到新腿）。
@@ -7068,6 +7122,17 @@ class SpeedexHkTiming:
                     f"TG-FRAME ch={info['channel']} shape={info['dataShape']} n={info['n']} "
                     f"ids={sorted(info['idKeys'])} st={sorted(info['st'])} si={sorted(info['si'])} chains={sorted(info['chains'])}"
                 )
+            # v10.32: wallet_trade_data t=="hash" success → GMGN leg chain-domain arrival (t_obs = hook entry).
+            # Arrival record only; the frame still goes through the unit pipeline below (no success there).
+            try:
+                for chain_h, tx_h in _gmgn_trade_hash_entries(payload):
+                    STORE.note_frame_diag("gmgnTradeHashEntries")
+                    n_new = STORE.note_channel_arrival(chain_h, tx_h, GMGN_TRADE_HASH_CHANNEL,
+                                                       "wallet_trade_data", t_obs, platform="gmgn")
+                    for _ in range(n_new):
+                        STORE.note_frame_diag("gmgnTradeHashArrivals")
+            except Exception:
+                pass
         # WS 帧可先见 hash（OKX sol / Binance PENDING / GMGN hash-ack）——先解析再判成功。
         # 逐单元处理——okx/gmgn 一帧多 entry 逐 entry 独立（身份/状态/
         # 链只取同一 entry；目标在第二 entry 也照常关联），其余平台整帧一单元。

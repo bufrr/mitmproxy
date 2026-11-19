@@ -7046,7 +7046,7 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.11.18-late-send-merge-v10.31")
+        self.assertEqual(A.ADDON_VERSION, "2026.11.19-gmgn-trade-hash-v10.32")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 
@@ -11185,6 +11185,262 @@ class TestGmgnSellPushV1029(unittest.TestCase):
         self.assertIsNone(ev["side"])
         self.assertEqual((ev["version"], ev["status"]), (1, "1"))
         self.assertEqual(set(ev) - {"side"}, self.V1028_KEYS)
+
+
+class TestGmgnTradeHashV1032(unittest.TestCase):
+    """v10.32: ws.gmgn.ai wallet_trade_data t=="hash" (d.h exact tx, d.s truthy) → GMGN leg channelArrivals
+    gmgn_trade_hash on the HK clock, ms relative to tOrderOutMs (same anchor as fullnode/helius). Arrival record
+    only: success, eligibility, anchors and hkL1aMs come solely from the existing pipeline. Frame shape from
+    speedex docs/gmgn.md §4 (entry h = block height, d.h = tx hash, wa = wallet, ch = chain)."""
+
+    SIG_BUY = "5" * 88
+    SIG_SELL = "4" * 88
+    SIG_APPROVE = "6" * 88
+    SIG_OTHER = "3" * 88
+    WALLET = "Wa11et" + "7" * 38
+
+    def setUp(self):
+        fresh()
+        self.clock = time.monotonic() * 1000 + 10
+        from unittest.mock import patch
+        for target, replacement in [("_mono_ms", lambda: self.clock), ("_poll_receipt", lambda *_a, **_k: None)]:
+            p = patch.object(A, target, replacement); p.start(); self.addCleanup(p.stop)
+
+    def _open(self, run, rounds=1, platform="gmgn", chain="solana"):
+        A.STORE.mark_open(run, manifest={"version": 1, "runId": run, "rounds": rounds,
+                                         "legs": [{"platform": platform, "chain": chain, "rounds": rounds}]})
+        self.clock += 50
+
+    def _order(self, oi, h):
+        f = FakeFlow("gmgn.ai", "/tapi/v1/swap_batch_order", "POST", req_body=json.dumps({"chain": "sol"}),
+                     resp_body=json.dumps({"code": 0, "data": {"hash": h, "orderId": oi}}))
+        A.addons[0].request(f)
+        A.addons[0].response(f)
+        return next(l for legs in A.STORE.legs.values() for l in legs
+                    if (l.get("_anchor") or {}).get("orderId") == oi)
+
+    def _hash_entry(self, h, s=1, ch="sol", **over):
+        e = {"wa": self.WALLET, "t": "hash", "h": 122142992, "ti": 22, "ts": 1789526324634, "ch": ch,
+             "d": {"h": h, "s": s, "ec": ""}}
+        e.update(over)
+        return e
+
+    def _frame(self, *entries, channel="wallet_trade_data", host="ws.gmgn.ai"):
+        A.addons[0].websocket_message(ws_frame(host, json.dumps({"channel": channel, "data": list(entries)})))
+
+    def _success(self, oi, h, si="buy"):
+        self._frame({"st": "successful", "si": si, "ch": "sol", "oi": oi, "h": h}, channel="tg_processed_order_info")
+
+    @staticmethod
+    def _row(run, leg):
+        return next(r for r in A.STORE.timeline(run, full=True)["legs"] if r["txHash"] == leg["txHash"])
+
+    def test_buy_leg_records_arrival_first_frozen_success_unchanged(self):
+        run = "run-v1032-buy"
+        self._open(run)
+        leg = self._order("gBuy", self.SIG_BUY)
+        self.clock += 420
+        self._frame(self._hash_entry(self.SIG_BUY))
+        row = self._row(run, leg)
+        self.assertEqual(row["channelArrivals"],
+                         [{"channel": "gmgn_trade_hash", "api": "wallet_trade_data", "ms": 420}])
+        self.assertAlmostEqual(self.clock - row["tOrderOutMs"], 420, places=3, msg="ms = tObs − tOrderOutMs")
+        self.assertIsNone(row["hkL1aMs"], "an arrival is not platform success")
+        for k in ("tSuccessPushMs", "successEvidence", "successAnchorKeys", "wsSha", "incomplete"):
+            self.assertIsNone(leg.get(k), k)
+        self.assertEqual(A.STORE.timeline(run)["counts"]["observed"], 0)
+        # First arrival frozen: a later identical frame neither overwrites nor adds.
+        self.clock += 200
+        self._frame(self._hash_entry(self.SIG_BUY))
+        self.assertEqual(self._row(run, leg)["channelArrivals"][0]["ms"], 420)
+        self.assertEqual(A.STORE.diag.get("gmgnTradeHashEntries"), 2)
+        self.assertEqual(A.STORE.diag.get("gmgnTradeHashArrivals"), 1)
+        self.assertEqual(A.STORE.timeline(run)["diag"].get("gmgnTradeHashArrivals"), 1)
+        # The success push still decides success and hkL1aMs exactly as before (tObs − tOrderOutMs).
+        self.clock += 40
+        self._success("gBuy", self.SIG_BUY)
+        row = self._row(run, leg)
+        self.assertEqual(leg["tSuccessPushMs"], self.clock)
+        self.assertEqual(row["hkL1aMs"], 660)
+        self.assertEqual(leg["successEvidence"]["channel"], "tg_processed_order_info")
+        self.assertEqual(row["channelArrivals"],
+                         [{"channel": "gmgn_trade_hash", "api": "wallet_trade_data", "ms": 420}])
+
+    def test_success_and_l1a_identical_with_or_without_hash_frame(self):
+        def run_once(run, with_hash):
+            self._open(run)
+            leg = self._order("o-" + run, self.SIG_BUY)
+            t0 = leg["tOrderOutMs"]
+            self.clock += 300
+            if with_hash:
+                self._frame(self._hash_entry(self.SIG_BUY))
+            self.clock += 50
+            self._success("o-" + run, self.SIG_BUY)
+            row = self._row(run, leg)
+            ev = dict(leg["successEvidence"])
+            ev.pop("frameSha", None)
+            return (row["hkL1aMs"], leg["tSuccessPushMs"] - t0, ev["channel"], ev["status"], ev["matchedKeys"],
+                    row.get("incomplete"), A.STORE.timeline(run)["counts"]), row["channelArrivals"]
+        a, arr_a = run_once("run-v1032-plain", False)
+        fresh()
+        b, arr_b = run_once("run-v1032-hash", True)
+        self.assertEqual(a, b)
+        self.assertIsNone(arr_a)
+        self.assertEqual(arr_b, [{"channel": "gmgn_trade_hash", "api": "wallet_trade_data", "ms": 300}])
+
+    def test_ineligible_entries_record_nothing(self):
+        run = "run-v1032-reject"
+        self._open(run)
+        leg = self._order("gBuy", self.SIG_BUY)
+        self.clock += 100
+        no_d = self._hash_entry(self.SIG_BUY)
+        no_d.pop("d")
+        cases = {
+            "s 0": self._hash_entry(self.SIG_BUY, s=0),
+            "s empty": self._hash_entry(self.SIG_BUY, s=""),
+            "s None": self._hash_entry(self.SIG_BUY, s=None),
+            "s false + ec": self._hash_entry(self.SIG_BUY, s=False, d={"h": self.SIG_BUY, "ec": "fail"}),
+            "s missing": self._hash_entry(self.SIG_BUY, d={"h": self.SIG_BUY, "ec": ""}),
+            "d.h missing, only top-level h": dict(self._hash_entry(None, d={"s": 1}), h=self.SIG_BUY),
+            "d.h non-string": self._hash_entry(12345),
+            "d.h empty": self._hash_entry(""),
+            "d missing": no_d,
+            "d not a dict": self._hash_entry(self.SIG_BUY, d=[self.SIG_BUY]),
+            "t balance": self._hash_entry(self.SIG_BUY, t="balance"),
+            "another hash": self._hash_entry(self.SIG_OTHER),
+            "prefix of hash": self._hash_entry(self.SIG_BUY[:-1]),
+            "chain conflict": self._hash_entry(self.SIG_BUY, ch="bsc"),
+        }
+        for name, entry in cases.items():
+            with self.subTest(name):
+                self._frame(entry)
+                self.assertIsNone(leg.get("_channelArrivals"), name)
+        # Same entry on another channel or a look-alike host is not this channel.
+        self._frame(self._hash_entry(self.SIG_BUY), channel="wallet_balance")
+        self._frame(self._hash_entry(self.SIG_BUY), host="ws.gmgn.ai.evil.example")
+        A.addons[0].websocket_message(ws_frame("ws.gmgn.ai", json.dumps(
+            {"channel": "wallet_trade_data", "data": self._hash_entry(self.SIG_BUY)})))  # data not a list
+        self.assertIsNone(leg.get("_channelArrivals"))
+        self.assertIsNone(leg.get("tSuccessPushMs"))
+        self.assertEqual(A.STORE.diag.get("gmgnTradeHashArrivals", 0), 0)
+        self.assertEqual(A.STORE.diag.get("gmgnTradeHashEntries"), 3, "another hash / prefix / chain conflict")
+        # Unknown chain string → chain from the leg; the exact hash still records.
+        self._frame(self._hash_entry(self.SIG_BUY, ch="zz-unknown"))
+        self.assertEqual(self._row(run, leg)["channelArrivals"],
+                         [{"channel": "gmgn_trade_hash", "api": "wallet_trade_data", "ms": 100}])
+
+    def test_okx_leg_with_same_hash_untouched(self):
+        h = "0x" + "ab" * 32
+        run = "run-v1032-okx"
+        self._open(run, platform="okx", chain="bsc")
+        f = FakeFlow("web3.okx.com", "/priapi/v6/dx/trade/multi/broadcast", "POST",
+                     req_body=json.dumps({"data": {"chainId": "56"}}),
+                     resp_body=json.dumps({"code": "0", "data": {"transactionHash": h, "orderId": "ord1"}}))
+        A.addons[0].request(f)
+        A.addons[0].response(f)
+        okx = A.STORE.legs[run][0]
+        self.assertEqual(okx["platform"], "okx")
+        self.assertEqual((okx.get("_anchor") or {}).get("txHash"), h)
+        self.clock += 100
+        self._frame(self._hash_entry(h, ch="bsc"))
+        self.assertIsNone(okx.get("_channelArrivals"), "platform filter: GMGN channel never lands on OKX legs")
+        self.assertEqual(A.STORE.diag.get("gmgnTradeHashEntries"), 1)
+        self.assertEqual(A.STORE.diag.get("gmgnTradeHashArrivals", 0), 0)
+
+    def test_sell_leg_own_hash_and_approve_does_not_match(self):
+        run = "run-v1032-sell"
+        self._open(run, rounds=2)
+        buy = self._order("gBuy", self.SIG_BUY)
+        self.clock += 500
+        sell = self._order("gSell", self.SIG_SELL)
+        self.clock += 80
+        # The sell's approve tx hash frame: no leg anchors it → nothing on the sell swap leg or the buy leg.
+        self._frame(self._hash_entry(self.SIG_APPROVE))
+        self.assertIsNone(sell.get("_channelArrivals"))
+        self.assertIsNone(buy.get("_channelArrivals"))
+        self.clock += 220
+        # Mixed frame: approve + sell swap entries handled per entry.
+        self._frame(self._hash_entry(self.SIG_APPROVE), self._hash_entry(self.SIG_SELL))
+        self.assertEqual(self._row(run, sell)["channelArrivals"],
+                         [{"channel": "gmgn_trade_hash", "api": "wallet_trade_data", "ms": 300}])
+        self.assertIsNone(buy.get("_channelArrivals"), "sell hash never lands on the buy leg")
+        self.assertIsNone(sell.get("tSuccessPushMs"))
+        self.clock += 50
+        self._frame(self._hash_entry(self.SIG_BUY))
+        self.assertEqual(self._row(run, buy)["channelArrivals"],
+                         [{"channel": "gmgn_trade_hash", "api": "wallet_trade_data", "ms": 850}])
+        self.assertEqual(self._row(run, sell)["channelArrivals"][0]["ms"], 300)
+        self.assertEqual(A.STORE.diag.get("gmgnTradeHashArrivals"), 2)
+
+    def test_parser_bytes_str_and_prefilter(self):
+        frame = json.dumps({"channel": "wallet_trade_data", "data": [
+            self._hash_entry(self.SIG_BUY), self._hash_entry(self.SIG_SELL, ch="bsc"),
+            self._hash_entry(self.SIG_OTHER, ch=None)]})
+        want = [("solana", self.SIG_BUY), ("bsc", self.SIG_SELL), (None, self.SIG_OTHER)]
+        self.assertEqual(A._gmgn_trade_hash_entries(frame), want)
+        self.assertEqual(A._gmgn_trade_hash_entries(frame.encode()), want)
+        self.assertEqual(A._gmgn_trade_hash_entries(bytearray(frame.encode())), want)
+        # Market frames without the channel name are skipped before any decode.
+        from unittest.mock import patch
+        with patch.object(A, "_decode_ws", side_effect=AssertionError("decoded")):
+            for p in ('{"channel":"token_activity","data":[{"t":"hash"}]}', b'{"channel":"chain_stat"}', None, 7):
+                self.assertEqual(A._gmgn_trade_hash_entries(p), [])
+
+    def test_first_entry_per_hash_decides_failure_first(self):
+        """GMGN page find(): the first t=="hash" entry with d.h decides — s:0 then s:1 → nothing."""
+        run = "run-v1032-first-fail"
+        self._open(run)
+        leg = self._order("gBuy", self.SIG_BUY)
+        self.clock += 100
+        self._frame(self._hash_entry(self.SIG_BUY, s=0), self._hash_entry(self.SIG_BUY, s=1))
+        self.assertIsNone(leg.get("_channelArrivals"))
+        self.assertEqual(A.STORE.diag.get("gmgnTradeHashEntries", 0), 0)
+        # Non-hash entries and entries without a string d.h do not take the first-entry slot.
+        frame = json.dumps({"channel": "wallet_trade_data", "data": [
+            self._hash_entry(self.SIG_SELL, s=0, t="balance"), self._hash_entry(12345, s=0),
+            self._hash_entry(self.SIG_SELL), self._hash_entry(self.SIG_OTHER, s=0), self._hash_entry(self.SIG_OTHER)]})
+        self.assertEqual(A._gmgn_trade_hash_entries(frame), [("solana", self.SIG_SELL)])
+        # EVM hashes compare normalized: an upper-case failure first also decides for the lower-case success.
+        h = "0x" + "ab" * 32
+        frame = json.dumps({"channel": "wallet_trade_data", "data": [
+            self._hash_entry(h.upper().replace("0X", "0x"), s=0, ch="bsc"), self._hash_entry(h, ch="bsc")]})
+        self.assertEqual(A._gmgn_trade_hash_entries(frame), [])
+
+    def test_first_entry_per_hash_decides_success_first(self):
+        """s:1 then s:0 for the same hash → the first (success) decides and records once."""
+        run = "run-v1032-first-ok"
+        self._open(run)
+        leg = self._order("gBuy", self.SIG_BUY)
+        self.clock += 130
+        self._frame(self._hash_entry(self.SIG_BUY, s=1), self._hash_entry(self.SIG_BUY, s=0),
+                    self._hash_entry(self.SIG_BUY, s=1))
+        self.assertEqual(self._row(run, leg)["channelArrivals"],
+                         [{"channel": "gmgn_trade_hash", "api": "wallet_trade_data", "ms": 130}])
+        self.assertEqual(A.STORE.diag.get("gmgnTradeHashEntries"), 1, "one decision per hash per frame")
+        self.assertEqual(A.STORE.diag.get("gmgnTradeHashArrivals"), 1)
+        self.assertIsNone(leg.get("tSuccessPushMs"))
+
+    def test_frame_body_not_persisted(self):
+        run = "run-v1032-privacy"
+        self._open(run)
+        self._order("gBuy", self.SIG_BUY)
+        self.clock += 90
+        self._frame(self._hash_entry(self.SIG_BUY))
+        surfaces = {
+            "timeline": A.STORE.timeline(run),
+            "timelineFull": A.STORE.timeline(run, full=True),
+            "events": dict(A.STORE.events),
+            "diag": dict(A.STORE.diag),
+            "runDiag": {k: dict(v) for k, v in A.STORE.run_diag.items()},
+            "legs": A.STORE.legs[run],
+            "health": _http_json("GET", "http://127.0.0.1:8072/health")[1],
+        }
+        for name, value in surfaces.items():
+            dumped = json.dumps(value, default=str)
+            self.assertNotIn(self.WALLET, dumped, name)
+            self.assertNotIn("122142992", dumped, name)
+        self.assertEqual(surfaces["health"]["diag"].get("gmgnTradeHashArrivals"), 1)
+        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.19-gmgn-trade-hash-v10.32")
 
 
 if __name__ == "__main__":
