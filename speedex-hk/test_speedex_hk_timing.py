@@ -7046,7 +7046,7 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.11.19-gmgn-trade-hash-v10.32")
+        self.assertEqual(A.ADDON_VERSION, "2026.11.22-axiom-sol-v10.33")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 
@@ -11440,7 +11440,516 @@ class TestGmgnTradeHashV1032(unittest.TestCase):
             self.assertNotIn(self.WALLET, dumped, name)
             self.assertNotIn("122142992", dumped, name)
         self.assertEqual(surfaces["health"]["diag"].get("gmgnTradeHashArrivals"), 1)
-        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.19-gmgn-trade-hash-v10.32")
+        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.22-axiom-sol-v10.33")
+
+
+class TestAxiomSolana(unittest.TestCase):
+    """v10.33: Axiom (axiom.trade, Solana). Send anchor on api.axiom.trade batched-send-tx-v4 or a Hellomoon
+    lunar-lander region, same-signature fold, conflict veto, cluster user-tx success, Helius arrival.
+    Transactions are the repo's synthetic v1 vector (single signer) with the 64 signature bytes replaced, plus
+    the public mainnet v1 vector; prefixes, user ids, pair addresses and keys are synthetic."""
+
+    VEC = json.loads(Path(__file__).with_name("tests").joinpath("fixtures", "sol-tx-v1-vectors.json").read_text())
+    PREFIX = __import__("base64").b64encode(b"\x00\x07\x11\x22\x33\x44").decode()  # synthetic 6-byte prefix
+    USER = "5e1f0c2a-9b3d-4e7f-8a6b-0c1d2e3f4a5b"  # synthetic user uuid
+    PAIR = "PairSynthetic" + "7" * 31
+    HELIUS_HOST = "synthname-fast-mainnet.helius-rpc.com"
+    HELIUS_KEY = "synthetic-axiom-helius-key-77a1"
+    COOKIE = "synthetic-axiom-cookie-value-91"
+
+    def setUp(self):
+        fresh()
+        self.clock = time.monotonic() * 1000 + 10
+        self.polls = []
+        for target, replacement in [("_mono_ms", lambda: self.clock),
+                                    ("_poll_receipt", lambda *a: self.polls.append(a[3]))]:
+            p = patch.object(A, target, replacement); p.start(); self.addCleanup(p.stop)
+        p = patch.object(A.HEADS, "snapshot", lambda rid, t: {c: {
+            "version": 1, "chain": c, "epoch": rid, "height": 40, "anchorTs": t,
+            "observedTs": t - 1, "sampleAgeMs": 1} for c in A.CHAINS})
+        p.start(); self.addCleanup(p.stop)
+        self.run = "axiom-window"
+        A.STORE.mark_open(self.run, manifest={"version": 1, "runId": self.run, "legs": [
+            {"platform": "axiom", "chain": "solana", "rounds": 2}]})
+        self.clock += 100
+
+    # ── fixtures ──
+    @classmethod
+    def tx(cls, seed=0x41):
+        import base64
+        raw = base64.b64decode(cls.VEC["synthetic"]["signed"]["b64"])
+        raw = raw[:-64] + bytes((seed + i) & 0xFF or 1 for i in range(64))
+        return raw, A._b58encode(raw[-64:])
+
+    @classmethod
+    def api_body(cls, raw):
+        import base64
+        return "0|0|" + cls.PREFIX + ":" + base64.b64encode(raw).decode()
+
+    @staticmethod
+    def hm_body(raw):
+        return len(raw).to_bytes(2, "big") + raw
+
+    def send(self, transport, raw=None, body=None, host=None, path=None, method="POST",
+             origin="https://axiom.trade", respond=True, status=200):
+        if transport == "axiom-api":
+            host = host or "api.axiom.trade"
+            path = path or "/wo/batched-send-tx-v4"
+            body = self.api_body(raw) if body is None else body
+        else:
+            host = host or "tyo.lunar-lander.hellomoon.io"
+            path = path or "/sendBatch-cors"
+            body = self.hm_body(raw) if body is None else body
+        headers = {"cookie": self.COOKIE, "authorization": "Bearer " + self.COOKIE, "content-type": "text/plain"}
+        if origin is not None:
+            headers["origin"] = origin
+        f = FakeFlow(host, path + "?k=synthetic-query", method, headers=headers, status_code=status)
+        if isinstance(body, bytes):
+            f.request.content = body
+        else:
+            f.request._body = body
+        A.addons[0].request(f)
+        if respond:
+            A.addons[0].response(f)
+        return f
+
+    def cluster(self, sig, side="buy", room=None, host="cluster9.axiom.trade", content=None, from_client=False):
+        room = room or ("sol-v2|user-tx:" + self.USER)
+        content = content if content is not None else [sig, "2026-11-22T10:00:00.123Z", side, self.PAIR]
+        f = FakeFlow(host, "/", "GET")
+        f.websocket = types.SimpleNamespace(messages=[FakeWSMsg(
+            json.dumps({"room": room, "seq": "1795000000000-0", "content": content}), from_client)])
+        A.addons[0].websocket_message(f)
+
+    def axiom_legs(self):
+        return [x for x in A.STORE.legs[self.run] if x.get("platform") == "axiom"]
+
+    def rows(self, full=True):
+        return [x for x in A.STORE.timeline(self.run, full=full)["legs"] if x.get("platform") == "axiom"
+                and x.get("anchorRole") == "order"]
+
+    # ── signature derivation ──
+    def test_v1_single_signer_trailing_64_bytes(self):
+        import base64
+        raw = base64.b64decode(self.VEC["mainnet"]["b64"])
+        self.assertEqual((raw[0], raw[1]), (0x81, 1))
+        sig, why = A._axiom_v1_single_sig(raw)
+        self.assertEqual(sig, self.VEC["mainnet"]["sig"], "on-chain signature of the public mainnet v1 tx")
+        self.assertEqual(sig, A._b58encode(raw[-64:]))
+        self.assertIsNone(why)
+        for name, data, reason in [
+            ("two signers", base64.b64decode(self.VEC["synthetic"]["twoSig"]["b64"]), "not-single-signer"),
+            ("bare message", base64.b64decode(self.VEC["synthetic_reject"]["bare"]), "v1-layout"),
+            ("trailing data", base64.b64decode(self.VEC["synthetic_reject"]["trailing"]), "v1-layout"),
+            ("extra byte", raw + b"\x00", "v1-layout"),
+            ("truncated", raw[:-1], "v1-layout"),
+            ("zero signature", raw[:-64] + b"\x00" * 64, "v1-layout"),
+            ("legacy one-sig", bytes([1]) + b"\x41" * 64 + b"\x41" * 40, "not-v1"),
+            ("empty", b"", "not-v1"),
+        ]:
+            with self.subTest(name):
+                self.assertEqual(A._axiom_v1_single_sig(data), (None, reason))
+
+    def test_both_body_formats_derive_the_same_signature(self):
+        import base64
+        raw = base64.b64decode(self.VEC["mainnet"]["b64"])
+        h = {"origin": "https://axiom.trade"}
+        sig = self.VEC["mainnet"]["sig"]
+        self.assertEqual(A._axiom_send_sig("axiom-api", h, self.api_body(raw).encode()), (sig, None))
+        self.assertEqual(A._axiom_send_sig("hellomoon", h, self.hm_body(raw)), (sig, None))
+        bad = [
+            ("axiom-api", {"origin": "https://evil.example"}, self.api_body(raw).encode(), "origin"),
+            ("axiom-api", {}, self.api_body(raw).encode(), "origin"),
+            ("axiom-api", {"origin": "https://axiom.trade.evil.example"}, self.api_body(raw).encode(), "origin"),
+            ("axiom-api", h, self.api_body(raw).replace("0|0|", "1|0|", 1).encode(), "body-shape"),
+            ("axiom-api", h, self.api_body(raw).replace("0|0|", "", 1).encode(), "body-shape"),
+            ("axiom-api", h, ("0|0|" + base64.b64encode(b"\x00" * 7).decode() + ":"
+                              + base64.b64encode(raw).decode()).encode(), "body-shape"),
+            ("axiom-api", h, (self.api_body(raw) + "," + self.PREFIX + ":" + base64.b64encode(raw).decode()).encode(),
+             "body-shape"),
+            ("axiom-api", h, self.api_body(raw)[:-3].encode() + b"!!!", "body-shape"),
+            ("axiom-api", h, json.dumps({"tx": base64.b64encode(raw).decode()}).encode(), "body-shape"),
+            ("axiom-api", h, ("0|0|" + self.PREFIX + ":" + base64.b64encode(
+                base64.b64decode(self.VEC["synthetic"]["twoSig"]["b64"])).decode()).encode(), "not-single-signer"),
+            ("hellomoon", h, (len(raw) + 1).to_bytes(2, "big") + raw, "body-shape"),
+            ("hellomoon", h, self.hm_body(raw) + self.hm_body(raw), "body-shape"),
+            ("hellomoon", h, b"\x00", "size"),
+            ("hellomoon", h, self.hm_body(raw)[:-1], "body-shape"),
+            ("hellomoon", {"origin": "https://evil.example"}, self.hm_body(raw), "origin"),
+        ]
+        for transport, headers, body, reason in bad:
+            with self.subTest(f"{transport}:{reason}:{len(body)}"):
+                self.assertEqual(A._axiom_send_sig(transport, headers, body), (None, reason))
+
+    def test_exact_send_routes(self):
+        self.assertEqual(len(A.AXIOM_HELLOMOON_HOSTS), 14)
+        for r in ("lax", "nyc", "fra", "ams", "ash", "sgp", "tyo", "lon", "syd", "uae", "chi", "dal", "sea", "lit"):
+            self.assertEqual(A._axiom_send_route(f"{r}.lunar-lander.hellomoon.io", "/sendBatch-cors", "POST"), "hellomoon")
+        self.assertEqual(A._axiom_send_route("api.axiom.trade", "/wo/batched-send-tx-v4", "POST"), "axiom-api")
+        for host, path, method in [
+            ("api.axiom.trade", "/wo/batched-send-tx-v4", "GET"),
+            ("api.axiom.trade", "/wo/batched-send-tx-v3", "POST"),
+            ("api.axiom.trade", "/wo/batched-send-tx-v4/x", "POST"),
+            ("api2.axiom.trade", "/wo/batched-send-tx-v4", "POST"),
+            ("api.axiom.trade.evil.example", "/wo/batched-send-tx-v4", "POST"),
+            ("tyo.lunar-lander.hellomoon.io", "/sendBatch", "POST"),
+            ("tyo.lunar-lander.hellomoon.io", "/sendBatch-cors", "OPTIONS"),
+            ("xyz.lunar-lander.hellomoon.io", "/sendBatch-cors", "POST"),
+            ("tyo.lunar-lander.hellomoon.io.evil.example", "/sendBatch-cors", "POST"),
+            ("lunar-lander.hellomoon.io", "/sendBatch-cors", "POST"),
+        ]:
+            self.assertIsNone(A._axiom_send_route(host, path, method), (host, path, method))
+
+    # ── order anchor ──
+    def test_send_anchor_from_axiom_api(self):
+        raw, sig = self.tx()
+        t_send = self.clock
+        f = self.send("axiom-api", raw)
+        legs = self.axiom_legs()
+        self.assertEqual(len(legs), 1)
+        leg = legs[0]
+        self.assertIs(f.metadata["speedex_leg"][0], leg)
+        self.assertEqual((leg["platform"], leg["chain"], leg["anchorRole"], leg["orderRequestSource"]),
+                         ("axiom", "solana", "order", "axiom-solana-send"))
+        self.assertEqual(leg["tOrderOutMs"], t_send)
+        self.assertEqual(leg["_anchor"], {"txHash": sig})
+        self.assertIsNotNone(leg["slot"], "chain known at the request → binds its axiom×solana slot")
+        self.assertEqual(self.polls, [sig], "receipt poll from the exact send signature")
+        row = self.rows()[0]
+        self.assertEqual(row["orderRequestSource"], "axiom-solana-send")
+        self.assertEqual(row["txHash"], sig)
+        self.assertEqual(row["chainHead"]["anchorTs"], t_send, "chain head frozen at the send hook")
+        self.assertEqual(row["evidence"]["axiomSend"],
+                         {"firstTransport": "axiom-api", "transports": {"axiom-api": 1}, "conflict": False})
+        req = next(e for e in A.STORE.events[self.run] if e["kind"] == "order_req")
+        self.assertEqual((req["host"], req["path"], req["bodySha"]), ("api.axiom.trade", "/wo/batched-send-tx-v4", None))
+        ack = next(e for e in A.STORE.events[self.run] if e["kind"] == "axiom_send_ack")
+        self.assertEqual((ack["transport"], ack["code"], ack["ok"]), ("axiom-api", 200, True))
+
+    def test_send_anchor_from_hellomoon_and_fanout_fold(self):
+        raw, sig = self.tx()
+        t_first = self.clock
+        self.send("hellomoon", raw, host="lax.lunar-lander.hellomoon.io")
+        for i, r in enumerate(A.AXIOM_HELLOMOON_REGIONS[1:]):
+            self.clock += 0.3
+            self.send("hellomoon", raw, host=f"{r}.lunar-lander.hellomoon.io")
+        self.clock += 2
+        self.send("axiom-api", raw)
+        self.clock += 5000
+        self.send("hellomoon", raw, host="sgp.lunar-lander.hellomoon.io")  # late same-signature resend still folds
+        legs = self.axiom_legs()
+        self.assertEqual(len(legs), 1, "one logical leg for the whole fanout")
+        leg = legs[0]
+        self.assertEqual(leg["tOrderOutMs"], t_first, "anchor = first qualifying send (either host)")
+        self.assertEqual(leg["_axiomSend"]["transports"], {"hellomoon": 15, "axiom-api": 1})
+        self.assertEqual(leg["_axiomSend"]["firstTransport"], "hellomoon")
+        self.assertEqual(self.polls, [sig], "one receipt poller")
+        self.assertEqual(A.STORE.diag["axiomSendFold"], 15)
+        A.STORE.mark_close(self.run)
+        tl = A.STORE.timeline(self.run, full=True)
+        self.assertEqual(tl["counts"]["attempted"], 1)
+        self.assertEqual(len([e for e in A.STORE.events[self.run] if e["kind"] == "axiom_send_req"]), 15)
+
+    def test_malformed_other_origin_other_path_record_nothing(self):
+        raw, sig = self.tx()
+        cases = [
+            dict(transport="axiom-api", raw=raw, origin=None),
+            dict(transport="axiom-api", raw=raw, origin="https://evil.example"),
+            dict(transport="hellomoon", raw=raw, origin="https://axiom.trade.evil.example"),
+            dict(transport="axiom-api", raw=raw, path="/wo/batched-send-tx-v3"),
+            dict(transport="axiom-api", raw=raw, method="PUT"),
+            dict(transport="hellomoon", raw=raw, path="/sendBatch"),
+            dict(transport="hellomoon", raw=raw, host="tyo.lunar-lander.hellomoon.io.evil.example"),
+            dict(transport="axiom-api", raw=raw, body="0|0|garbage"),
+            dict(transport="hellomoon", raw=raw, body=b"\x00\x05" + raw),
+            dict(transport="axiom-api", raw=raw, body=self.api_body(raw[:-1])),
+        ]
+        for case in cases:
+            with self.subTest(str({k: v for k, v in case.items() if k != "raw"})[:80]):
+                f = self.send(**case)
+                self.assertNotIn("speedex_leg", f.metadata)
+        self.assertEqual(self.axiom_legs(), [])
+        self.assertEqual(A.STORE.events.get(self.run, []), [])
+        self.assertEqual(self.polls, [])
+        self.assertEqual(A.STORE.diag["axiomSendUnproven.axiom-api.origin"], 2)
+        self.assertEqual(A.STORE.diag["axiomSendUnproven.hellomoon.origin"], 1)
+        self.assertEqual(A.STORE.diag["axiomSendUnproven.axiom-api.body-shape"], 1)
+        self.assertEqual(A.STORE.diag["axiomSendUnproven.hellomoon.body-shape"], 1)
+        self.assertEqual(A.STORE.diag["axiomSendUnproven.axiom-api.v1-layout"], 1)
+        # a success frame for that signature has nothing to bind to
+        self.cluster(sig)
+        self.assertEqual(A.STORE.diag["axiomUserTxNoLeg"], 1)
+
+    def test_no_window_no_leg(self):
+        A.STORE.mark_close(self.run)
+        raw, _ = self.tx()
+        self.clock += 10
+        self.send("axiom-api", raw)
+        self.assertEqual(self.axiom_legs(), [])
+
+    def test_signature_conflict_in_fanout_vetoes(self):
+        raw_a, sig_a = self.tx(0x41)
+        raw_b, sig_b = self.tx(0x52)
+        raw_c, sig_c = self.tx(0x63)
+        self.send("axiom-api", raw_a)
+        self.clock += 40
+        self.send("hellomoon", raw_b)  # different tx inside A's fanout window
+        legs = self.axiom_legs()
+        self.assertEqual(len(legs), 1, "the conflicting signature gets no leg")
+        leg_a = legs[0]
+        self.assertTrue(leg_a["_anchorVeto"])
+        self.assertEqual(leg_a["incomplete"], "axiom-send-sig-conflict")
+        self.clock += 2000
+        self.send("hellomoon", raw_b)  # B never gets a leg in this run, even after the window
+        self.assertEqual(len(self.axiom_legs()), 1)
+        self.clock += 300
+        self.cluster(sig_a)
+        self.assertIsNone(leg_a["tSuccessPushMs"], "vetoed leg takes no success")
+        self.send("axiom-api", raw_c)  # next trade, well after A's first send
+        legs = self.axiom_legs()
+        self.assertEqual(len(legs), 2)
+        self.assertEqual(legs[1]["_axiomSig"], sig_c)
+        self.assertFalse(legs[1].get("_anchorVeto"))
+        A.STORE.mark_close(self.run)
+        row_a = next(x for x in self.rows() if x["txHash"] == sig_a)
+        self.assertTrue(row_a["anchorVeto"])
+        self.assertIsNone(row_a["hkL1aMs"])
+        self.assertEqual(row_a["incomplete"], "axiom-send-sig-conflict")
+        self.assertTrue(row_a["evidence"]["axiomSend"]["conflict"])
+        self.assertEqual(A.STORE.diag["axiomSendSigConflict"], 1)
+        self.assertEqual(A.STORE.diag["axiomSendConflictSig"], 1)
+        self.assertNotIn(sig_b, json.dumps(A.STORE.timeline(self.run, full=True)))
+
+    def test_buy_then_sell_two_legs(self):
+        raw_buy, sig_buy = self.tx(0x41)
+        raw_sell, sig_sell = self.tx(0x63)
+        t_buy = self.clock
+        self.send("axiom-api", raw_buy)
+        self.clock += 380
+        self.cluster(sig_buy, "buy")
+        self.clock += 1500
+        t_sell = self.clock
+        self.send("hellomoon", raw_sell)
+        self.clock += 410
+        self.cluster(sig_sell, "sell")
+        A.STORE.mark_close(self.run)
+        tl = A.STORE.timeline(self.run, full=True)
+        rows = {x["txHash"]: x for x in tl["legs"] if x.get("platform") == "axiom"}
+        self.assertEqual(rows[sig_buy]["hkL1aMs"], 380)
+        self.assertEqual(rows[sig_sell]["hkL1aMs"], 410)
+        self.assertEqual(rows[sig_buy]["tOrderOutMs"], t_buy)
+        self.assertEqual(rows[sig_sell]["tOrderOutMs"], t_sell)
+        self.assertEqual(rows[sig_buy]["evidence"]["success"]["side"], "buy")
+        self.assertEqual(rows[sig_sell]["evidence"]["success"]["side"], "sell")
+        self.assertEqual(tl["counts"], {"requested": 2, "attempted": 2, "observed": 2, "unbound": 0})
+
+    # ── platform success ──
+    def test_user_tx_frame_is_success(self):
+        raw, sig = self.tx()
+        self.send("axiom-api", raw)
+        leg = self.axiom_legs()[0]
+        self.clock += 352.4
+        self.cluster(sig, "buy", host="cluster-euc2.axiom.trade")
+        self.assertEqual(leg["tSuccessPushMs"], self.clock)
+        ev = leg["successEvidence"]
+        self.assertEqual({k: ev[k] for k in ("version", "platform", "channel", "status", "txHash", "matchedKeys",
+                                             "correlation", "side")},
+                         {"version": 1, "platform": "axiom", "channel": "axiom-user-tx-ws", "status": "success",
+                          "txHash": sig, "matchedKeys": ["txHash"], "correlation": "user-tx-room+send-sig",
+                          "side": "buy"})
+        self.clock += 100
+        self.cluster(sig, "buy")  # repeat frame does not move the frozen success
+        self.assertEqual(leg["tSuccessPushMs"], self.clock - 100)
+        self.assertEqual(A.STORE.diag["axiomUserTxRepeat"], 1)
+        self.clock += 600
+        A._settle_receipt(leg, {"rpc": "stub", "chain": "solana", "pollIntervalMs": 800, "status": 1, "slot": 777})
+        A.STORE.mark_close(self.run)
+        row = self.rows()[0]
+        self.assertEqual(row["hkL1aMs"], 352.4)
+        self.assertEqual(row["hkL3Ms"], 1052.4)
+        self.assertIsNone(row["incomplete"])
+        default_row = self.rows(full=False)[0]
+        self.assertNotEqual(default_row["evidence"]["success"]["txHash"], sig, "default timeline shortens the hash")
+
+    def test_wrong_signature_public_and_malformed_frames_ignored(self):
+        raw, sig = self.tx()
+        _, other = self.tx(0x63)
+        self.send("axiom-api", raw)
+        leg = self.axiom_legs()[0]
+        self.clock += 300
+        mint = "MintSynthetic" + "8" * 31
+        cases = [
+            dict(sig=other),
+            dict(sig=sig, room="sol-v2|t:" + mint),
+            dict(sig=sig, room="sol-v2|t:" + mint + "|user-tx:" + self.USER),
+            dict(sig=sig, room="sol-v2|user-tx:not-a-uuid"),
+            dict(sig=sig, room="sol|user-tx:" + self.USER),
+            dict(sig=sig, room="balance-updates-user"),
+            dict(sig=sig, side="swap"),
+            dict(sig=sig, content=[sig, "2026-11-22T10:00:00Z", "buy"]),
+            dict(sig=sig, content=[sig, "2026-11-22T10:00:00Z", "buy", self.PAIR, "extra"]),
+            dict(sig=sig, content={"0": sig}),
+            dict(sig=sig, from_client=True),
+            dict(sig=sig, host="cluster9.axiom.trade.evil.example"),
+            dict(sig=sig, host="axiom.trade"),
+            dict(sig=sig, host="api.axiom.trade"),
+        ]
+        for case in cases:
+            with self.subTest(str(case)[:90]):
+                self.cluster(**case)
+                self.assertIsNone(leg["tSuccessPushMs"])
+        for payload in ("not json user-tx:", json.dumps([{"room": "sol-v2|user-tx:" + self.USER}])):
+            f = FakeFlow("cluster9.axiom.trade", "/", "GET")
+            f.websocket = types.SimpleNamespace(messages=[FakeWSMsg(payload)])
+            A.addons[0].websocket_message(f)
+        self.assertIsNone(leg["tSuccessPushMs"])
+        self.assertEqual(A.STORE.diag["axiomUserTxNoLeg"], 1, "only the other-signature user-tx frame routes")
+        self.assertGreaterEqual(A.STORE.diag["axiomUserTxInvalid"], 7)
+        # A frame observed before the send hook (stale/replay) is not adopted.
+        self.clock = leg["tOrderOutMs"] - 1
+        self.cluster(sig)
+        self.assertIsNone(leg["tSuccessPushMs"])
+        self.assertEqual(A.STORE.diag["axiomUserTxBeforeSend"], 1)
+        self.clock = leg["tOrderOutMs"] + 500
+        self.cluster(sig)
+        self.assertEqual(leg["tSuccessPushMs"], self.clock)
+
+    def test_success_after_window_close_ignored(self):
+        raw, sig = self.tx()
+        self.send("axiom-api", raw)
+        A.STORE.mark_close(self.run)
+        self.clock += 300
+        self.cluster(sig)
+        self.assertIsNone(self.axiom_legs()[0]["tSuccessPushMs"])
+
+    # ── Helius chain-domain arrival ──
+    def helius_conn(self, host=None):
+        f = FakeFlow(host or self.HELIUS_HOST, "/?api-key=" + self.HELIUS_KEY, "GET")
+        f.websocket = types.SimpleNamespace(messages=[])
+        return f
+
+    def ws(self, f, obj, from_client=False):
+        f.websocket.messages.append(FakeWSMsg(json.dumps(obj), from_client))
+        A.addons[0].websocket_message(f)
+
+    def subscribe(self, f, sig, rid=11, sub=6061, commitment="processed", reply=True):
+        params = [sig, {"commitment": commitment}] if commitment is not None else [sig]
+        self.ws(f, {"jsonrpc": "2.0", "id": rid, "method": "signatureSubscribe", "params": params}, True)
+        if reply:
+            self.ws(f, {"jsonrpc": "2.0", "id": rid, "result": sub})
+
+    def notify(self, f, sub=6061, err=None):
+        self.ws(f, {"jsonrpc": "2.0", "method": "signatureNotification", "params": {
+            "subscription": sub, "result": {"context": {"slot": 382000111}, "value": {"err": err}}}})
+
+    def test_helius_bound_notification_records_arrival(self):
+        raw, sig = self.tx()
+        self.send("axiom-api", raw)
+        leg = self.axiom_legs()[0]
+        f = self.helius_conn()
+        self.clock += 20
+        self.subscribe(f, sig)
+        self.clock += 360
+        self.notify(f)
+        self.notify(f)  # subscription already consumed → unmapped, no second arrival
+        self.assertEqual(self.rows()[0]["channelArrivals"],
+                         [{"channel": "helius", "api": "signatureNotification", "ms": 380}])
+        self.assertIsNone(leg["tSuccessPushMs"], "a chain-domain arrival is not platform success")
+        self.assertEqual(A.STORE.diag["axiomHeliusNotify"], 1)
+        self.assertEqual(A.STORE.diag["axiomHeliusNotifyUnmapped"], 1)
+
+    def test_helius_unbound_or_failed_records_nothing(self):
+        raw, sig = self.tx()
+        _, other = self.tx(0x63)
+        self.send("axiom-api", raw)
+        cases = {
+            "err non-null": lambda f: (self.subscribe(f, sig), self.notify(f, err={"InstructionError": [0, "x"]})),
+            "other signature": lambda f: (self.subscribe(f, other), self.notify(f)),
+            "other subscription": lambda f: (self.subscribe(f, sig), self.notify(f, sub=999)),
+            "no reply": lambda f: (self.subscribe(f, sig, reply=False), self.notify(f)),
+            "commitment confirmed": lambda f: (self.subscribe(f, sig, commitment="confirmed"), self.notify(f)),
+            "no config": lambda f: (self.subscribe(f, sig, commitment=None), self.notify(f)),
+            "unsubscribed": lambda f: (self.subscribe(f, sig), self.ws(f, {"jsonrpc": "2.0", "id": 12,
+                "method": "signatureUnsubscribe", "params": [6061]}, True), self.notify(f)),
+            "connection ended": lambda f: (self.subscribe(f, sig), A.addons[0].websocket_end(f), self.notify(f)),
+            "lookalike host": lambda f: (self.subscribe(f, sig), self.notify(f)),
+            "atlas host (OKX)": lambda f: (self.subscribe(f, sig), self.notify(f)),
+        }
+        hosts = {"lookalike host": self.HELIUS_HOST + ".evil.example", "atlas host (OKX)": A.HELIUS_ATLAS_WS_HOST}
+        for name, scenario in cases.items():
+            with self.subTest(name):
+                scenario(self.helius_conn(hosts.get(name)))
+                self.assertIsNone(self.axiom_legs()[0].get("_channelArrivals"), name)
+        for host in ("atlas-mainnet.helius-rpc.com", "sender.helius-rpc.com", "fast-mainnet.helius-rpc.com",
+                     "x.fast-mainnet.helius-rpc.com", "synthname-fast-mainnet.helius-rpc.com.evil.example",
+                     "synthname-fast-devnet.helius-rpc.com"):
+            self.assertIsNone(A.AXIOM_HELIUS_WS_HOST_RE.fullmatch(host), host)
+
+    def test_helius_arrival_only_on_axiom_legs(self):
+        raw, sig = self.tx()
+        self.send("axiom-api", raw)
+        A.STORE.legs[self.run][-1]["platform"] = "okx"
+        f = self.helius_conn()
+        self.subscribe(f, sig)
+        self.notify(f)
+        self.assertIsNone(A.STORE.legs[self.run][-1].get("_channelArrivals"))
+
+    # ── privacy ──
+    def test_no_body_header_query_or_user_id_persisted(self):
+        import base64
+        import contextlib
+        import io
+        raw, sig = self.tx()
+        api_body = self.api_body(raw)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            f1 = self.send("axiom-api", raw)
+            f2 = self.send("hellomoon", raw)
+            self.clock += 300
+            self.cluster(sig)
+            h = self.helius_conn()
+            A.addons[0].request(h)
+            A.addons[0].response(h)
+            self.subscribe(h, sig)
+            self.notify(h)
+            surfaces = {
+                "timeline": A.STORE.timeline(self.run),
+                "timelineFull": A.STORE.timeline(self.run, full=True),
+                "events": dict(A.STORE.events),
+                "diag": dict(A.STORE.diag),
+                "runDiag": {k: dict(v) for k, v in A.STORE.run_diag.items()},
+                "legs": A.STORE.legs[self.run],
+                "meta": [f1.metadata, f2.metadata],
+                "health": _http_json("GET", "http://127.0.0.1:8072/health")[1],
+                "timelineHttp": _http_json("GET", f"http://127.0.0.1:8072/timeline/{self.run}?full=1")[1],
+                "stdio": [out.getvalue(), err.getvalue()],
+            }
+        secrets = [api_body, base64.b64encode(raw).decode(), self.PREFIX, self.USER, self.PAIR, self.HELIUS_KEY,
+                   "api-key", self.COOKIE, "synthetic-query", "k="]
+        for name, value in surfaces.items():
+            dumped = json.dumps(value, default=str)
+            for s in secrets:
+                self.assertNotIn(s, dumped, (name, s[:24]))
+        self.assertIn(sig, json.dumps(surfaces["timelineFull"]), "the public signature is the anchor")
+        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.22-axiom-sol-v10.33")
+        self.assertEqual(surfaces["health"]["diag"].get("axiomUserTxAdopted"), 1)
+
+    # ── other platforms unaffected ──
+    def test_existing_platforms_unaffected(self):
+        self.assertEqual(sorted(A.RULES), ["binance", "fomo", "gmgn", "okx", "padre"])
+        for host, path in [("api.axiom.trade", "/wo/batched-send-tx-v4"),
+                           ("tyo.lunar-lander.hellomoon.io", "/sendBatch-cors")]:
+            self.assertIsNone(A._classify_order(host, path, "POST"))
+        self.assertIsNone(A._classify_ws("cluster9.axiom.trade"))
+        # An OKX Solana BlockRazor send keeps its v10.32 shape.
+        body = __import__("base64").b64encode(self.tx()[0]).decode()
+        meta = A._okx_rpc_request("hongkong.solana.blockrazor.io", "/v2/sendTransaction", "POST",
+                                  {"origin": "https://web3.okx.com"}, body)
+        self.assertEqual(meta["source"], "okx-solana-send")
+        # Axiom bodies sent with the OKX origin to Axiom hosts are not OKX legs either.
+        raw, _ = self.tx()
+        self.send("axiom-api", raw, origin="https://web3.okx.com")
+        self.assertEqual(A.STORE.legs.get(self.run, []), [])
 
 
 if __name__ == "__main__":

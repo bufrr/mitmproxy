@@ -227,3 +227,52 @@ page's success toast leg; it usually arrives 30–70 ms before `tg_processed_ord
 Cross-repo: the EU consumers register `gmgn_trade_hash` — `scripts/lib/public-projector.mjs` channelArrivals.channel enum,
 `web/shared-push-timing.mjs` `chainArrivalEligible` (GMGN legs, supplies a value on BSC only) and the history push-source label
 `TRADE_HASH` (`web/history-view.js`). The speedex side applies the same first-entry rule.
+
+## 2026.11.22-axiom-sol-v10.33
+
+Axiom (`axiom.trade`, Solana) as a fifth HK-observed Solana platform (live product facts 2026-11-22, five funded
+round trips). New platform `axiom`, `orderRequestSource="axiom-solana-send"`; `schemaVersion=2` / `hook-observed@v2`
+and every other platform's behaviour are unchanged (no new `RULES` entry: Axiom has its own exact dispatch).
+
+- **Send anchor (request hook)**: Origin exactly `https://axiom.trade` and one of
+  - `POST api.axiom.trade/wo/batched-send-tx-v4`, ASCII body `0|0|<base64 of 6 bytes>:<base64 signed tx>` (exactly one tx);
+  - `POST <region>.lunar-lander.hellomoon.io/sendBatch-cors` for the 14 regions
+    `lax nyc fra ams ash sgp tyo lon syd uae chi dal sea lit`, binary body = u16 big-endian length covering exactly
+    the rest of the body + the raw tx.
+
+  The tx must be Solana v1 (first byte 0x81) with exactly one required signature and pass the full v1 layout check
+  (`_sol_v1_first_sig`); the signature is then its trailing 64 bytes (base58). Legacy/v0, multi-signer, bare,
+  truncated/trailing, other Origin/path/method/host → no leg, only `axiomSendUnproven.<transport>.<reason>`
+  (`origin|size|body-shape|not-v1|not-single-signer|v1-layout`). The FIRST proven send of a signature opens an
+  `anchorRole:"order"` leg on chain `solana` (slot bound at once), freezing `tOrderOutMs`, wall time and the chain-head
+  snapshot at that hook, and starts the Solana receipt/slot poll from the signature (HK-L3′).
+- **Fanout fold / veto**: every later send with the same signature (Hellomoon fanout + Axiom API, any time in the window)
+  folds into that leg (`axiomSendFold`, event `axiom_send_req`, per-transport counts in `evidence.axiomSend`). A different
+  signature within `AXIOM_SEND_FANOUT_MS` = 1000 ms of the latest leg's first send vetoes that leg
+  (`_anchorVeto`, `incomplete="axiom-send-sig-conflict"`, `hkL1aMs` null) and the conflicting signature never gets a
+  leg in that run (`axiomSendSigConflict`, `axiomSendConflictSig`). Sends after 1 s with a new signature are a new trade.
+- **Success (HK-L1a′)**: a server text frame on `cluster[a-z0-9-]*.axiom.trade` (WS opened from a page shared worker)
+  `{"room":"sol-v2|user-tx:<uuid>","content":[<sig>,<iso time>,"buy"|"sell",<pair>]}` (content exactly 4 items) whose
+  `content[0]` equals an open, non-vetoed Axiom leg's signature, at or after its send hook → `tSuccessPushMs` (frame hook
+  entry, first adoption frozen), `successEvidence={version:1, platform:"axiom", channel:"axiom-user-tx-ws",
+  status:"success", txHash, txDigest, matchedKeys:["txHash"], correlation:"user-tx-room+send-sig", observedAtMs,
+  frameSha, side}`. Frames without `user-tx:` (public `sol-v2|t:<mint>` trades, prices, slots, blockhash, gas-prices,
+  balance-updates-user) are skipped before decode; malformed user-tx frames count `axiomUserTxInvalid`; other
+  signatures `axiomUserTxNoLeg`; diag also `axiomUserTxAdopted|Repeat|BeforeSend|LegIneligible`.
+- **Helius chain-domain arrival**: on `<name>-fast-mainnet.helius-rpc.com` the page's
+  `signatureSubscribe([sig,{commitment:"processed"}])` registers reqId→sig, the `{"id":reqId,"result":subId}` reply binds
+  subId→sig (connection-level, separate from OKX maps), and a mapped `signatureNotification` with `value.err` present and
+  null records `channelArrivals {channel:"helius", api:"signatureNotification", ms}` on the Axiom leg with that anchor
+  signature (`note_channel_arrival(..., platform="axiom")`, first arrival frozen). Not success. Diag `axiomHelius*`.
+- **Decrypt scope**: production and experiment units add exactly `api.axiom.trade`, `cluster[a-z0-9-]*.axiom.trade`
+  (first-party form) and the 14 Hellomoon hosts (overlay section 2026-11-22). The Axiom page's Helius WS is added
+  as one exact host, `greer-651y13-fast-mainnet.helius-rpc.com` (read from the live page 2026-11-22; no query key);
+  the addon dispatches the form `[a-z0-9]+(-[a-z0-9]+)*-fast-mainnet.helius-rpc.com` (never atlas-mainnet/sender), so
+  if Axiom moves to another name the helius arrival is honestly missing until that exact host is added. Decrypting `api.axiom.trade` exposes all Axiom REST traffic (login/session, cookies,
+  auth headers, quotes, balances); the addon reads only host/path/method/Origin, parses only the exact send POST body
+  in memory and keeps nothing of bodies, prefixes, headers, query, response bodies, user uuid or pair.
+- **Timeline**: `evidence.axiomSend={firstTransport, transports:{axiom-api|hellomoon: n}, conflict}` (counts only).
+
+Cross-repo: the EU consumer must register platform `axiom`, `orderRequestSource` `axiom-solana-send`, success channel
+`axiom-user-tx-ws` and the Axiom helius arrival (api `signatureNotification`; the OKX helius gate only accepts
+`transactionNotification`) in hk-timing-client / public-projector / shared-push-timing / docs/hk-proxy-timing.md.

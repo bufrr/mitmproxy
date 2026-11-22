@@ -95,6 +95,10 @@ fomo.md + tests/classify-ws.test.mjs 等夹具——改规则同步改本注释�
           的首个 200 + success===true + responseObject.status=="SUCCESS" 响应（响应 hook 入口）；
           intentId 须等于执行腿 transport 前最新 Mobula preview 的 mobulaSwap.intentId，
           且为 transport 后首个同 id GET 绑定；FAILED 只记失败；无 fill hash → 无 HK receipt。
+  Axiom   (v10.33) order anchor = first proven send of a tx (Origin https://axiom.trade): POST
+          api.axiom.trade /wo/batched-send-tx-v4 or <region>.lunar-lander.hellomoon.io /sendBatch-cors;
+          signature derived in memory from the single-signer Solana v1 tx (trailing 64 bytes). Success =
+          cluster*.axiom.trade WS room sol-v2|user-tx:<uuid>, content[0] == the leg's signature.
 
 成功判定统一锚纪律：成功状态/hash/id 必须与「请求/响应建立的
 独立锚」（leg._anchor：响应抽取 id、binance 请求体 clientOrderId、fomo 页面出站
@@ -335,7 +339,15 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # arrival on the GMGN leg whose anchor txHash equals d.h (channel "gmgn_trade_hash", api "wallet_trade_data",
 # same HK clock/anchor as fullnode/helius, first arrival frozen). Arrival record only:
 # never success/eligibility/anchor/hkL1aMs. Diag: gmgnTradeHashEntries / gmgnTradeHashArrivals.
-ADDON_VERSION = "2026.11.19-gmgn-trade-hash-v10.32"
+# v10.33 (2026-11-22): Axiom (axiom.trade, Solana). Order anchor (platform "axiom", orderRequestSource
+# "axiom-solana-send", anchorRole order, chain solana) = request hook of the first proven send of a tx: POST
+# api.axiom.trade/wo/batched-send-tx-v4 ("0|0|<b64 6B>:<b64 tx>") or <region>.lunar-lander.hellomoon.io
+# /sendBatch-cors (u16 BE length + tx), Origin https://axiom.trade, Solana v1 tx with one signer (trailing 64
+# bytes). Same-signature sends fold into that leg; a different signature within 1 s of its first send vetoes
+# it. Success = cluster*.axiom.trade room sol-v2|user-tx:<uuid> with content[0] == the leg's signature;
+# Helius "<name>-fast-mainnet" signatureNotification (err null) = channelArrivals helius. Receipt poll from
+# the send. Bodies/headers/query/user ids never kept. Other platforms unchanged.
+ADDON_VERSION = "2026.11.22-axiom-sol-v10.33"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -809,6 +821,231 @@ def _helius_server_frame(flow, payload):
     if not isinstance(sig, str) or sig != mapped:
         return "heliusNotifySigMismatch", None
     return "heliusNotify", sig
+
+
+# ── v10.33 Axiom (axiom.trade, Solana) ───────────────────────────────────────
+# Product facts (2026-11-22, 5 funded round trips): on the buy/sell click the page (Origin https://axiom.trade)
+# POSTs the same signed v1 transaction to
+#   - api.axiom.trade /wo/batched-send-tx-v4, text body "0|0|<base64 of 6 bytes>:<base64 signed tx>", and
+#   - 14 Hellomoon regions <r>.lunar-lander.hellomoon.io /sendBatch-cors, binary body = u16 big-endian length
+#     + the same raw tx bytes.
+# The tx is Solana v1 (first byte 0x81) with ONE required signature, serialized after the message, i.e. the
+# last 64 bytes. Only that shape is derived (full v1 layout check + nSig == 1 + trailing 64 bytes); anything
+# else is no anchor. The body is read in memory only: signed bytes, prefixes, headers and query are never
+# kept — only the public base58 signature leaves the parser (same rule as the OKX Solana / FOMO sends).
+# Success = a cluster*.axiom.trade WS text frame of room "sol-v2|user-tx:<user uuid>" whose content[0] is the
+# leg's signature; the user uuid, iso time and pair address are never kept. Public rooms (sol-v2|t:<mint>,
+# prices, slots, …) never count. Helius (wss://<name>-fast-mainnet.helius-rpc.com/) signatureSubscribe →
+# mapped signatureNotification with value.err null = chain-domain arrival (channel "helius"), never success.
+AXIOM_PLATFORM = "axiom"
+AXIOM_ORIGIN = "https://axiom.trade"
+AXIOM_SEND_SOURCE = "axiom-solana-send"
+AXIOM_API_HOST = "api.axiom.trade"
+AXIOM_API_SEND_PATH = "/wo/batched-send-tx-v4"
+AXIOM_HELLOMOON_REGIONS = (
+    "lax", "nyc", "fra", "ams", "ash", "sgp", "tyo", "lon", "syd", "uae", "chi", "dal", "sea", "lit",
+)
+AXIOM_HELLOMOON_HOSTS = frozenset(f"{r}.lunar-lander.hellomoon.io" for r in AXIOM_HELLOMOON_REGIONS)
+AXIOM_HELLOMOON_SEND_PATH = "/sendBatch-cors"
+# First-party Axiom WS hosts (observed cluster9 / cluster-atl1 / cluster-euc2). Addon dispatch only; the
+# decrypt scope (allow_hosts) carries the same exact-form pattern.
+AXIOM_CLUSTER_WS_HOST_RE = re.compile(r"cluster[a-z0-9-]*\.axiom\.trade")
+# Helius "<name>-fast-mainnet" WS form. Addon dispatch only: decryption still needs the exact host in
+# allow_hosts, and an arrival is recorded only for an Axiom leg whose anchor signature equals the mapped one.
+# Never matches atlas-mainnet (OKX, dispatched earlier) or sender.helius-rpc.com (FOMO HTTP transport).
+AXIOM_HELIUS_WS_HOST_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*-fast-mainnet\.helius-rpc\.com")
+# Sends with a different signature within this time of a leg's first send = conflicting fanout → veto.
+AXIOM_SEND_FANOUT_MS = 1000.0
+AXIOM_SUCCESS_CHANNEL = "axiom-user-tx-ws"
+AXIOM_USER_TX_ROOM_PREFIX = "sol-v2|user-tx:"
+AXIOM_SEND_BODY_MAX = 2 + _SOL_TX_V1_MAX_BYTES
+_AXIOM_API_BODY_RE = re.compile(r"0\|0\|([A-Za-z0-9+/]{8}):([A-Za-z0-9+/]+={0,2})")
+_AXIOM_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+_AXIOM_HELIUS_SUBS_KEY = "speedex_axiom_helius_subs"
+AXIOM_SEND_UNPROVEN_REASONS = ("origin", "size", "body-shape", "not-v1", "not-single-signer", "v1-layout")
+
+
+def _axiom_send_route(host, path, method):
+    """Exact host + POST + path → transport label ("axiom-api" | "hellomoon") or None."""
+    if method != "POST":
+        return None
+    if host == AXIOM_API_HOST and path == AXIOM_API_SEND_PATH:
+        return "axiom-api"
+    if host in AXIOM_HELLOMOON_HOSTS and path == AXIOM_HELLOMOON_SEND_PATH:
+        return "hellomoon"
+    return None
+
+
+def _axiom_v1_single_sig(raw):
+    """Signed Solana v1 tx with exactly one required signature → (base58 sig, None) or (None, reason).
+
+    Full v1 layout check (_sol_v1_first_sig) plus nSig == 1; the signature is then the trailing 64 bytes
+    (proven live on both send bodies). Multi-signer, legacy/v0, bare or trailing-data shapes → no anchor."""
+    if not raw or raw[0] != _SOL_TX_V1_VERSION_BYTE:
+        return None, "not-v1"
+    if len(raw) < 2 or raw[1] != 1:
+        return None, "not-single-signer"
+    sig = _sol_v1_first_sig(raw)
+    if sig is None or sig != _b58encode(raw[-64:]):
+        return None, "v1-layout"
+    return sig, None
+
+
+def _axiom_send_sig(transport, headers, body):
+    """In-memory parse of one Axiom send request body (bytes) → (sig | None, reason | None).
+
+    Origin must be exactly https://axiom.trade. axiom-api: ASCII "0|0|<b64 6 bytes>:<b64 tx>" (one tx);
+    hellomoon: u16 big-endian length that covers exactly the rest of the body (one tx). Fail closed."""
+    try:
+        origin = headers.get("origin")
+    except Exception:
+        origin = None
+    if origin != AXIOM_ORIGIN:
+        return None, "origin"
+    if not isinstance(body, (bytes, bytearray)) or not 3 <= len(body) <= 4 * AXIOM_SEND_BODY_MAX:
+        return None, "size"
+    if transport == "axiom-api":
+        try:
+            m = _AXIOM_API_BODY_RE.fullmatch(bytes(body).decode("ascii"))
+        except UnicodeDecodeError:
+            m = None
+        if not m:
+            return None, "body-shape"
+        try:
+            prefix = base64.b64decode(m.group(1), validate=True)
+            raw = base64.b64decode(m.group(2), validate=True)
+        except Exception:
+            return None, "body-shape"
+        if len(prefix) != 6:
+            return None, "body-shape"
+    elif transport == "hellomoon":
+        if len(body) > AXIOM_SEND_BODY_MAX:
+            return None, "size"
+        if int.from_bytes(body[:2], "big") != len(body) - 2:
+            return None, "body-shape"
+        raw = bytes(body[2:])
+    else:
+        return None, "body-shape"
+    if len(raw) > _SOL_TX_V1_MAX_BYTES:
+        return None, "size"
+    return _axiom_v1_single_sig(raw)
+
+
+def _request_bytes(req):
+    """Request body as bytes (binary Hellomoon body); in memory only, never retained."""
+    try:
+        b = getattr(req, "content", None)
+    except Exception:
+        b = None
+    if isinstance(b, (bytes, bytearray)):
+        return bytes(b)
+    try:
+        return (req.get_text() or "").encode("utf-8")
+    except Exception:
+        return b""
+
+
+def _axiom_user_tx_frame(payload):
+    """cluster*.axiom.trade server frame → (diag key | None, sig | None, side | None).
+
+    Only {"room":"sol-v2|user-tx:<uuid>","content":[sig, iso time, "buy"|"sell", pair]} counts; every other
+    room (public trades sol-v2|t:<mint>, prices, slots, blockhash, gas-prices, balance-updates-user) is
+    skipped before any JSON decode. The uuid, time and pair are validated as shapes and dropped."""
+    needle = b"user-tx:" if isinstance(payload, (bytes, bytearray)) else "user-tx:"
+    try:
+        if needle not in payload:
+            return None, None, None
+    except TypeError:
+        return None, None, None
+    obj = _j(payload)
+    if not isinstance(obj, dict):
+        return "axiomUserTxInvalid", None, None
+    room = obj.get("room")
+    if (
+        not isinstance(room, str)
+        or not room.startswith(AXIOM_USER_TX_ROOM_PREFIX)
+        or not _AXIOM_UUID_RE.fullmatch(room[len(AXIOM_USER_TX_ROOM_PREFIX):])
+    ):
+        return "axiomUserTxInvalid", None, None
+    content = obj.get("content")
+    if not isinstance(content, list) or len(content) != 4:
+        return "axiomUserTxInvalid", None, None
+    sig, at, side, pair = content
+    if (
+        not isinstance(sig, str)
+        or _SOL_SIG_RE.fullmatch(sig) is None
+        or not isinstance(at, str)
+        or side not in ("buy", "sell")
+        or not isinstance(pair, str)
+    ):
+        return "axiomUserTxInvalid", None, None
+    return "axiomUserTx", sig, side
+
+
+def _axiom_helius_subs(flow):
+    return flow.metadata.setdefault(_AXIOM_HELIUS_SUBS_KEY, {"req": {}, "subs": {}})
+
+
+def _axiom_helius_client_frame(flow, payload):
+    """Axiom Helius outbound frame → diag key or None. signatureSubscribe registers reqId→sig only for
+    params == [<sig>, {"commitment": "processed", …}] (the page's form); anything else clears that reqId."""
+    obj = _decode_ws(payload)
+    if not isinstance(obj, dict):
+        return None
+    method = obj.get("method")
+    ident = obj.get("id")
+    params = obj.get("params")
+    subs = _axiom_helius_subs(flow)
+    if method == "signatureSubscribe":
+        sig = params[0] if isinstance(params, list) and len(params) == 2 else None
+        cfg = params[1] if isinstance(params, list) and len(params) == 2 else None
+        ok = (
+            ident is not None and not isinstance(ident, bool)
+            and isinstance(sig, str) and _SOL_SIG_RE.fullmatch(sig) is not None
+            and isinstance(cfg, dict) and cfg.get("commitment") == "processed"
+        )
+        if ok:
+            subs["req"][str(ident)] = sig
+            return "axiomHeliusSubscribe"
+        if ident is not None:
+            subs["req"].pop(str(ident), None)
+        return "axiomHeliusSubscribeIneligible"
+    if method == "signatureUnsubscribe":
+        sid = params[0] if isinstance(params, list) and params else None
+        if sid is not None:
+            subs["subs"].pop(str(sid), None)
+        return "axiomHeliusUnsubscribe"
+    return None
+
+
+def _axiom_helius_server_frame(flow, payload):
+    """Axiom Helius inbound frame → (diag key | None, sig | None). sig only for a signatureNotification whose
+    subscription maps (same connection) and whose value.err key is present and null. A signature
+    subscription ends with its notification, so the mapping is dropped then."""
+    obj = _decode_ws(payload)
+    if not isinstance(obj, dict):
+        return None, None
+    subs = _axiom_helius_subs(flow)
+    method = obj.get("method")
+    if method is None:
+        if obj.get("id") is not None and str(obj.get("id")) in subs["req"]:
+            _sol_sub_response(subs, obj)
+            return "axiomHeliusSubscribeReply", None
+        return None, None
+    if method != "signatureNotification":
+        return None, None
+    params = obj.get("params")
+    result = params.get("result") if isinstance(params, dict) else None
+    value = result.get("value") if isinstance(result, dict) else None
+    if not isinstance(value, dict) or "err" not in value:
+        return "axiomHeliusNotifyInvalid", None
+    sig = _sol_sub_mapped(subs, params)
+    if not sig:
+        return "axiomHeliusNotifyUnmapped", None
+    subs["subs"].pop(str(params.get("subscription")), None)
+    if value.get("err") is not None:
+        return "axiomHeliusNotifyErr", None
+    return "axiomHeliusNotify", sig
 
 
 def _j(payload):
@@ -3425,6 +3662,8 @@ class Store:
         self.fomo_swaps = {}
         # FOMO Privy share requests per run: hook time/wall/head snapshots only (no path id, body or header).
         self.fomo_signs = {}
+        # v10.33: per run, Axiom signatures that conflicted inside a send fanout (never get a leg).
+        self.axiom_conflict_sigs = {}
 
     def _freeze_run_locked(self, run_id):
         """关窗即冻结——腿标 windowClosed（后续帧不更新、receipt 回写丢弃），
@@ -3450,6 +3689,7 @@ class Store:
         self.fomo_mobula_previews.pop(run_id, None)
         self.fomo_preview_source.pop(run_id, None)
         self.fomo_signs.pop(run_id, None)
+        self.axiom_conflict_sigs.pop(run_id, None)
         for key in list(self.fomo_swaps):
             if key[0] == run_id:
                 self.fomo_swaps.pop(key, None)
@@ -3485,6 +3725,7 @@ class Store:
             self.run_diag.pop(rid, None)
             self.ws_buffer.pop(rid, None)  # 回收前窗口已 freeze（缓冲已弃），防御性清理
             self.fomo_signs.pop(rid, None)
+            self.axiom_conflict_sigs.pop(rid, None)
             for p, leg in list(self.open_legs.items()):
                 if leg.get("runId") == rid:
                     del self.open_legs[p]
@@ -5052,6 +5293,149 @@ class Store:
             })
             return leg
 
+    # ── v10.33 Axiom ──────────────────────────────────────────────────────────
+    def _axiom_diag_locked(self, rid, key):
+        self.diag[key] += 1
+        if rid:
+            self.run_diag[rid][key] += 1
+
+    def _axiom_window_locked(self, window, t):
+        """(lock held) The run of the window captured at hook entry, or None (closed/TTL/reopened)."""
+        rid, epoch = window
+        mark = self.marks.get(rid)
+        now = time.monotonic()
+        if mark and mark["closed"] is None and now - mark["opened"] >= MARK_TTL_S:
+            mark["closed"] = now
+            self._freeze_run_locked(rid)
+        if not mark or mark["closed"] is not None or mark.get("epoch") != epoch or t < mark["opened"] * 1000:
+            return None
+        return rid
+
+    def note_axiom_send_unproven(self, window, transport, reason, t_obs):
+        """A send request on an exact Axiom host/path whose Origin/body is not the proven shape: counted only
+        (no leg, no event, no value)."""
+        label = reason if reason in AXIOM_SEND_UNPROVEN_REASONS else "body-shape"
+        with self.lock:
+            rid = self._axiom_window_locked(window, t_obs)
+            self._axiom_diag_locked(rid, f"axiomSendUnproven.{transport}.{label}")
+
+    def axiom_send_in_open_window(self, window, ev, sig, transport):
+        """v10.33: one proven Axiom send (signature derived in memory) → (rid, leg | None, verdict).
+
+        verdict: "new" = the first send of this signature opened an order leg (anchor = this request hook,
+        chain solana, head snapshot frozen by the caller); "fold" = same signature as an existing leg of this
+        run (the Hellomoon fanout + Axiom API send of one tx, at any time) → same leg, counted per transport;
+        "conflict" = a different signature within AXIOM_SEND_FANOUT_MS of the latest leg's first send → that
+        leg is vetoed (incomplete axiom-send-sig-conflict) and this signature never gets a leg in the run;
+        "no-window" / "overflow" → nothing. The signature is kept only as the leg's anchor txHash."""
+        with self.lock:
+            rid = self._axiom_window_locked(window, ev["t"])
+            if rid is None:
+                self.diag["orderReqNoWindow"] += 1
+                return None, None, "no-window"
+            t = ev["t"]
+            axiom_legs = [
+                x for x in self.legs[rid]
+                if x.get("platform") == AXIOM_PLATFORM and x.get("orderRequestSource") == AXIOM_SEND_SOURCE
+            ]
+            conflicted = self.axiom_conflict_sigs.setdefault(rid, set())
+            if sig in conflicted:
+                self._axiom_diag_locked(rid, "axiomSendConflictSig")
+                return rid, None, "conflict"
+            same = next((x for x in axiom_legs if x.get("_axiomSig") == sig), None)
+            if same is not None:
+                st = same["_axiomSend"]
+                st["transports"][transport] = st["transports"].get(transport, 0) + 1
+                st["lastMs"] = max(st["lastMs"], t)
+                self._axiom_diag_locked(rid, "axiomSendFold")
+                self._add_event_locked(rid, {
+                    "t": t, "tw": ev["tw"], "kind": "axiom_send_req", "platform": AXIOM_PLATFORM,
+                    "host": ev["host"], "transport": transport, "flowId": ev["flowId"],
+                })
+                return rid, same, "fold"
+            latest = axiom_legs[-1] if axiom_legs else None
+            if (
+                latest is not None
+                and isinstance(latest.get("tOrderOutMs"), (int, float))
+                and abs(t - latest["tOrderOutMs"]) <= AXIOM_SEND_FANOUT_MS
+            ):
+                conflicted.add(sig)
+                latest["_axiomSend"]["conflict"] = True
+                if not latest.get("incomplete"):
+                    latest["incomplete"] = "axiom-send-sig-conflict"
+                self._veto_leg_locked(latest)
+                self._axiom_diag_locked(rid, "axiomSendSigConflict")
+                self._add_event_locked(rid, {
+                    "t": t, "tw": ev["tw"], "kind": "axiom_send_conflict", "platform": AXIOM_PLATFORM,
+                    "host": ev["host"], "transport": transport, "flowId": ev["flowId"],
+                })
+                return rid, None, "conflict"
+            if len(self.legs[rid]) >= MAX_LEGS_PER_RUN:
+                self.overflow[rid]["legs"] += 1
+                return None, None, "overflow"
+            self._add_event_locked(rid, ev)
+            leg = self._new_leg_locked(rid, AXIOM_PLATFORM, "solana", ev)
+            if leg is None:
+                return None, None, "overflow"
+            leg["_axiomSig"] = sig
+            leg["_anchor"]["txHash"] = sig
+            leg["txHash"] = sig
+            leg["_axiomSend"] = {
+                "transports": {transport: 1}, "firstTransport": transport, "lastMs": t, "conflict": False,
+            }
+            self._axiom_diag_locked(rid, "axiomSendLeg")
+            return rid, leg, "new"
+
+    def observe_axiom_user_tx(self, sig, side, t_obs, frame_sha, host):
+        """v10.33: a cluster user-tx frame whose content[0] equals an open Axiom leg's own send signature is
+        that leg's platform success (t_obs = frame hook entry). First adoption frozen; vetoed / closed /
+        before-send / unknown signature → counted only. Returns the leg on adoption."""
+        with self.lock:
+            rids = self._open_run_ids_locked(time.monotonic())
+            rid0 = rids[0] if rids else None
+            hits = [
+                leg for rid in rids for leg in self.legs.get(rid, [])
+                if leg.get("platform") == AXIOM_PLATFORM and leg.get("_axiomSig") == sig
+            ]
+            if len(hits) != 1:
+                self._axiom_diag_locked(rid0, "axiomUserTxNoLeg" if not hits else "axiomUserTxAmbiguous")
+                return None
+            leg = hits[0]
+            rid = leg.get("runId")
+            if leg.get("windowClosed") or leg.get("_anchorVeto") or leg.get("dup"):
+                self._axiom_diag_locked(rid, "axiomUserTxLegIneligible")
+                return None
+            t0 = leg.get("tOrderOutMs")
+            if not isinstance(t0, (int, float)) or t_obs < t0:
+                self._axiom_diag_locked(rid, "axiomUserTxBeforeSend")
+                return None
+            if leg.get("tSuccessPushMs") is not None:
+                self._axiom_diag_locked(rid, "axiomUserTxRepeat")
+                return None
+            leg["tSuccessPushMs"] = t_obs
+            leg["wsSha"] = frame_sha
+            leg["successAnchorKeys"] = ["txHash"]
+            digest = hashlib.sha256(sig.encode()).hexdigest()
+            leg["successEvidence"] = {
+                "version": 1,
+                "platform": AXIOM_PLATFORM,
+                "channel": AXIOM_SUCCESS_CHANNEL,
+                "status": "success",
+                "txHash": sig,
+                "txDigest": "-".join(digest[i:i+16] for i in range(0, 64, 16)),
+                "matchedKeys": ["txHash"],
+                "correlation": "user-tx-room+send-sig",
+                "observedAtMs": t_obs,
+                "frameSha": frame_sha,
+                "side": side if side in ("buy", "sell") else None,
+            }
+            self._axiom_diag_locked(rid, "axiomUserTxAdopted")
+            self._add_event_locked(rid, {
+                "t": t_obs, "tw": _wall_iso(), "kind": "ws_success", "platform": AXIOM_PLATFORM,
+                "host": host, "sha": frame_sha,
+            })
+            return leg
+
     def route_ws_frame(self, platform, ids, defer_nomatch=False):
         """入站 WS 帧按**锚身份**路由到目标腿——候选是
         所有开窗 run 内该平台未冻结的腿（不只平台最新腿：最新腿是 dup/后一轮时
@@ -5667,6 +6051,12 @@ class Store:
                         # v10.28: per-transport signature derivation + provider WS correlation (no values)
                         **({"fomoExecSig": _fomo_exec_sig_evidence(x)} if x.get("_fomoExecSigDiag") else {}),
                         **({"fomoProviderWs": _fomo_provider_ws_evidence(x, full)} if x.get("_fomoProvider") else {}),
+                        # v10.33: Axiom send fanout folded into this leg (transport counts only; no body/value)
+                        **({"axiomSend": {
+                            "firstTransport": x["_axiomSend"].get("firstTransport"),
+                            "transports": dict(x["_axiomSend"].get("transports") or {}),
+                            "conflict": bool(x["_axiomSend"].get("conflict")),
+                        }} if x.get("_axiomSend") else {}),
                     },
                     "incomplete": incomplete,
                     "atWall": at_wall,
@@ -6654,6 +7044,11 @@ class SpeedexHkTiming:
                 STORE.note_frame_diag("fomoProviderStatusPoll")
             return
 
+        axiom_transport = _axiom_send_route(host, path, method)
+        if axiom_transport:
+            self._handle_axiom_send(flow, window, axiom_transport, host, path, t_obs, t_wall, t_wall_ms)
+            return
+
         fomo_route = _fomo_execution_route(host, path, method)
         raw_candidate = method == "POST" and (host in OKX_RPC_HOSTS or host in OKX_SOL_SEND_HOSTS)
         if not platform and not raw_candidate and not fomo_route:
@@ -6766,6 +7161,47 @@ class SpeedexHkTiming:
             if kv:
                 STORE.update_anchor(leg, kv)
 
+    @staticmethod
+    def _handle_axiom_send(flow, window, transport, host, path, t_obs, t_wall, t_wall_ms):
+        """v10.33 Axiom send (exact host + POST + path already matched). Head snapshot frozen at hook entry;
+        the body is parsed in memory for the public signature only (bytes/prefix/headers/query dropped)."""
+        head_snapshots = HEADS.snapshot(window[0], t_obs)
+        body = _request_bytes(flow.request)
+        sig, reason = _axiom_send_sig(transport, getattr(flow.request, "headers", {}), body)
+        body = None
+        if not sig:
+            STORE.note_axiom_send_unproven(window, transport, reason, t_obs)
+            return
+        ev = {
+            "t": t_obs,
+            "tw": t_wall,
+            "twms": t_wall_ms,
+            "kind": "order_req",
+            "platform": AXIOM_PLATFORM,
+            "host": host,
+            "path": path,
+            "flowId": flow.id,
+            "bodySha": None,  # signed transaction body — no hash of it is kept
+            "headSnapshots": head_snapshots,
+            "orderRequestSource": AXIOM_SEND_SOURCE,
+            "anchorRole": "order",
+            "transport": transport,
+        }
+        rid, leg, verdict = STORE.axiom_send_in_open_window(window, ev, sig, transport)
+        if leg is None:
+            return
+        flow.metadata["speedex_leg"] = (leg, rid)
+        flow.metadata["speedex_axiom_send"] = {"transport": transport}
+        if verdict == "new":
+            # Exact signature + chain solana known at the request: start the Solana receipt/slot observation.
+            h = STORE.claim_receipt_poll(leg)
+            if h:
+                threading.Thread(
+                    target=_poll_receipt,
+                    args=(rid, leg, leg.get("chain"), h, _jsonrpc),
+                    daemon=True,
+                ).start()
+
     def response(self, flow):
         t_obs = _mono_ms()  # hook 入口冻结（同 request 侧）
         relay_host = _ws_raw_relay_host(flow)
@@ -6877,6 +7313,20 @@ class SpeedexHkTiming:
         with STORE.lock:
             if not leg.get("windowClosed") and leg.get("tFirstRespMs") is None:
                 leg["tFirstRespMs"] = t_obs
+        axiom_send = flow.metadata.get("speedex_axiom_send")
+        if axiom_send:
+            # v10.33: status/transport only; the response body is never read.
+            code = getattr(flow.response, "status_code", None)
+            STORE.add_event(rid, {
+                "t": t_obs,
+                "tw": _wall_iso(),
+                "kind": "axiom_send_ack",
+                "platform": AXIOM_PLATFORM,
+                "transport": axiom_send["transport"],
+                "code": code,
+                "ok": isinstance(code, int) and 200 <= code < 300,
+            })
+            return
         body = ""
         try:
             body = flow.response.get_text() or ""
@@ -7018,6 +7468,7 @@ class SpeedexHkTiming:
         try:
             flow.metadata.pop(_SOL_SUBS_KEY, None)
             flow.metadata.pop(_HELIUS_SUBS_KEY, None)
+            flow.metadata.pop(_AXIOM_HELIUS_SUBS_KEY, None)
         except Exception:
             pass
 
@@ -7075,6 +7526,34 @@ class SpeedexHkTiming:
             if sig:
                 STORE.note_channel_arrival("solana", sig, HELIUS_CHANNEL, "transactionNotification", t_obs,
                                            platform="okx")
+            return
+        if AXIOM_CLUSTER_WS_HOST_RE.fullmatch(host or ""):
+            # v10.33: Axiom user-tx room → platform success of the leg with that exact send signature.
+            # Client frames and every other room are ignored (prefilter before decode); nothing is retained.
+            if not msg.from_client:
+                key, sig, side = _axiom_user_tx_frame(msg.content)
+                if key:
+                    STORE.note_frame_diag(key)
+                if sig:
+                    payload = msg.content
+                    frame_sha = hashlib.sha256(
+                        payload if isinstance(payload, bytes) else str(payload).encode()
+                    ).hexdigest()[:16]
+                    STORE.observe_axiom_user_tx(sig, side, t_obs, frame_sha, host)
+            return
+        if AXIOM_HELIUS_WS_HOST_RE.fullmatch(host or ""):
+            # v10.33: Axiom page Helius signatureSubscribe → mapped signatureNotification (err null) →
+            # Axiom leg chain-domain arrival (HK clock). Host dispatch only; query and frame bodies unread/unkept.
+            if msg.from_client:
+                key = _axiom_helius_client_frame(flow, msg.content)
+                sig = None
+            else:
+                key, sig = _axiom_helius_server_frame(flow, msg.content)
+            if key:
+                STORE.note_frame_diag(key)
+            if sig:
+                STORE.note_channel_arrival("solana", sig, HELIUS_CHANNEL, "signatureNotification", t_obs,
+                                           platform=AXIOM_PLATFORM)
             return
         platform = _classify_ws(host)
         if not platform:

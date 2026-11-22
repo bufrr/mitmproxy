@@ -17,6 +17,11 @@ WorkingDirectory=/opt/speedex-mitm
 # 证书/ALPN、提交兼容与单核资源水位；这些主机不提供平台成功信号。
 # v10.30：atlas-mainnet.helius-rpc.com（精确 host，OKX Solana 页面的 transactionSubscribe WS）只读帧作链域
 # 到达（channel=helius）；api-key query 不读不存。只此精确 host，不放行 helius-rpc.com 其它子域。
+# v10.33：Axiom（Solana）——api.axiom.trade（send 锚；该主机的登录/报价/账户 API 同时被解密）、
+# cluster[a-z0-9-]*.axiom.trade（user-tx 成功 WS，first-party 形）、14 个精确 Hellomoon
+# <region>.lunar-lander.hellomoon.io（send 扇出）。只读 host/path/method/Origin 与内存推导签名；body/header/
+# query/用户 id 不持久化。Axiom 页的 Helius WS 精确 host greer-651y13-fast-mainnet.helius-rpc.com（2026-11-22 实页读出，无 query key）。
+# 生产安装本 unit = 扩大解密范围，须先在实验实例验收（docs/hk-operations.md §2）并取得 owner 授权。
 ExecStart=/opt/speedex-mitm/venv/bin/mitmdump \
   --mode regular \
   --listen-host 0.0.0.0 \
@@ -28,7 +33,7 @@ ExecStart=/opt/speedex-mitm/venv/bin/mitmdump \
   --set body_size_limit=2m \
   --set keep_host_header=false \
   --set block_global=false \
-  --set "allow_hosts=(?:^(.*\\.)?(gmgn\\.ai|ws\\.gmgn\\.ai|web3\\.okx\\.com|wsdexpri\\.okx\\.com|www\\.okx\\.(?:com|ac)|turnkey\\.com|padre\\.gg|binance\\.com|fomo\\.family|relay\\.link)(:\\d+)?$)|(?:^(?:okx\\.(?:bsc-rpc\\.com|(?:rpc|builder)\\.48\\.club|bsc\\.blockrazor\\.xyz|bscnetwork\\.blockrazor\\.io)|(?:frankfurt|hongkong|newyork|tokyo)2?\\.solana\\.blockrazor\\.io|rpc\\.mainnet\\.(?:arc\\.io|chain\\.robinhood\\.com))(:\\d+)?$)|(?:^(?:mainnet\\.(?:hudson|block-engine)\\.jito\\.wtf|sender\\.helius-rpc\\.com|atlas-mainnet\\.helius-rpc\\.com|cashback\\.circular\\.fi|sender\\.lamport\\.dev|(?:nozomi\\.temporal\\.xyz|(?:edge|pit1|ewr1|ash1|lax1|fra2|ams1|lon1|tyo1|sgp1|pit|ewr|ash|lax|fra|ams|lon|tyo|sgp)\\.nozomi\\.temporal\\.xyz))(:\\d+)?$)" \
+  --set "allow_hosts=(?:^(.*\\.)?(gmgn\\.ai|ws\\.gmgn\\.ai|web3\\.okx\\.com|wsdexpri\\.okx\\.com|www\\.okx\\.(?:com|ac)|turnkey\\.com|padre\\.gg|binance\\.com|fomo\\.family|relay\\.link)(:\\d+)?$)|(?:^(?:okx\\.(?:bsc-rpc\\.com|(?:rpc|builder)\\.48\\.club|bsc\\.blockrazor\\.xyz|bscnetwork\\.blockrazor\\.io)|(?:frankfurt|hongkong|newyork|tokyo)2?\\.solana\\.blockrazor\\.io|rpc\\.mainnet\\.(?:arc\\.io|chain\\.robinhood\\.com))(:\\d+)?$)|(?:^(?:mainnet\\.(?:hudson|block-engine)\\.jito\\.wtf|sender\\.helius-rpc\\.com|atlas-mainnet\\.helius-rpc\\.com|cashback\\.circular\\.fi|sender\\.lamport\\.dev|(?:nozomi\\.temporal\\.xyz|(?:edge|pit1|ewr1|ash1|lax1|fra2|ams1|lon1|tyo1|sgp1|pit|ewr|ash|lax|fra|ams|lon|tyo|sgp)\\.nozomi\\.temporal\\.xyz))(:\\d+)?$)|(?:^(?:api\\.axiom\\.trade|cluster[a-z0-9-]*\\.axiom\\.trade|greer-651y13-fast-mainnet\\.helius-rpc\\.com|(?:lax|nyc|fra|ams|ash|sgp|tyo|lon|syd|uae|chi|dal|sea|lit)\\.lunar-lander\\.hellomoon\\.io)(:\\d+)?$)" \
   -s /opt/speedex-mitm/speedex_hk_timing.py \
   --quiet
 Restart=always

@@ -256,3 +256,43 @@ test('Helius Atlas v10.30：生产 allow_hosts 只加精确 atlas-mainnet.helius
   const exp = readSource('deploy/hk-proxy/speedex-mitm-exp.service');
   assert.ok(!exp.includes('atlas-mainnet'), '实验 unit 不得加入 atlas host（OKX 透传）');
 });
+
+test('Axiom v10.33：生产/实验/overlay 只放行 api.axiom.trade、cluster*.axiom.trade 与 14 个精确 Hellomoon 区域（无第三方通配）', () => {
+  const regions = ['lax', 'nyc', 'fra', 'ams', 'ash', 'sgp', 'tyo', 'lon', 'syd', 'uae', 'chi', 'dal', 'sea', 'lit'];
+  // greer-651y13-fast-mainnet.helius-rpc.com: the Axiom page's Helius WS, exact host read from the live page 2026-11-22
+  const hosts = ['api.axiom.trade', 'cluster9.axiom.trade', 'cluster-atl1.axiom.trade', 'cluster-euc2.axiom.trade',
+    'greer-651y13-fast-mainnet.helius-rpc.com', ...regions.map((r) => `${r}.lunar-lander.hellomoon.io`)];
+  const rejected = [
+    'axiom.trade', 'www.axiom.trade', 'evil.api.axiom.trade', 'api.axiom.trade.evil.example', 'xcluster9.axiom.trade',
+    'evil.cluster9.axiom.trade', 'cluster9.axiom.trade.evil.example', 'lunar-lander.hellomoon.io', 'pit.lunar-lander.hellomoon.io',
+    'tyo.lunar-lander.hellomoon.io.evil.example', 'evil.tyo.lunar-lander.hellomoon.io', 'hellomoon.io',
+    'synthname-fast-mainnet.helius-rpc.com', 'mainnet.helius-rpc.com', 'xgreer-651y13-fast-mainnet.helius-rpc.com',
+    'evil.greer-651y13-fast-mainnet.helius-rpc.com', 'greer-651y13-fast-mainnet.helius-rpc.com.evil.example',
+  ];
+  for (const rel of ['deploy/hk-proxy/speedex-mitm.service', 'deploy/hk-proxy/speedex-mitm-exp.service']) {
+    const unit = readSource(rel);
+    const raw = unit.match(/--set "allow_hosts=([^"]+)"/)?.[1];
+    assert.ok(raw, `${rel} 缺 allow_hosts 行`);
+    for (const wild of [String.raw`.*\\.axiom`, String.raw`.*\\.hellomoon`, String.raw`.*\\.lunar-lander`, String.raw`.*\\.helius-rpc`, String.raw`|axiom\\.trade`, String.raw`|hellomoon\\.io`]) {
+      assert.ok(!raw.includes(wild), `${rel} 不得通配 ${wild}`);
+    }
+    const allow = new RegExp(raw.replace(/\\\\/g, '\\'));
+    for (const host of hosts) {
+      assert.ok(allow.test(`${host}:443`), `${rel} 未命中 ${host}:443`);
+      assert.ok(allow.test(host), `${rel} 未命中 ${host}`);
+    }
+    for (const host of rejected) assert.ok(!allow.test(`${host}:443`), `${rel} 不得命中 ${host}:443`);
+    // 既有范围不变（抽样）
+    for (const host of ['sender.helius-rpc.com', 'tyo1.nozomi.temporal.xyz', 'relay.link', 'api.turnkey.com']) {
+      assert.ok(allow.test(`${host}:443`), `${rel} 既有 host ${host} 丢失`);
+    }
+  }
+  const prod = readSource('deploy/hk-proxy/speedex-mitm.service');
+  const allowProd = new RegExp(prod.match(/--set "allow_hosts=([^"]+)"/)[1].replace(/\\\\/g, '\\'));
+  for (const host of ['gmgn.ai', 'ws.gmgn.ai', 'web3.okx.com', 'atlas-mainnet.helius-rpc.com', 'okx.bsc-rpc.com']) {
+    assert.ok(allowProd.test(`${host}:443`), `生产既有 host ${host} 丢失`);
+  }
+  const overlay = readSource('deploy/hk-proxy/selective-decrypt.overlay.example');
+  assert.ok(overlay.includes(String.raw`^(?:api\.axiom\.trade|cluster[a-z0-9-]*\.axiom\.trade|greer-651y13-fast-mainnet\.helius-rpc\.com|(?:lax|nyc|fra|ams|ash|sgp|tyo|lon|syd|uae|chi|dal|sea|lit)\.lunar-lander\.hellomoon\.io)(:\d+)?$`),
+    'overlay 缺带边界/端口的 Axiom regex');
+});

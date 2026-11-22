@@ -115,3 +115,21 @@
 # [raw] 追加部分（与原 regex 作 OR，保留端口和边界锚）：
 # ^(?:nozomi\.temporal\.xyz|(?:edge|pit1|ewr1|ash1|lax1|fra2|ams1|lon1|tyo1|sgp1|pit|ewr|ash|lax|fra|ams|lon|tyo|sgp)\.nozomi\.temporal\.xyz)(:\d+)?$
 # 不得改成后缀通配；扩围前仍须实验验收证书/ALPN、提交兼容与单核资源水位。
+
+# 2026-11-22 Axiom Solana（v10.33；生产与实验 unit 均列精确主机，Hellomoon 为 14 个精确区域名）。
+# api.axiom.trade：POST /wo/batched-send-tx-v4（text "0|0|<b64 6B>:<b64 signed tx>"）= send 锚之一。
+#   解密该主机即同时解密 Axiom 的登录/会话、报价、账户/持仓、钱包等全部 REST——请求可带 cookie/
+#   Authorization/Turnkey 相关头与用户数据。addon 只读 host/path/method/Origin，并只对该精确 POST 在内存中
+#   解析 body 推导公开签名；body、前缀、header、query、响应体一律不读入事件/日志/timeline。
+# cluster[a-z0-9-]*.axiom.trade：first-party 形（cluster9 / cluster-atl1 / cluster-euc2 实测），成功帧为
+#   room "sol-v2|user-tx:<uuid>"；uuid/时间/pair 只校验形状后丢弃。其余 room（价格/slot/公共成交）帧不解析。
+#   ⚠ 该 WS 帧量大（价格/公共成交）且不能 rawtcp 中继（成功判据同连接）——验收须看单核 CPU/RSS。
+# <region>.lunar-lander.hellomoon.io /sendBatch-cors（二进制：u16 BE 长度 + 签名交易）= send 锚之二。
+# Helius：Axiom 页 wss://<name>-fast-mainnet.helius-rpc.com/。第三方只许精确 host——此处不给通配；
+#   2026-11-22 实页读出精确 host greer-651y13-fast-mainnet.helius-rpc.com（无 query key），已列入下面这组。addon 侧按
+#   `[a-z0-9]+(-[a-z0-9]+)*-fast-mainnet.helius-rpc.com` 形分派（只对精确签名映射的 Axiom 腿记到达），
+#   未解密时 channelArrivals 如实缺失。
+# [raw] 追加部分（与原 regex 作 OR，保留端口和边界锚）：
+# ^(?:api\.axiom\.trade|cluster[a-z0-9-]*\.axiom\.trade|greer-651y13-fast-mainnet\.helius-rpc\.com|(?:lax|nyc|fra|ams|ash|sgp|tyo|lon|syd|uae|chi|dal|sea|lit)\.lunar-lander\.hellomoon\.io)(:\d+)?$
+# 不得改成 (.*\.)?axiom\.trade 或 *.hellomoon.io / *.helius-rpc.com；扩围前须实验验收证书/ALPN、登录、报价、
+# WS（cluster/Helius）与 send 提交兼容及单核资源水位。
