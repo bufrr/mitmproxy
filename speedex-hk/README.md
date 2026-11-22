@@ -235,7 +235,8 @@ round trips). New platform `axiom`, `orderRequestSource="axiom-solana-send"`; `s
 and every other platform's behaviour are unchanged (no new `RULES` entry: Axiom has its own exact dispatch).
 
 - **Send anchor (request hook)**: Origin exactly `https://axiom.trade` and one of
-  - `POST api.axiom.trade/wo/batched-send-tx-v4`, ASCII body `0|0|<base64 of 6 bytes>:<base64 signed tx>` (exactly one tx);
+  - `POST api.axiom.trade/wo/batched-send-tx-v4`, ASCII body `0|0|<opaque prefix>:<base64 signed tx>` (exactly one tx;
+    prefix per v10.34 below);
   - `POST <region>.lunar-lander.hellomoon.io/sendBatch-cors` for the 14 regions
     `lax nyc fra ams ash sgp tyo lon syd uae chi dal sea lit`, binary body = u16 big-endian length covering exactly
     the rest of the body + the raw tx.
@@ -251,13 +252,13 @@ and every other platform's behaviour are unchanged (no new `RULES` entry: Axiom 
   signature within `AXIOM_SEND_FANOUT_MS` = 1000 ms of the latest leg's first send vetoes that leg
   (`_anchorVeto`, `incomplete="axiom-send-sig-conflict"`, `hkL1aMs` null) and the conflicting signature never gets a
   leg in that run (`axiomSendSigConflict`, `axiomSendConflictSig`). Sends after 1 s with a new signature are a new trade.
-- **Success (HK-L1a′)**: a server text frame on `cluster[a-z0-9-]*.axiom.trade` (WS opened from a page shared worker)
-  `{"room":"sol-v2|user-tx:<uuid>","content":[<sig>,<iso time>,"buy"|"sell",<pair>]}` (content exactly 4 items) whose
+- **Success (HK-L1a′)**: a server frame on `cluster[a-z0-9-]*.axiom.trade` (WS opened from a page shared worker)
+  `{"room":"sol-v2|user-tx:<id>","content":[<sig>,<iso time>,"buy"|"sell",<pair>,…]}` (accepted shapes per v10.34 below) whose
   `content[0]` equals an open, non-vetoed Axiom leg's signature, at or after its send hook → `tSuccessPushMs` (frame hook
   entry, first adoption frozen), `successEvidence={version:1, platform:"axiom", channel:"axiom-user-tx-ws",
   status:"success", txHash, txDigest, matchedKeys:["txHash"], correlation:"user-tx-room+send-sig", observedAtMs,
   frameSha, side}`. Frames without `user-tx:` (public `sol-v2|t:<mint>` trades, prices, slots, blockhash, gas-prices,
-  balance-updates-user) are skipped before decode; malformed user-tx frames count `axiomUserTxInvalid`; other
+  balance-updates-user) are skipped before decode; malformed user-tx frames count `axiomUserTxInvalid.<reason>`; other
   signatures `axiomUserTxNoLeg`; diag also `axiomUserTxAdopted|Repeat|BeforeSend|LegIneligible`.
 - **Helius chain-domain arrival**: on `<name>-fast-mainnet.helius-rpc.com` the page's
   `signatureSubscribe([sig,{commitment:"processed"}])` registers reqId→sig, the `{"id":reqId,"result":subId}` reply binds
@@ -276,3 +277,29 @@ and every other platform's behaviour are unchanged (no new `RULES` entry: Axiom 
 Cross-repo: the EU consumer must register platform `axiom`, `orderRequestSource` `axiom-solana-send`, success channel
 `axiom-user-tx-ws` and the Axiom helius arrival (api `signatureNotification`; the OKX helius gate only accepts
 `transactionNotification`) in hk-timing-client / public-projector / shared-push-timing / docs/hk-proxy-timing.md.
+
+## 2026.11.22-axiom-sol-v10.34
+
+Fixes two parser rejections found in the first funded Axiom batch through LA v10.33 (1 buy + 1 sell):
+`axiomSendUnproven.axiom-api.body-shape` 2 (Hellomoon anchored and folded) and `axiomUserTxInvalid` 2 (both success frames
+seen, rejected → `hkL1aMs` null, `incomplete: no-success-observed`). Every other platform is unchanged.
+
+- **api.axiom.trade body prefix**: the live body is `0|0|<9-char prefix>:<1360-char base64 tx>`. The prefix is not base64
+  of 6 bytes and its alphabet is unknown, so it is an opaque bounded token `[^|:]{1,32}`. It is matched by shape only,
+  never decoded or kept. `0|0|` stays exact, exactly one `:` separates prefix and tx, the tx is strict base64 and must
+  pass the single-signer v1 check. Missing/over-long prefix, a second tx, non-base64 tx → `body-shape`; legacy/multi-signer
+  → `not-v1` / `not-single-signer`.
+- **user-tx frame shapes**: mitmproxy hands every message as decompressed bytes (wsproto undoes permessage-deflate inside
+  the connection; same code in mitmproxy 11.0.2 and 12.3.0), and the opcode stays visible. Accepted: one JSON message, a
+  JSON array of messages or newline-delimited JSON (at most 32 items/lines each). In a batch only items whose `room` holds
+  `user-tx:` are evaluated; the first valid one wins, and two different valid signatures → `axiomUserTxAmbiguousBatch` with
+  nothing adopted. `content` needs ≥ 4 items; the first four are checked and trailing items are ignored. The room id is
+  any 8–64 `[0-9a-fA-F-]` (same as the EU consumer). Strictness is unchanged for the signature (base58 shape here, exact
+  leg-signature match downstream), the side (`buy|sell`) and the `sol-v2|user-tx:` room class. Public `sol-v2|t:` frames
+  never count.
+- **Reason-coded rejects**: `axiomUserTxInvalid.<reason>`, reason from the fixed set `AXIOM_USER_TX_INVALID_REASONS` =
+  `binary` (BINARY opcode, not UTF-8 JSON), `not-json`, `batch-size`, `top-type-str|num|bool|null`, `room`, `content-type`,
+  `content-len-0..3`, `sig`, `at`, `side`, `pair`. There is no un-suffixed `axiomUserTxInvalid` counter any more. A batch with no
+  valid item reports the first user-tx item's reason (`room` if none). No values are recorded.
+
+EU consumer: `axiomAddonSupported` (`web/shared-push-timing.mjs`) accepts `-v10.34`; no consumer change.

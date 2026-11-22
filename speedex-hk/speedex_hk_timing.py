@@ -98,7 +98,8 @@ fomo.md + tests/classify-ws.test.mjs 等夹具——改规则同步改本注释�
   Axiom   (v10.33) order anchor = first proven send of a tx (Origin https://axiom.trade): POST
           api.axiom.trade /wo/batched-send-tx-v4 or <region>.lunar-lander.hellomoon.io /sendBatch-cors;
           signature derived in memory from the single-signer Solana v1 tx (trailing 64 bytes). Success =
-          cluster*.axiom.trade WS room sol-v2|user-tx:<uuid>, content[0] == the leg's signature.
+          cluster*.axiom.trade WS room sol-v2|user-tx:<id>, content[0] == the leg's signature
+          (v10.34: opaque api body prefix; JSON-array/NDJSON user-tx batches; reason-coded rejects).
 
 成功判定统一锚纪律：成功状态/hash/id 必须与「请求/响应建立的
 独立锚」（leg._anchor：响应抽取 id、binance 请求体 clientOrderId、fomo 页面出站
@@ -347,7 +348,13 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # it. Success = cluster*.axiom.trade room sol-v2|user-tx:<uuid> with content[0] == the leg's signature;
 # Helius "<name>-fast-mainnet" signatureNotification (err null) = channelArrivals helius. Receipt poll from
 # the send. Bodies/headers/query/user ids never kept. Other platforms unchanged.
-ADDON_VERSION = "2026.11.22-axiom-sol-v10.33"
+# v10.34 (2026-11-22, LA funded batch through v10.33: every api send body-shape, both user-tx frames invalid):
+# the api.axiom.trade body prefix is an opaque bounded token ([^|:]{1,32}, not decoded/kept; tx still strict
+# base64 + single-signer v1). user-tx frames: also a JSON array or NDJSON batch (≤32; first valid user-tx item;
+# two different valid signatures → axiomUserTxAmbiguousBatch, none adopted), content ≥ 4 (first four checked),
+# room id 8-64 [0-9a-fA-F-]; rejects count axiomUserTxInvalid.<reason> (fixed set, no values; BINARY opcode
+# frames that are not UTF-8 JSON → .binary). Sig/side/user-tx room class strictness unchanged.
+ADDON_VERSION = "2026.11.22-axiom-sol-v10.34"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -826,15 +833,17 @@ def _helius_server_frame(flow, payload):
 # ── v10.33 Axiom (axiom.trade, Solana) ───────────────────────────────────────
 # Product facts (2026-11-22, 5 funded round trips): on the buy/sell click the page (Origin https://axiom.trade)
 # POSTs the same signed v1 transaction to
-#   - api.axiom.trade /wo/batched-send-tx-v4, text body "0|0|<base64 of 6 bytes>:<base64 signed tx>", and
+#   - api.axiom.trade /wo/batched-send-tx-v4, text body "0|0|<opaque prefix>:<base64 signed tx>" (v10.34: the
+#     prefix is a 9-char token of unknown alphabet live; matched as [^|:]{1,32}, never decoded/kept), and
 #   - 14 Hellomoon regions <r>.lunar-lander.hellomoon.io /sendBatch-cors, binary body = u16 big-endian length
 #     + the same raw tx bytes.
 # The tx is Solana v1 (first byte 0x81) with ONE required signature, serialized after the message, i.e. the
 # last 64 bytes. Only that shape is derived (full v1 layout check + nSig == 1 + trailing 64 bytes); anything
 # else is no anchor. The body is read in memory only: signed bytes, prefixes, headers and query are never
 # kept — only the public base58 signature leaves the parser (same rule as the OKX Solana / FOMO sends).
-# Success = a cluster*.axiom.trade WS text frame of room "sol-v2|user-tx:<user uuid>" whose content[0] is the
-# leg's signature; the user uuid, iso time and pair address are never kept. Public rooms (sol-v2|t:<mint>,
+# Success = a cluster*.axiom.trade WS text frame of room "sol-v2|user-tx:<user id>" whose content[0] is the
+# leg's signature (v10.34: also inside a JSON array / NDJSON batch, content ≥ 4 items, id 8-64 [0-9a-fA-F-]);
+# the user id, iso time and pair address are never kept. Public rooms (sol-v2|t:<mint>,
 # prices, slots, …) never count. Helius (wss://<name>-fast-mainnet.helius-rpc.com/) signatureSubscribe →
 # mapped signatureNotification with value.err null = chain-domain arrival (channel "helius"), never success.
 AXIOM_PLATFORM = "axiom"
@@ -859,8 +868,18 @@ AXIOM_SEND_FANOUT_MS = 1000.0
 AXIOM_SUCCESS_CHANNEL = "axiom-user-tx-ws"
 AXIOM_USER_TX_ROOM_PREFIX = "sol-v2|user-tx:"
 AXIOM_SEND_BODY_MAX = 2 + _SOL_TX_V1_MAX_BYTES
-_AXIOM_API_BODY_RE = re.compile(r"0\|0\|([A-Za-z0-9+/]{8}):([A-Za-z0-9+/]+={0,2})")
-_AXIOM_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+# v10.34: live bodies carry a 9-char prefix of unknown alphabet (not base64 of 6 bytes) → the prefix is an
+# opaque bounded token (no '|' / ':'), matched only, never decoded or kept; exactly one ':' then one strict
+# base64 tx. The only capture group is the tx.
+_AXIOM_API_BODY_RE = re.compile(r"0\|0\|[^|:]{1,32}:([A-Za-z0-9+/]+={0,2})")
+# Room id tolerance = the EU consumer's /^sol-v2\|(user-tx|balance-updates-user):[0-9a-fA-F-]{8,64}$/.
+_AXIOM_ROOM_ID_RE = re.compile(r"[0-9a-fA-F-]{8,64}")
+AXIOM_USER_TX_BATCH_MAX = 32
+AXIOM_USER_TX_INVALID_REASONS = (
+    "binary", "not-json", "batch-size", "top-type-str", "top-type-num", "top-type-bool", "top-type-null",
+    "room", "content-type", "content-len-0", "content-len-1", "content-len-2", "content-len-3",
+    "sig", "at", "side", "pair",
+)
 _AXIOM_HELIUS_SUBS_KEY = "speedex_axiom_helius_subs"
 AXIOM_SEND_UNPROVEN_REASONS = ("origin", "size", "body-shape", "not-v1", "not-single-signer", "v1-layout")
 
@@ -894,7 +913,7 @@ def _axiom_v1_single_sig(raw):
 def _axiom_send_sig(transport, headers, body):
     """In-memory parse of one Axiom send request body (bytes) → (sig | None, reason | None).
 
-    Origin must be exactly https://axiom.trade. axiom-api: ASCII "0|0|<b64 6 bytes>:<b64 tx>" (one tx);
+    Origin must be exactly https://axiom.trade. axiom-api: ASCII "0|0|<opaque token>:<b64 tx>" (one tx);
     hellomoon: u16 big-endian length that covers exactly the rest of the body (one tx). Fail closed."""
     try:
         origin = headers.get("origin")
@@ -912,11 +931,9 @@ def _axiom_send_sig(transport, headers, body):
         if not m:
             return None, "body-shape"
         try:
-            prefix = base64.b64decode(m.group(1), validate=True)
-            raw = base64.b64decode(m.group(2), validate=True)
+            # The prefix is an opaque token: matched by shape only, never decoded or retained.
+            raw = base64.b64decode(m.group(1), validate=True)
         except Exception:
-            return None, "body-shape"
-        if len(prefix) != 6:
             return None, "body-shape"
     elif transport == "hellomoon":
         if len(body) > AXIOM_SEND_BODY_MAX:
@@ -945,41 +962,109 @@ def _request_bytes(req):
         return b""
 
 
-def _axiom_user_tx_frame(payload):
+def _axiom_user_tx_item(obj):
+    """One decoded message → (None, sig, side) or (reason, None, None); reason ∈ AXIOM_USER_TX_INVALID_REASONS.
+
+    {"room":"sol-v2|user-tx:<id 8-64 [0-9a-fA-F-]>","content":[sig, iso time, "buy"|"sell", pair, …]}: the
+    first four content items are checked, trailing items ignored. The id, time and pair are shapes only."""
+    if not isinstance(obj, dict):
+        if isinstance(obj, bool):
+            return "top-type-bool", None, None
+        if isinstance(obj, (int, float)):
+            return "top-type-num", None, None
+        if isinstance(obj, str):
+            return "top-type-str", None, None
+        return "top-type-null", None, None
+    room = obj.get("room")
+    if (
+        not isinstance(room, str)
+        or not room.startswith(AXIOM_USER_TX_ROOM_PREFIX)
+        or not _AXIOM_ROOM_ID_RE.fullmatch(room[len(AXIOM_USER_TX_ROOM_PREFIX):])
+    ):
+        return "room", None, None
+    content = obj.get("content")
+    if not isinstance(content, list):
+        return "content-type", None, None
+    if len(content) < 4:
+        return f"content-len-{len(content)}", None, None
+    sig, at, side, pair = content[:4]
+    if not isinstance(sig, str) or _SOL_SIG_RE.fullmatch(sig) is None:
+        return "sig", None, None
+    if not isinstance(at, str):
+        return "at", None, None
+    if side not in ("buy", "sell"):
+        return "side", None, None
+    if not isinstance(pair, str):
+        return "pair", None, None
+    return None, sig, side
+
+
+def _axiom_user_tx_frame(payload, is_text=True):
     """cluster*.axiom.trade server frame → (diag key | None, sig | None, side | None).
 
-    Only {"room":"sol-v2|user-tx:<uuid>","content":[sig, iso time, "buy"|"sell", pair]} counts; every other
-    room (public trades sol-v2|t:<mint>, prices, slots, blockhash, gas-prices, balance-updates-user) is
-    skipped before any JSON decode. The uuid, time and pair are validated as shapes and dropped."""
+    Frames without "user-tx:" (public trades sol-v2|t:<mint>, prices, slots, blockhash, gas-prices,
+    balance-updates-user) are skipped before any decode. The rest is decoded in memory as one JSON message, a
+    JSON array of messages or newline-delimited JSON (≤ AXIOM_USER_TX_BATCH_MAX each); in a batch only items
+    whose room is a user-tx room are considered, the first valid one wins and two different valid signatures
+    adopt none (axiomUserTxAmbiguousBatch). Rejections count axiomUserTxInvalid.<reason> (fixed reason set,
+    never a value). mitmproxy hands decompressed bytes (permessage-deflate is undone by wsproto); a BINARY
+    opcode frame that is not UTF-8 JSON is axiomUserTxInvalid.binary."""
     needle = b"user-tx:" if isinstance(payload, (bytes, bytearray)) else "user-tx:"
     try:
         if needle not in payload:
             return None, None, None
     except TypeError:
         return None, None, None
-    obj = _j(payload)
-    if not isinstance(obj, dict):
-        return "axiomUserTxInvalid", None, None
-    room = obj.get("room")
-    if (
-        not isinstance(room, str)
-        or not room.startswith(AXIOM_USER_TX_ROOM_PREFIX)
-        or not _AXIOM_UUID_RE.fullmatch(room[len(AXIOM_USER_TX_ROOM_PREFIX):])
-    ):
-        return "axiomUserTxInvalid", None, None
-    content = obj.get("content")
-    if not isinstance(content, list) or len(content) != 4:
-        return "axiomUserTxInvalid", None, None
-    sig, at, side, pair = content
-    if (
-        not isinstance(sig, str)
-        or _SOL_SIG_RE.fullmatch(sig) is None
-        or not isinstance(at, str)
-        or side not in ("buy", "sell")
-        or not isinstance(pair, str)
-    ):
-        return "axiomUserTxInvalid", None, None
-    return "axiomUserTx", sig, side
+
+    def invalid(reason):
+        return "axiomUserTxInvalid." + reason, None, None
+
+    if isinstance(payload, (bytes, bytearray)):
+        try:
+            text = bytes(payload).decode("utf-8")
+        except UnicodeDecodeError:
+            return invalid("not-json" if is_text else "binary")
+    else:
+        text = payload
+    batch = None
+    try:
+        obj = json.loads(text)
+    except Exception:
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        if len(lines) < 2:
+            return invalid("not-json" if is_text else "binary")
+        if len(lines) > AXIOM_USER_TX_BATCH_MAX:
+            return invalid("batch-size")
+        batch = []
+        for ln in lines:
+            try:
+                batch.append(json.loads(ln))
+            except Exception:
+                return invalid("not-json" if is_text else "binary")
+    if batch is None:
+        if not isinstance(obj, list):
+            reason, sig, side = _axiom_user_tx_item(obj)
+            return (invalid(reason) if reason else ("axiomUserTx", sig, side))
+        if len(obj) > AXIOM_USER_TX_BATCH_MAX:
+            return invalid("batch-size")
+        batch = obj
+    first_reason = None
+    found = None
+    for item in batch:
+        room = item.get("room") if isinstance(item, dict) else None
+        if not isinstance(room, str) or "user-tx:" not in room:
+            continue  # other rooms / non-message items in a batch are not user-tx evidence
+        reason, sig, side = _axiom_user_tx_item(item)
+        if reason:
+            first_reason = first_reason or reason
+            continue
+        if found is None:
+            found = (sig, side)
+        elif found[0] != sig:
+            return "axiomUserTxAmbiguousBatch", None, None
+    if found is not None:
+        return "axiomUserTx", found[0], found[1]
+    return invalid(first_reason or "room")
 
 
 def _axiom_helius_subs(flow):
@@ -7531,7 +7616,11 @@ class SpeedexHkTiming:
             # v10.33: Axiom user-tx room → platform success of the leg with that exact send signature.
             # Client frames and every other room are ignored (prefilter before decode); nothing is retained.
             if not msg.from_client:
-                key, sig, side = _axiom_user_tx_frame(msg.content)
+                try:
+                    is_text = bool(getattr(msg, "is_text", True))
+                except Exception:
+                    is_text = True
+                key, sig, side = _axiom_user_tx_frame(msg.content, is_text)
                 if key:
                     STORE.note_frame_diag(key)
                 if sig:

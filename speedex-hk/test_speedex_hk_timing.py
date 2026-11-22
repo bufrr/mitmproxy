@@ -7046,7 +7046,7 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.11.22-axiom-sol-v10.33")
+        self.assertEqual(A.ADDON_VERSION, "2026.11.22-axiom-sol-v10.34")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 
@@ -11440,7 +11440,7 @@ class TestGmgnTradeHashV1032(unittest.TestCase):
             self.assertNotIn(self.WALLET, dumped, name)
             self.assertNotIn("122142992", dumped, name)
         self.assertEqual(surfaces["health"]["diag"].get("gmgnTradeHashArrivals"), 1)
-        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.22-axiom-sol-v10.33")
+        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.22-axiom-sol-v10.34")
 
 
 class TestAxiomSolana(unittest.TestCase):
@@ -11450,7 +11450,7 @@ class TestAxiomSolana(unittest.TestCase):
     the public mainnet v1 vector; prefixes, user ids, pair addresses and keys are synthetic."""
 
     VEC = json.loads(Path(__file__).with_name("tests").joinpath("fixtures", "sol-tx-v1-vectors.json").read_text())
-    PREFIX = __import__("base64").b64encode(b"\x00\x07\x11\x22\x33\x44").decode()  # synthetic 6-byte prefix
+    PREFIX = "k7Q-x_Z2p"  # synthetic opaque 9-char prefix (live length; alphabet unknown, deliberately not base64)
     USER = "5e1f0c2a-9b3d-4e7f-8a6b-0c1d2e3f4a5b"  # synthetic user uuid
     PAIR = "PairSynthetic" + "7" * 31
     HELIUS_HOST = "synthname-fast-mainnet.helius-rpc.com"
@@ -11563,8 +11563,7 @@ class TestAxiomSolana(unittest.TestCase):
             ("axiom-api", {"origin": "https://axiom.trade.evil.example"}, self.api_body(raw).encode(), "origin"),
             ("axiom-api", h, self.api_body(raw).replace("0|0|", "1|0|", 1).encode(), "body-shape"),
             ("axiom-api", h, self.api_body(raw).replace("0|0|", "", 1).encode(), "body-shape"),
-            ("axiom-api", h, ("0|0|" + base64.b64encode(b"\x00" * 7).decode() + ":"
-                              + base64.b64encode(raw).decode()).encode(), "body-shape"),
+            ("axiom-api", h, ("0|0|" + "p" * 33 + ":" + base64.b64encode(raw).decode()).encode(), "body-shape"),
             ("axiom-api", h, (self.api_body(raw) + "," + self.PREFIX + ":" + base64.b64encode(raw).decode()).encode(),
              "body-shape"),
             ("axiom-api", h, self.api_body(raw)[:-3].encode() + b"!!!", "body-shape"),
@@ -11787,7 +11786,7 @@ class TestAxiomSolana(unittest.TestCase):
             dict(sig=sig, room="balance-updates-user"),
             dict(sig=sig, side="swap"),
             dict(sig=sig, content=[sig, "2026-11-22T10:00:00Z", "buy"]),
-            dict(sig=sig, content=[sig, "2026-11-22T10:00:00Z", "buy", self.PAIR, "extra"]),
+            dict(sig=sig, content=[sig, 1795000000, "buy", self.PAIR, "extra"]),
             dict(sig=sig, content={"0": sig}),
             dict(sig=sig, from_client=True),
             dict(sig=sig, host="cluster9.axiom.trade.evil.example"),
@@ -11804,7 +11803,9 @@ class TestAxiomSolana(unittest.TestCase):
             A.addons[0].websocket_message(f)
         self.assertIsNone(leg["tSuccessPushMs"])
         self.assertEqual(A.STORE.diag["axiomUserTxNoLeg"], 1, "only the other-signature user-tx frame routes")
-        self.assertGreaterEqual(A.STORE.diag["axiomUserTxInvalid"], 7)
+        self.assertEqual({k: v for k, v in A.STORE.diag.items() if k.startswith("axiomUserTxInvalid")}, {
+            "axiomUserTxInvalid.room": 3, "axiomUserTxInvalid.side": 1, "axiomUserTxInvalid.content-len-3": 1,
+            "axiomUserTxInvalid.at": 1, "axiomUserTxInvalid.content-type": 2, "axiomUserTxInvalid.not-json": 1})
         # A frame observed before the send hook (stale/replay) is not adopted.
         self.clock = leg["tOrderOutMs"] - 1
         self.cluster(sig)
@@ -11931,8 +11932,187 @@ class TestAxiomSolana(unittest.TestCase):
             for s in secrets:
                 self.assertNotIn(s, dumped, (name, s[:24]))
         self.assertIn(sig, json.dumps(surfaces["timelineFull"]), "the public signature is the anchor")
-        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.22-axiom-sol-v10.33")
+        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.22-axiom-sol-v10.34")
         self.assertEqual(surfaces["health"]["diag"].get("axiomUserTxAdopted"), 1)
+
+    # ── v10.34: opaque api body prefix ──
+    def test_api_body_opaque_prefix(self):
+        import base64
+        raw = base64.b64decode(self.VEC["mainnet"]["b64"])
+        sig = self.VEC["mainnet"]["sig"]
+        tx = base64.b64encode(raw).decode()
+        h = {"origin": "https://axiom.trade"}
+        for prefix in (self.PREFIX, "AbCd1234", "x", "p" * 32, "1795.358/6+"):
+            with self.subTest(prefix=len(prefix)):
+                self.assertEqual(A._axiom_send_sig("axiom-api", h, f"0|0|{prefix}:{tx}".encode()), (sig, None))
+        two_sig = base64.b64encode(base64.b64decode(self.VEC["synthetic"]["twoSig"]["b64"])).decode()
+        legacy = base64.b64encode(bytes([1]) + b"\x41" * 64 + b"\x41" * 40).decode()
+        for name, body, reason in [
+            ("missing prefix", f"0|0|:{tx}", "body-shape"),
+            ("no separator", f"0|0|{tx}", "body-shape"),
+            ("prefix over 32", f"0|0|{'p' * 33}:{tx}", "body-shape"),
+            ("prefix with pipe", f"0|0|a|b:{tx}", "body-shape"),
+            ("two txs colon", f"0|0|{self.PREFIX}:{tx}:{tx}", "body-shape"),
+            ("two txs pipe", f"0|0|{self.PREFIX}:{tx}|{self.PREFIX}:{tx}", "body-shape"),
+            ("two txs comma", f"0|0|{self.PREFIX}:{tx},{self.PREFIX}:{tx}", "body-shape"),
+            ("non-base64 tx", f"0|0|{self.PREFIX}:{tx[:-4]}!!!!", "body-shape"),
+            ("bad padding", f"0|0|{self.PREFIX}:{tx}A", "body-shape"),
+            ("trailing newline", f"0|0|{self.PREFIX}:{tx}\n", "body-shape"),
+            ("other markers", f"0|1|{self.PREFIX}:{tx}", "body-shape"),
+            ("non-ascii prefix", f"0|0|préfix:{tx}", "body-shape"),
+            ("legacy tx", f"0|0|{self.PREFIX}:{legacy}", "not-v1"),
+            ("multi-signer tx", f"0|0|{self.PREFIX}:{two_sig}", "not-single-signer"),
+        ]:
+            with self.subTest(name):
+                self.assertEqual(A._axiom_send_sig("axiom-api", h, body.encode("utf-8")), (None, reason))
+        # End to end: a live-length 9-char prefix anchors a leg; nothing of it is kept anywhere.
+        raw2, sig2 = self.tx()
+        f = self.send("axiom-api", raw2)
+        legs = self.axiom_legs()
+        self.assertEqual([x["_axiomSig"] for x in legs], [sig2])
+        self.assertEqual(A.STORE.diag["axiomSendLeg"], 1)
+        self.assertFalse([k for k in A.STORE.diag if k.startswith("axiomSendUnproven")])
+        dumped = json.dumps([A.STORE.timeline(self.run, full=True), dict(A.STORE.events), dict(A.STORE.diag),
+                             legs, f.metadata], default=str)
+        self.assertNotIn(self.PREFIX, dumped)
+
+    # ── v10.34: user-tx reasons and transport shapes ──
+    def ws_frame(self, payload, is_text=True, host="cluster9.axiom.trade"):
+        msg = FakeWSMsg(payload)
+        msg.is_text = is_text
+        f = FakeFlow(host, "/", "GET")
+        f.websocket = types.SimpleNamespace(messages=[msg])
+        A.addons[0].websocket_message(f)
+
+    def frame_obj(self, sig, side="buy", room=None, content=None):
+        return {"room": room or ("sol-v2|user-tx:" + self.USER), "seq": "D5B__g0AAg",
+                "content": content if content is not None else [sig, "2026-11-22T06:29:38.913Z", side, self.PAIR]}
+
+    def test_user_tx_invalid_reasons(self):
+        _, sig = self.tx()
+        room = "sol-v2|user-tx:" + self.USER
+        ok = self.frame_obj(sig)
+        self.assertEqual(A._axiom_user_tx_frame(json.dumps(ok).encode()), ("axiomUserTx", sig, "buy"))
+        self.assertEqual(A._axiom_user_tx_frame(json.dumps(ok)), ("axiomUserTx", sig, "buy"))
+        cases = [
+            ("not-json", b"42[\"user-tx:\"," + b"{}]", True),
+            ("not-json", b"\xff\xfeuser-tx:", True),
+            ("binary", b"\x82\xa4room\xb3sol-v2|user-tx:" + self.USER.encode(), False),
+            ("top-type-str", json.dumps("sol-v2|user-tx:" + self.USER), True),
+            ("room", json.dumps({"room": "sol-v2|t:Mint|user-tx:" + self.USER, "content": ok["content"]}), True),
+            ("room", json.dumps({"room": "sol-v2|user-tx:" + "z" * 12, "content": ok["content"]}), True),
+            ("room", json.dumps({"room": "sol-v2|user-tx:" + "a" * 7, "content": ok["content"]}), True),
+            ("room", json.dumps({"room": "sol-v2|user-tx:" + "a" * 65, "content": ok["content"]}), True),
+            ("room", json.dumps({"rooms": room, "content": ok["content"]}), True),
+            ("content-type", json.dumps({"room": room, "content": {"0": sig}}), True),
+            ("content-type", json.dumps({"room": room}), True),
+            ("content-len-0", json.dumps({"room": room, "content": []}), True),
+            ("content-len-3", json.dumps({"room": room, "content": ok["content"][:3]}), True),
+            ("sig", json.dumps({"room": room, "content": ["0x" + "ab" * 32] + ok["content"][1:]}), True),
+            ("sig", json.dumps({"room": room, "content": [None] + ok["content"][1:]}), True),
+            ("at", json.dumps({"room": room, "content": [sig, None, "buy", self.PAIR]}), True),
+            ("side", json.dumps({"room": room, "content": [sig, "t", "swap", self.PAIR]}), True),
+            ("side", json.dumps({"room": room, "content": [sig, "t", "BUY", self.PAIR]}), True),
+            ("pair", json.dumps({"room": room, "content": [sig, "t", "sell", 42]}), True),
+            ("batch-size", json.dumps([ok] * 33), True),
+            ("batch-size", "\n".join([json.dumps(ok)] * 33), True),
+        ]
+        for reason, payload, is_text in cases:
+            with self.subTest(reason=reason, n=len(payload)):
+                self.assertIn(reason, A.AXIOM_USER_TX_INVALID_REASONS)
+                self.assertEqual(A._axiom_user_tx_frame(payload, is_text),
+                                 ("axiomUserTxInvalid." + reason, None, None))
+        # A scalar JSON number/bool/null cannot contain "user-tx:" (prefiltered), so those reasons are
+        # checked on the item helper directly.
+        self.assertEqual(A._axiom_user_tx_item(7)[0], "top-type-num")
+        self.assertEqual(A._axiom_user_tx_item(True)[0], "top-type-bool")
+        self.assertEqual(A._axiom_user_tx_item(None)[0], "top-type-null")
+        self.assertEqual(A._axiom_user_tx_item("x")[0], "top-type-str")
+        # Frames without "user-tx:" are skipped before decode (public trades, balances).
+        for payload in (json.dumps({"room": "sol-v2|t:Mint", "content": ok["content"]}),
+                        json.dumps({"room": "sol-v2|balance-updates-user:" + self.USER, "content": [1]}),
+                        b"\x00\x01binary", "not json"):
+            self.assertEqual(A._axiom_user_tx_frame(payload, False), (None, None, None))
+
+    def test_user_tx_tolerated_shapes(self):
+        _, sig = self.tx()
+        _, other = self.tx(0x63)
+        ok = self.frame_obj(sig, "sell")
+        pub = {"room": "sol-v2|t:Mint" + "8" * 31, "content": [other, "t", "buy", self.PAIR]}
+        expect = ("axiomUserTx", sig, "sell")
+        for name, payload, is_text in [
+            ("live single object as bytes", json.dumps(ok, separators=(",", ":")).encode(), True),
+            ("binary opcode carrying json", json.dumps(ok).encode(), False),
+            ("array", json.dumps([ok]), True),
+            ("array with public item first", json.dumps([pub, 5, "x", ok]), True),
+            ("array same sig twice", json.dumps([ok, ok]), True),
+            ("array invalid user-tx item then valid", json.dumps([self.frame_obj(sig, "swap"), ok]), True),
+            ("array of 32", json.dumps([pub] * 31 + [ok]), True),
+            ("ndjson", json.dumps(pub) + "\n" + json.dumps(ok) + "\n", True),
+            ("ndjson crlf", (json.dumps(ok) + "\r\n" + json.dumps(pub)).encode(), True),
+            ("content extra items", json.dumps(self.frame_obj(sig, "sell", content=[
+                sig, "2026-11-22T06:29:38.913Z", "sell", self.PAIR, {"x": 1}, 9])), True),
+            ("room id 8 chars", json.dumps(self.frame_obj(sig, "sell", room="sol-v2|user-tx:abcdef12")), True),
+            ("room id 64 chars", json.dumps(self.frame_obj(sig, "sell", room="sol-v2|user-tx:" + "A-" * 32)), True),
+            ("room id no dashes", json.dumps(self.frame_obj(sig, "sell",
+                                                            room="sol-v2|user-tx:" + self.USER.replace("-", ""))),
+             True),
+        ]:
+            with self.subTest(name):
+                self.assertEqual(A._axiom_user_tx_frame(payload, is_text), expect)
+        amb = A._axiom_user_tx_frame(json.dumps([ok, self.frame_obj(other)]))
+        self.assertEqual(amb, ("axiomUserTxAmbiguousBatch", None, None))
+        amb = A._axiom_user_tx_frame(json.dumps(self.frame_obj(other)) + "\n" + json.dumps(ok))
+        self.assertEqual(amb, ("axiomUserTxAmbiguousBatch", None, None))
+        # a batch whose only user-tx-looking item is malformed → that item's reason
+        self.assertEqual(A._axiom_user_tx_frame(json.dumps([pub, self.frame_obj(sig, room="sol-v2|user-tx:x")])),
+                         ("axiomUserTxInvalid.room", None, None))
+        # NDJSON with one non-JSON line is not decoded at all
+        self.assertEqual(A._axiom_user_tx_frame(json.dumps(ok) + "\nping"),
+                         ("axiomUserTxInvalid.not-json", None, None))
+        # public rooms never count, even inside a batch and even when they carry the leg's signature
+        self.assertEqual(A._axiom_user_tx_frame(json.dumps([{"room": "sol-v2|t:Mint", "content": ok["content"]},
+                                                            {"room": "user-tx:" + self.USER,
+                                                             "content": ok["content"]}])),
+                         ("axiomUserTxInvalid.room", None, None))
+
+    def test_user_tx_batches_end_to_end(self):
+        raw, sig = self.tx()
+        _, other = self.tx(0x63)
+        self.send("axiom-api", raw)
+        leg = self.axiom_legs()[0]
+        self.clock += 200
+        # ambiguous batch: two different user-tx signatures (one is the leg's) → nothing adopted
+        self.ws_frame(json.dumps([self.frame_obj(sig), self.frame_obj(other)]).encode())
+        self.assertIsNone(leg["tSuccessPushMs"])
+        self.assertEqual(A.STORE.diag["axiomUserTxAmbiguousBatch"], 1)
+        self.assertEqual(A.STORE.run_diag[self.run]["axiomUserTxAmbiguousBatch"], 1)
+        # non-JSON binary frame → reason binary, nothing adopted
+        self.ws_frame(b"\x93\xa5room\xb0sol-v2|user-tx:" + bytes(range(0x80, 0x90)), is_text=False)
+        self.assertIsNone(leg["tSuccessPushMs"])
+        self.assertEqual(A.STORE.diag["axiomUserTxInvalid.binary"], 1)
+        # public sol-v2|t: frame with the leg's signature never counts
+        self.ws_frame(json.dumps({"room": "sol-v2|t:Mint", "content": [sig, "t", "buy", self.PAIR]}).encode())
+        self.assertIsNone(leg["tSuccessPushMs"])
+        # live shape inside a JSON array with a public item → adopted at this frame's hook entry
+        self.clock += 150
+        self.ws_frame(json.dumps([{"room": "sol-v2|t:Mint", "content": []}, self.frame_obj(sig)],
+                                 separators=(",", ":")).encode())
+        self.assertEqual(leg["tSuccessPushMs"], self.clock)
+        self.assertEqual(leg["successEvidence"]["side"], "buy")
+        self.assertEqual(A.STORE.diag["axiomUserTxAdopted"], 1)
+        frozen = self.clock
+        self.clock += 50
+        self.ws_frame("\n".join([json.dumps(self.frame_obj(sig))] * 2))
+        self.assertEqual(leg["tSuccessPushMs"], frozen)
+        self.assertEqual(A.STORE.diag["axiomUserTxRepeat"], 1)
+        A.STORE.mark_close(self.run)
+        dumped = json.dumps([A.STORE.timeline(self.run, full=True), dict(A.STORE.diag),
+                             {k: dict(v) for k, v in A.STORE.run_diag.items()}, A.STORE.legs[self.run]], default=str)
+        for secret in (self.USER, self.PAIR, "D5B__g0AAg", "2026-11-22T06:29:38.913Z"):
+            self.assertNotIn(secret, dumped)
+        self.assertFalse([k for k in A.STORE.diag if k.startswith("axiomUserTxInvalid.")
+                          and k[len("axiomUserTxInvalid."):] not in A.AXIOM_USER_TX_INVALID_REASONS])
 
     # ── other platforms unaffected ──
     def test_existing_platforms_unaffected(self):
