@@ -7046,7 +7046,7 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.11.23-axiom-evm-v10.36")
+        self.assertEqual(A.ADDON_VERSION, "2026.11.23-axiom-evm-v10.37")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 
@@ -11440,7 +11440,7 @@ class TestGmgnTradeHashV1032(unittest.TestCase):
             self.assertNotIn(self.WALLET, dumped, name)
             self.assertNotIn("122142992", dumped, name)
         self.assertEqual(surfaces["health"]["diag"].get("gmgnTradeHashArrivals"), 1)
-        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.23-axiom-evm-v10.36")
+        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.23-axiom-evm-v10.37")
 
 
 class TestAxiomSolana(unittest.TestCase):
@@ -11932,7 +11932,7 @@ class TestAxiomSolana(unittest.TestCase):
             for s in secrets:
                 self.assertNotIn(s, dumped, (name, s[:24]))
         self.assertIn(sig, json.dumps(surfaces["timelineFull"]), "the public signature is the anchor")
-        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.23-axiom-evm-v10.36")
+        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.23-axiom-evm-v10.37")
         self.assertEqual(surfaces["health"]["diag"].get("axiomUserTxAdopted"), 1)
 
     # ── v10.34: opaque api body prefix ──
@@ -12511,6 +12511,73 @@ class TestAxiomEvm(unittest.TestCase):
                           leg2["_axiomEvmSend"]["fanout"]), (h2, t_seq, "rh-sequencer", 2))
         self.assertEqual(A.STORE.timeline(self.run)["counts"]["attempted"], 2)
 
+    def test_one_post_swap_and_approve_both_get_first_response(self):
+        """v10.37: one POST carrying swap + approve → every leg it opened gets the response-hook time."""
+        self.open([{"platform": "axiom", "chain": "bsc", "rounds": 1}])
+        swap, h_swap = _evm_type2_tx(56, 4, _SWAP_DATA)
+        appr, h_appr = _evm_type2_tx(56, 5, _APPROVE_DATA)
+        f = self.post("axiom-bnb-api", [appr, swap], respond=False)
+        a, s = self.legs()
+        self.assertEqual((a["txHash"], a["anchorRole"], s["txHash"], s["anchorRole"]),
+                         (h_appr, "approve", h_swap, "order"))
+        self.assertIs(f.metadata["speedex_leg"][0], a, "speedex_leg stays the first leg")
+        self.assertEqual([x for x, _ in f.metadata["speedex_axiom_evm_legs"]], [a, s])
+        self.assertEqual((a["tFirstRespMs"], s["tFirstRespMs"]), (None, None))
+        self.clock += 40
+        t_resp = self.clock
+        A.addons[0].response(f)
+        self.assertEqual((a["tFirstRespMs"], s["tFirstRespMs"]), (t_resp, t_resp))
+        ack = [e for e in A.STORE.events[self.run] if e["kind"] == "axiom_send_ack"]
+        self.assertEqual([(e["transport"], e["t"]) for e in ack], [("axiom-bnb-api", t_resp)], "one ack per flow")
+        # a repeated response hook never moves the frozen first observation
+        self.clock += 5
+        A.addons[0].response(f)
+        self.assertEqual((a["tFirstRespMs"], s["tFirstRespMs"]), (t_resp, t_resp))
+        rows = self.rows()
+        self.assertEqual([r["tFirstRespMs"] for r in rows], [t_resp, t_resp])
+
+    def test_same_hash_twice_in_one_post_is_one_leg_entry(self):
+        self.open([{"platform": "axiom", "chain": "bsc", "rounds": 1}])
+        swap, _ = _evm_type2_tx(56, 4, _SWAP_DATA)
+        f = self.post("axiom-bnb-api", [swap, swap])
+        (leg,) = self.legs()
+        self.assertEqual(f.metadata["speedex_axiom_evm_legs"], [(leg, self.run)])
+        self.assertEqual((leg["_axiomEvmSend"]["fanout"], leg["tFirstRespMs"]), (2, self.clock))
+
+    def test_sequencer_fold_does_not_overwrite_first_response(self):
+        self.open([{"platform": "axiom", "chain": "robinhood", "rounds": 1}])
+        swap, _ = _evm_type2_tx(4663, 20, _SWAP_DATA)
+        appr, _ = _evm_type2_tx(4663, 19, _APPROVE_DATA)
+        f_api = self.post("axiom-rh-api", [appr, swap], respond=False)
+        self.clock += 2
+        f_seq = self.post("rh-sequencer", [swap], respond=False)
+        a, s = self.legs()
+        self.assertEqual(s["_axiomEvmSend"]["fanout"], 2)
+        self.assertEqual([x for x, _ in f_seq.metadata["speedex_axiom_evm_legs"]], [s])
+        # sequencer response lands first: it is the first response observed for the swap only
+        self.clock += 10
+        t_seq = self.clock
+        A.addons[0].response(f_seq)
+        self.assertEqual((a["tFirstRespMs"], s["tFirstRespMs"]), (None, t_seq))
+        self.clock += 30
+        t_api = self.clock
+        A.addons[0].response(f_api)
+        self.assertEqual((a["tFirstRespMs"], s["tFirstRespMs"]), (t_api, t_seq), "fold never overwrites")
+        # a later sequencer fold of the swap after both responses changes nothing
+        self.clock += 50
+        self.post("rh-sequencer", [swap])
+        self.assertEqual((a["tFirstRespMs"], s["tFirstRespMs"], s["_axiomEvmSend"]["fanout"]), (t_api, t_seq, 3))
+
+    def test_response_after_window_close_sets_nothing(self):
+        self.open([{"platform": "axiom", "chain": "bsc", "rounds": 1}])
+        swap, _ = _evm_type2_tx(56, 4, _SWAP_DATA)
+        appr, _ = _evm_type2_tx(56, 5, _APPROVE_DATA)
+        f = self.post("axiom-bnb-api", [swap, appr], respond=False)
+        A.STORE.mark_close(self.run)
+        self.clock += 10
+        A.addons[0].response(f)
+        self.assertEqual([x["tFirstRespMs"] for x in self.legs()], [None, None])
+
     def test_chain_not_authorized_by_batch_not_adopted(self):
         self.open([{"platform": "axiom", "chain": "bsc", "rounds": 1}, {"platform": "okx", "chain": "robinhood", "rounds": 1}])
         rh, _ = _evm_type2_tx(4663, 1, _SWAP_DATA)
@@ -12600,6 +12667,9 @@ class TestAxiomEvm(unittest.TestCase):
                          ("solana", "axiom-solana-send", sig, t_sol))
         self.assertFalse(sol_leg.get("_anchorVeto"))
         self.assertNotIn("_axiomEvmSend", sol_leg)
+        self.assertNotIn("speedex_axiom_evm_legs", f.metadata, "Solana keeps the single-leg metadata shape")
+        self.assertEqual(f.metadata["speedex_leg"], (sol_leg, self.run))
+        self.assertEqual(sol_leg["tFirstRespMs"], t_sol)
         self.assertEqual(self.polls, [sig], "Solana receipt poll as before; none for EVM")
         self.assertEqual((evm_leg["chain"], evm_leg["txHash"]), ("bsc", h))
         self.clock += 300

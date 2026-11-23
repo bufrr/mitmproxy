@@ -104,6 +104,7 @@ fomo.md + tests/classify-ws.test.mjs 等夹具——改规则同步改本注释�
           (v10.36) EVM BSC/Robinhood: order-out legs only (orderRequestSource axiom-evm-send) from
           api.axiom.trade /wo/batched-(bnb|rh)-send-tx and the RH sequencer eth_sendRawTransaction; tx
           identity (chainId, keccak256(raw)) decoded in memory; no EVM success channel → no HK-L1a′.
+          (v10.37) every leg of a multi-tx POST gets that flow's tFirstRespMs.
 
 成功判定统一锚纪律：成功状态/hash/id 必须与「请求/响应建立的
 独立锚」（leg._anchor：响应抽取 id、binance 请求体 clientOrderId、fomo 页面出站
@@ -369,7 +370,11 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # (chainId, hash), first observation wins, same-hash fanout folds (fanout count), approve txs are their own
 # "approve" legs (no slot), chains the manifest did not authorize are counted, not adopted. No EVM success
 # push exists → no success adoption, no HK-L1a′, no receipt poll. Solana Axiom unchanged.
-ADDON_VERSION = "2026.11.23-axiom-evm-v10.36"
+# v10.37 (2026-11-23, review finding): an Axiom EVM POST carrying several txs (swap + approve) keeps every
+# distinct leg it opened or folded into (flow.metadata "speedex_axiom_evm_legs"); the response hook sets
+# tFirstRespMs on each from the same hook timestamp (first observation, open window only). Body still unread.
+# Every other path (incl. Axiom Solana) keeps the single speedex_leg reference, unchanged.
+ADDON_VERSION = "2026.11.23-axiom-evm-v10.37"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -7541,7 +7546,7 @@ class SpeedexHkTiming:
         if status != "ok":
             STORE.note_axiom_evm_send_unproven(window, transport, reason, t_obs)
             return
-        first = None
+        legs = []  # v10.37: every distinct leg this POST opened or folded into (frame order)
         for facts in txs:
             ev = {
                 "t": t_obs,
@@ -7558,10 +7563,11 @@ class SpeedexHkTiming:
                 "transport": transport,
             }
             rid, leg, _verdict = STORE.axiom_evm_send_in_open_window(window, ev, facts, transport)
-            if leg is not None and first is None:
-                first = (leg, rid)
-        if first is not None:
-            flow.metadata["speedex_leg"] = first
+            if leg is not None and not any(x is leg for x, _ in legs):
+                legs.append((leg, rid))
+        if legs:
+            flow.metadata["speedex_leg"] = legs[0]
+            flow.metadata["speedex_axiom_evm_legs"] = legs
             flow.metadata["speedex_axiom_send"] = {"transport": transport}
 
     def response(self, flow):
@@ -7672,9 +7678,13 @@ class SpeedexHkTiming:
         if not meta:
             return
         leg, rid = meta
+        # v10.37: an Axiom EVM POST may carry several txs (swap + approve) → every distinct leg it opened or
+        # folded into gets this response time under the same first-observation rule. Other paths: one leg.
+        resp_legs = flow.metadata.get("speedex_axiom_evm_legs") or (meta,)
         with STORE.lock:
-            if not leg.get("windowClosed") and leg.get("tFirstRespMs") is None:
-                leg["tFirstRespMs"] = t_obs
+            for x, _ in resp_legs:
+                if not x.get("windowClosed") and x.get("tFirstRespMs") is None:
+                    x["tFirstRespMs"] = t_obs
         axiom_send = flow.metadata.get("speedex_axiom_send")
         if axiom_send:
             # v10.33: status/transport only; the response body is never read.

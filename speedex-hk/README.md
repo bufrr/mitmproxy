@@ -362,3 +362,21 @@ EU consumer: must run with v10.36 — accept `-v10.36` in `axiomAddonSupported` 
 `evidence.axiomEvmSend` and the diag keys `axiomEvmSendLeg|ApproveLeg|Fold|ChainUnauthorized`, `axiomEvmSequencerOther`,
 `axiomEvmSendUnproven.<transport>.<reason>` in hk-timing-client / public-projector / shared-push-timing /
 docs/hk-proxy-timing.md. Axiom EVM legs supply no push/L1a value.
+
+## 2026.11.23-axiom-evm-v10.37
+
+Review fix for multi-tx Axiom EVM POSTs. In v10.36, the response hook set `tFirstRespMs` only on the first leg of a
+`txs[]` POST, so a swap + approve sent in one POST left the second leg's `tFirstRespMs` null.
+
+- `_handle_axiom_evm_send` keeps every distinct leg the POST opened or folded into, in tx order, in
+  `flow.metadata["speedex_axiom_evm_legs"]`. A hash repeated in the same POST counts once. `speedex_leg` is still the
+  first leg.
+- The response hook sets `tFirstRespMs` on each of those legs from the same hook timestamp, with the existing rule:
+  open window only, first observation frozen. A later fold of the same hash (api ↔ RH sequencer fanout) never
+  overwrites it; whichever response for that leg arrives first wins. One `axiom_send_ack` per flow as before;
+  the response body is still never read.
+- Every other path (other platforms, Axiom Solana) sets no list and keeps the single `speedex_leg` reference,
+  unchanged.
+
+EU consumer: `axiomAddonSupported` (`web/shared-push-timing.mjs`) accepts `-v10.37` (≥ v10.33); no shape change, no
+consumer change.
