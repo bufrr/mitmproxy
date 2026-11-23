@@ -296,3 +296,29 @@ test('Axiom v10.33：生产/实验/overlay 只放行 api.axiom.trade、cluster*.
   assert.ok(overlay.includes(String.raw`^(?:api\.axiom\.trade|cluster[a-z0-9-]*\.axiom\.trade|greer-651y13-fast-mainnet\.helius-rpc\.com|(?:lax|nyc|fra|ams|ash|sgp|tyo|lon|syd|uae|chi|dal|sea|lit)\.lunar-lander\.hellomoon\.io)(:\d+)?$`),
     'overlay 缺带边界/端口的 Axiom regex');
 });
+
+test('Axiom EVM v10.36：生产/实验/overlay 放行精确 sequencer.mainnet.chain.robinhood.com（无 chain.robinhood.com 通配），api.axiom.trade 仍在', () => {
+  const host = 'sequencer.mainnet.chain.robinhood.com';
+  const rejected = [
+    'evil.sequencer.mainnet.chain.robinhood.com', 'sequencer.mainnet.chain.robinhood.com.evil.example',
+    'xsequencer.mainnet.chain.robinhood.com', 'sequencer.testnet.chain.robinhood.com', 'chain.robinhood.com',
+    'mainnet.chain.robinhood.com', 'sequencer.mainnet.chain.robinhood.com:443x',
+  ];
+  for (const rel of ['deploy/hk-proxy/speedex-mitm.service', 'deploy/hk-proxy/speedex-mitm-exp.service']) {
+    const unit = readSource(rel);
+    const raw = unit.match(/--set "allow_hosts=([^"]+)"/)?.[1];
+    assert.ok(raw, `${rel} 缺 allow_hosts 行`);
+    assert.ok(raw.includes(String.raw`sequencer\\.mainnet\\.chain\\.robinhood\\.com`), `${rel} 缺精确 sequencer host`);
+    assert.ok(!raw.includes(String.raw`.*\\.chain\\.robinhood`), `${rel} 不得通配 chain.robinhood.com`);
+    const allow = new RegExp(raw.replace(/\\\\/g, '\\'));
+    for (const h of [host, `${host}:443`, 'api.axiom.trade:443']) assert.ok(allow.test(h), `${rel} 未命中 ${h}`);
+    for (const h of rejected) assert.ok(!allow.test(h.includes(':') ? h : `${h}:443`), `${rel} 不得命中 ${h}`);
+  }
+  // 实验 unit 不镜像生产的 OKX RH RPC（透传）；sequencer 只服务 Axiom 页
+  const exp = readSource('deploy/hk-proxy/speedex-mitm-exp.service');
+  const expAllow = new RegExp(exp.match(/--set "allow_hosts=([^"]+)"/)[1].replace(/\\\\/g, '\\'));
+  assert.ok(!expAllow.test('rpc.mainnet.chain.robinhood.com:443'), '实验 unit 不得放行 OKX 的 RH RPC');
+  const overlay = readSource('deploy/hk-proxy/selective-decrypt.overlay.example');
+  assert.ok(overlay.includes(String.raw`^(?:sequencer\.mainnet\.chain\.robinhood\.com)(:\d+)?$`),
+    'overlay 缺带边界/端口的 Axiom EVM sequencer regex');
+});

@@ -11,7 +11,7 @@ speedex 主仓只保留消费侧 `scripts/lib/hk-timing-client.mjs` 等与部署
 | --- | --- |
 | `speedex_hk_timing.py` | mitmproxy addon：下单/成功信号锚关联 + 链 receipt 轮询 + 控制面（`/mark` `/mark/close` `/timeline/<rid>` `/health` `/egress` `/latency`） |
 | `test_speedex_hk_timing.py` | addon 离线测试（合成 flow/frame 夹具）：`python3 test_speedex_hk_timing.py` |
-| `tests/` | 安装/单元行为测试（Node 22，`node --test tests/*.test.mjs`，15 项） |
+| `tests/` | 安装/单元行为测试（Node 22，`node --test tests/*.test.mjs`，21 项） |
 | `install.sh` | 幂等安装/受控重启（用法见文件头；实验实例 `SPEEDEX_HK_INSTANCE=experiment`） |
 | `gen-htpasswd.sh` | 代理认证 htpasswd 生成（{SHA}，凭据不进 argv） |
 | `speedex-mitm.service` | 生产 unit（0.0.0.0:8443 + 控制面 8072） |
@@ -319,3 +319,46 @@ Review fix for user-tx batches (v10.34 kept only the first valid entry). Every o
 - Timing unchanged: `tSuccessPushMs` is the proxy observation time of the frame for every entry it carries.
 
 EU consumer: `axiomAddonSupported` (`web/shared-push-timing.mjs`) accepts `-v10.35` (≥ v10.33); no consumer change.
+
+## 2026.11.23-axiom-evm-v10.36
+
+Axiom EVM (BSC + Robinhood) order-out legs (live captures 2026-11-23). New `orderRequestSource="axiom-evm-send"` on platform
+`axiom`. **EVM has order-out legs only**: Axiom has no hash-carrying platform success push on EVM (the client-socket room
+`<bnb-v2|rh-v2>|balance-updates-user:<uuid>` carries no tx hash), so there is no success adoption, no HK-L1a′ and no
+receipt poll for these legs. Axiom Solana (`axiom-solana-send`, user-tx success, Helius arrival) is byte-identical.
+
+- **Sends (request hook, Origin exactly `https://axiom.trade`)**: `POST api.axiom.trade/wo/batched-bnb-send-tx`
+  (transport `axiom-bnb-api`) and `/wo/batched-rh-send-tx` (`axiom-rh-api`), JSON object whose `txs` is a list of 1–4 raw
+  signed txs (other keys are not read); `POST sequencer.mainnet.chain.robinhood.com/` (`rh-sequencer`), one JSON-RPC 2.0
+  `eth_sendRawTransaction` with `params == [raw]` (the page's fanout of the same RH tx ~2 ms after the api POST). Other
+  sequencer JSON-RPC methods are not sends: counted `axiomEvmSequencerOther` only.
+- **Decode (in memory only)**: each raw tx must be an EIP-1559 type-2 tx that decodes exactly (12 fields, canonical
+  scalars, `to` 0/20 bytes, yParity 0/1, r/s non-zero). Kept: `txHash = keccak256(raw)`, `chainId` (56 → `bsc`,
+  4663 → `robinhood`, read from the signed tx only), `nonce`, and `call` = `approve` iff the signed calldata selector is
+  `0x095ea7b3`, else `other`. Raw bytes, bodies, headers, query, r/s and calldata are never kept. The route is only a
+  cross-check: a chainId that disagrees with the endpoint (bnb ↔ 56, rh/sequencer ↔ 4663) rejects the body.
+- **Rejects**: any undecodable body/tx rejects the whole POST (no partial batch) and counts
+  `axiomEvmSendUnproven.<transport>.<reason>`, transport ∈ `axiom-bnb-api|axiom-rh-api|rh-sequencer`, reason from the fixed set
+  `AXIOM_EVM_UNPROVEN_REASONS` = `origin|size|body-shape|tx-hex|tx-type|tx-rlp|tx-sig|chain-id|route-chain`. No values.
+- **Legs** keyed by `(chainId, txHash)` within the run. The first observation of a tx opens the leg (`tOrderOutMs`, wall
+  time and chain-head snapshot frozen at that request hook; chain from the decoded tx). Every later send of the same hash
+  (api + sequencer, any order, any time in the window) folds into it (`axiomEvmSendFold`, `fanout` += 1, per-transport
+  counts). Different hashes are separate legs and never fold or veto each other (a new-token buy = swap leg + approve
+  leg ~8 ms apart).
+- **Roles / slots**: a swap (`call:"other"`) is `anchorRole:"order"` and binds its axiom×chain manifest slot; an approve
+  (`call:"approve"`) is `anchorRole:"approve"` — its own leg, never a slot, not counted in `attempted`. Diag
+  `axiomEvmSendLeg` / `axiomEvmSendApproveLeg`.
+- **Chain authorization**: with a detail manifest, a tx whose chain has no axiom (or platform-less) spec gets no leg and
+  counts `axiomEvmSendChainUnauthorized`. Without a detail manifest there is nothing to check (same as other platforms).
+- **Timeline**: `evidence.axiomEvmSend={chainId, nonce, call, firstTransport, transports:{<transport>: n}, fanout}`;
+  `txHash` = the decoded hash; at window close `incomplete="no-success-observed"`, `hkL1aMs`/`hkL3Ms` null. The response
+  hook records only `axiom_send_ack` (transport/status), never the response body.
+- **Decrypt scope**: production and experiment units add exactly `sequencer\.mainnet\.chain\.robinhood\.com` (overlay
+  section 2026-11-23). `api.axiom.trade` was already intercepted for Solana (v10.33) and covers both EVM send paths.
+  The experiment unit still does not intercept OKX's `rpc.mainnet.chain.robinhood.com`.
+
+EU consumer: must run with v10.36 — accept `-v10.36` in `axiomAddonSupported` (`web/shared-push-timing.mjs`), register
+`orderRequestSource` `axiom-evm-send`, `anchorRole` `approve` (excluded from attempted/metrics like other non-order roles),
+`evidence.axiomEvmSend` and the diag keys `axiomEvmSendLeg|ApproveLeg|Fold|ChainUnauthorized`, `axiomEvmSequencerOther`,
+`axiomEvmSendUnproven.<transport>.<reason>` in hk-timing-client / public-projector / shared-push-timing /
+docs/hk-proxy-timing.md. Axiom EVM legs supply no push/L1a value.

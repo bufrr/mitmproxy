@@ -133,3 +133,13 @@
 # ^(?:api\.axiom\.trade|cluster[a-z0-9-]*\.axiom\.trade|greer-651y13-fast-mainnet\.helius-rpc\.com|(?:lax|nyc|fra|ams|ash|sgp|tyo|lon|syd|uae|chi|dal|sea|lit)\.lunar-lander\.hellomoon\.io)(:\d+)?$
 # 不得改成 (.*\.)?axiom\.trade 或 *.hellomoon.io / *.helius-rpc.com；扩围前须实验验收证书/ALPN、登录、报价、
 # WS（cluster/Helius）与 send 提交兼容及单核资源水位。
+
+# 2026-11-23 Axiom EVM（v10.36；生产与实验 unit 均列精确主机）。
+# api.axiom.trade 已在 2026-11-22 段：POST /wo/batched-bnb-send-tx（BSC）与 /wo/batched-rh-send-tx（Robinhood），
+#   JSON {txs:[0x 签名 type-2 tx]}，addon 只在内存解码 hash=keccak256(raw)、chainId（56/4663，取自签名 tx）、nonce。
+# sequencer.mainnet.chain.robinhood.com：Axiom 页把同一 RH 签名 tx 以 JSON-RPC eth_sendRawTransaction 再发一次（扇出，
+#   ~2 ms 后）。解密该主机即解密所有经此代理发往 RH sequencer 的请求；addon 只对 Origin https://axiom.trade 的
+#   eth_sendRawTransaction 解码，其它方法只计数，raw/body/header/响应体不读入事件/日志/timeline。
+# [raw] 追加部分（与原 regex 作 OR，保留端口和边界锚）：
+# ^(?:sequencer\.mainnet\.chain\.robinhood\.com)(:\d+)?$
+# 不得改成 (.*\.)?chain\.robinhood\.com；扩围前须实验验收证书/ALPN 与 RH send 提交兼容。

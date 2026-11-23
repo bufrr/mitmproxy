@@ -101,6 +101,9 @@ fomo.md + tests/classify-ws.test.mjs 等夹具——改规则同步改本注释�
           cluster*.axiom.trade WS room sol-v2|user-tx:<id>, content[0] == the leg's signature
           (v10.34: opaque api body prefix; JSON-array/NDJSON user-tx batches; reason-coded rejects;
           v10.35: every batch entry tried by exact signature, same sig with both sides not adopted).
+          (v10.36) EVM BSC/Robinhood: order-out legs only (orderRequestSource axiom-evm-send) from
+          api.axiom.trade /wo/batched-(bnb|rh)-send-tx and the RH sequencer eth_sendRawTransaction; tx
+          identity (chainId, keccak256(raw)) decoded in memory; no EVM success channel → no HK-L1a′.
 
 成功判定统一锚纪律：成功状态/hash/id 必须与「请求/响应建立的
 独立锚」（leg._anchor：响应抽取 id、binance 请求体 clientOrderId、fomo 页面出站
@@ -359,7 +362,14 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # each matched against the send legs by exact signature (all observe_axiom_user_tx gates per entry), so a frame
 # carrying the previous round's sell and this round's buy no longer loses the buy; axiomUserTxAmbiguousBatch is
 # gone. One signature with both sides in a frame → not adopted, axiomUserTxAmbiguousSide. Timing unchanged.
-ADDON_VERSION = "2026.11.23-axiom-sol-v10.35"
+# v10.36 (2026-11-23): Axiom EVM (BSC + Robinhood) order-out legs, orderRequestSource "axiom-evm-send". Sends =
+# api.axiom.trade /wo/batched-bnb-send-tx | /wo/batched-rh-send-tx (JSON txs[]) and the Robinhood sequencer
+# eth_sendRawTransaction (sequencer.mainnet.chain.robinhood.com, added to allow_hosts). Each raw type-2 tx is
+# decoded in memory (hash = keccak256(raw), chainId 56/4663 from the signed tx, nonce); legs keyed by
+# (chainId, hash), first observation wins, same-hash fanout folds (fanout count), approve txs are their own
+# "approve" legs (no slot), chains the manifest did not authorize are counted, not adopted. No EVM success
+# push exists → no success adoption, no HK-L1a′, no receipt poll. Solana Axiom unchanged.
+ADDON_VERSION = "2026.11.23-axiom-evm-v10.36"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -1140,6 +1150,135 @@ def _axiom_helius_server_frame(flow, payload):
     if value.get("err") is not None:
         return "axiomHeliusNotifyErr", None
     return "axiomHeliusNotify", sig
+
+
+# ── v10.36 Axiom EVM (BSC + Robinhood) order-out sends ───────────────────────
+# Product facts (live captures 2026-11-23): the page (Origin https://axiom.trade) POSTs
+#   - api.axiom.trade /wo/batched-bnb-send-tx  JSON {txs:[<0x raw signed type-2 tx>], antiMevRpc, sherwood, allAnswers, v}
+#   - api.axiom.trade /wo/batched-rh-send-tx   JSON {txs:[…], sherwood, v}
+# and, on Robinhood, the SAME raw tx ~2 ms later as JSON-RPC eth_sendRawTransaction to
+# sequencer.mainnet.chain.robinhood.com (fanout of one tx). A buy on a new token sends the swap, then an
+# approve (selector 0x095ea7b3), each in its own POST ~8 ms apart: separate txs (nonce/hash) = separate legs,
+# only the same hash folds. txHash = keccak256(raw); chainId (56 bsc / 4663 robinhood) comes only from the
+# decoded signed tx (the route is a cross-check, never the source). There is no hash-carrying platform success
+# push on EVM (client-socket room <bnb-v2|rh-v2>|balance-updates-user:<uuid> has no hash) → order-out legs
+# only: no success adoption, no HK-L1a′, no receipt poll. Raw bytes, bodies, headers, r/s are never kept:
+# only hash, chainId, nonce and the approve/other class of the signed calldata leave the parser.
+AXIOM_EVM_SEND_SOURCE = "axiom-evm-send"
+AXIOM_EVM_API_ROUTES = {"/wo/batched-bnb-send-tx": "axiom-bnb-api", "/wo/batched-rh-send-tx": "axiom-rh-api"}
+AXIOM_RH_SEQUENCER_HOST = "sequencer.mainnet.chain.robinhood.com"
+AXIOM_EVM_TRANSPORT_CHAIN_ID = {"axiom-bnb-api": 56, "axiom-rh-api": 4663, "rh-sequencer": 4663}
+AXIOM_EVM_CHAIN_IDS = {56: "bsc", 4663: "robinhood"}
+AXIOM_EVM_BODY_MAX = 262144
+AXIOM_EVM_TXS_MAX = 4
+_AXIOM_EVM_RAW_RE = re.compile(r"0x(?:[0-9a-fA-F]{2}){16,131000}")
+AXIOM_EVM_UNPROVEN_REASONS = (
+    "origin", "size", "body-shape", "tx-hex", "tx-type", "tx-rlp", "tx-sig", "chain-id", "route-chain",
+)
+
+
+def _axiom_evm_send_route(host, path, method):
+    """Exact host + POST + path → transport ("axiom-bnb-api" | "axiom-rh-api" | "rh-sequencer") or None."""
+    if method != "POST":
+        return None
+    if host == AXIOM_API_HOST:
+        return AXIOM_EVM_API_ROUTES.get(path)
+    if host == AXIOM_RH_SEQUENCER_HOST and path == "/":
+        return "rh-sequencer"
+    return None
+
+
+def _rlp_uint(b):
+    """Canonical RLP scalar (bytes, no leading zero) → int; None if not canonical."""
+    if not isinstance(b, bytes) or len(b) > 32 or (b and b[0] == 0):
+        return None
+    return int.from_bytes(b, "big")
+
+
+def _axiom_evm_tx_facts(raw_hex):
+    """0x-hex signed EIP-1559 (type-2) tx → ({hash, chainId, chain, nonce, call}, None) or (None, reason).
+
+    In memory only. Fields [chainId, nonce, maxPriorityFee, maxFee, gas, to, value, data, accessList, yParity,
+    r, s] must decode exactly (no trailing bytes, canonical scalars, to 0/20 bytes, yParity 0/1, r/s 1-32
+    bytes and non-zero). chainId must be 56 or 4663. call = "approve" iff the signed calldata selector is
+    0x095ea7b3, else "other". r/s/calldata/raw are dropped here; the hash is keccak256(raw)."""
+    if not isinstance(raw_hex, str) or not _AXIOM_EVM_RAW_RE.fullmatch(raw_hex):
+        return None, "tx-hex"
+    raw = bytes.fromhex(raw_hex[2:])
+    if raw[0] != 0x02:
+        return None, "tx-type"
+    try:
+        fields, end = _rlp_decode(raw, 1)
+    except (ValueError, IndexError):
+        return None, "tx-rlp"
+    if end != len(raw) or not isinstance(fields, list) or len(fields) != 12:
+        return None, "tx-rlp"
+    chain_id, nonce, _tip, _fee, _gas, to, _value, data, access, y, r, s = fields
+    scalars = [_rlp_uint(v) for v in (chain_id, nonce, _tip, _fee, _gas, _value)]
+    if (
+        any(v is None for v in scalars)
+        or not isinstance(to, bytes) or len(to) not in (0, 20)
+        or not isinstance(data, bytes) or not isinstance(access, list)
+    ):
+        return None, "tx-rlp"
+    if y not in (b"", b"\x01") or any(
+        not isinstance(v, bytes) or not 1 <= len(v) <= 32 or v[0] == 0 for v in (r, s)
+    ):
+        return None, "tx-sig"
+    cid = scalars[0]
+    if cid not in AXIOM_EVM_CHAIN_IDS:
+        return None, "chain-id"
+    return {
+        "hash": "0x" + _keccak256(raw).hex(),
+        "chainId": cid,
+        "chain": AXIOM_EVM_CHAIN_IDS[cid],
+        "nonce": scalars[1],
+        "call": "approve" if data[:4].hex() == _ERC20_APPROVE_SELECTOR[2:] else "other",
+    }, None
+
+
+def _axiom_evm_send_txs(transport, headers, body):
+    """In-memory parse of one Axiom EVM send request → (status, [facts…], reason).
+
+    status "ok" (every tx decoded; reason None), "unproven" (fixed reason, nothing derived) or "ignore"
+    (a sequencer JSON-RPC call that is not eth_sendRawTransaction — not a send). Origin must be exactly
+    https://axiom.trade. api: JSON object whose "txs" is a list of 1..AXIOM_EVM_TXS_MAX raw txs (other keys
+    are not read); sequencer: one JSON-RPC 2.0 object, method eth_sendRawTransaction, params == [raw].
+    Any tx that does not decode, or whose chainId disagrees with the route, rejects the whole body."""
+    try:
+        origin = headers.get("origin")
+    except Exception:
+        origin = None
+    if not isinstance(body, (bytes, bytearray)) or not 2 <= len(body) <= AXIOM_EVM_BODY_MAX:
+        return ("unproven", [], "origin" if origin != AXIOM_ORIGIN else "size")
+    try:
+        obj = json.loads(bytes(body).decode("utf-8"))
+    except Exception:
+        obj = None
+    if transport == "rh-sequencer":
+        if isinstance(obj, dict) and obj.get("method") != "eth_sendRawTransaction":
+            return ("ignore", [], None)
+    if origin != AXIOM_ORIGIN:
+        return ("unproven", [], "origin")
+    if transport == "rh-sequencer":
+        params = obj.get("params") if isinstance(obj, dict) else None
+        if not isinstance(obj, dict) or obj.get("jsonrpc") != "2.0" or not isinstance(params, list) or len(params) != 1:
+            return ("unproven", [], "body-shape")
+        raws = params
+    else:
+        txs = obj.get("txs") if isinstance(obj, dict) else None
+        if not isinstance(txs, list) or not 1 <= len(txs) <= AXIOM_EVM_TXS_MAX:
+            return ("unproven", [], "body-shape")
+        raws = txs
+    out = []
+    for raw in raws:
+        facts, reason = _axiom_evm_tx_facts(raw)
+        if facts is None:
+            return ("unproven", [], reason)
+        if facts["chainId"] != AXIOM_EVM_TRANSPORT_CHAIN_ID[transport]:
+            return ("unproven", [], "route-chain")
+        out.append(facts)
+    return ("ok", out, None)
 
 
 def _j(payload):
@@ -5530,6 +5669,82 @@ class Store:
             })
             return leg
 
+    # ── v10.36 Axiom EVM ──────────────────────────────────────────────────────
+    def note_axiom_evm_send_unproven(self, window, transport, reason, t_obs):
+        """An Axiom EVM send on an exact host/path whose Origin/body/tx is not the proven shape: counted only
+        (axiomEvmSendUnproven.<transport>.<reason>; no leg, no event, no value)."""
+        label = reason if reason in AXIOM_EVM_UNPROVEN_REASONS else "body-shape"
+        with self.lock:
+            rid = self._axiom_window_locked(window, t_obs)
+            self._axiom_diag_locked(rid, f"axiomEvmSendUnproven.{transport}.{label}")
+
+    def note_axiom_evm_sequencer_other(self, window, t_obs):
+        with self.lock:
+            self._axiom_diag_locked(self._axiom_window_locked(window, t_obs), "axiomEvmSequencerOther")
+
+    def _axiom_evm_chain_authorized_locked(self, rid, chain):
+        """No detail manifest → no chain authorization to check (same as every other platform). With one, an
+        axiom (or platform-less) spec must name this chain."""
+        detail = (self.marks.get(rid) or {}).get("manifestLegs")
+        if not detail:
+            return True
+        return any(
+            (not spec.get("platform") or spec["platform"] == AXIOM_PLATFORM)
+            and (not spec.get("chain") or str(spec["chain"]) == chain)
+            for spec in detail
+        )
+
+    def axiom_evm_send_in_open_window(self, window, ev, facts, transport):
+        """v10.36: one decoded Axiom EVM send tx → (rid, leg | None, verdict).
+
+        Legs are keyed by (chainId, hash) within the run. verdict: "new" = first observation of this tx opened a
+        leg (anchor = this request hook; chain from the signed tx; swap → anchorRole "order" bound to its
+        axiom×chain slot, approve → anchorRole "approve", never a slot); "fold" = same (chainId, hash) as an
+        existing leg (api + sequencer fanout, any time in the window) → counted per transport, fanout += 1;
+        "unauthorized" = a detail manifest without an axiom spec for this chain → counted, no leg;
+        "no-window" / "overflow" → nothing. Different hashes never fold or veto each other."""
+        with self.lock:
+            rid = self._axiom_window_locked(window, ev["t"])
+            if rid is None:
+                self.diag["orderReqNoWindow"] += 1
+                return None, None, "no-window"
+            t = ev["t"]
+            key = (facts["chainId"], facts["hash"])
+            same = next((
+                x for x in self.legs[rid]
+                if x.get("platform") == AXIOM_PLATFORM and x.get("_axiomEvmKey") == key
+            ), None)
+            if same is not None:
+                st = same["_axiomEvmSend"]
+                st["transports"][transport] = st["transports"].get(transport, 0) + 1
+                st["fanout"] += 1
+                self._axiom_diag_locked(rid, "axiomEvmSendFold")
+                self._add_event_locked(rid, {
+                    "t": t, "tw": ev["tw"], "kind": "axiom_evm_send_req", "platform": AXIOM_PLATFORM,
+                    "host": ev["host"], "transport": transport, "flowId": ev["flowId"],
+                })
+                return rid, same, "fold"
+            if not self._axiom_evm_chain_authorized_locked(rid, facts["chain"]):
+                self._axiom_diag_locked(rid, "axiomEvmSendChainUnauthorized")
+                return rid, None, "unauthorized"
+            if len(self.legs[rid]) >= MAX_LEGS_PER_RUN:
+                self.overflow[rid]["legs"] += 1
+                return None, None, "overflow"
+            ev = dict(ev, anchorRole="approve" if facts["call"] == "approve" else "order")
+            self._add_event_locked(rid, ev)
+            leg = self._new_leg_locked(rid, AXIOM_PLATFORM, facts["chain"], ev)
+            if leg is None:
+                return None, None, "overflow"
+            leg["_axiomEvmKey"] = key
+            leg["_anchor"]["txHash"] = facts["hash"]
+            leg["txHash"] = facts["hash"]
+            leg["_axiomEvmSend"] = {
+                "chainId": facts["chainId"], "nonce": facts["nonce"], "call": facts["call"],
+                "firstTransport": transport, "transports": {transport: 1}, "fanout": 1,
+            }
+            self._axiom_diag_locked(rid, "axiomEvmSendLeg" if facts["call"] != "approve" else "axiomEvmSendApproveLeg")
+            return rid, leg, "new"
+
     def route_ws_frame(self, platform, ids, defer_nomatch=False):
         """入站 WS 帧按**锚身份**路由到目标腿——候选是
         所有开窗 run 内该平台未冻结的腿（不只平台最新腿：最新腿是 dup/后一轮时
@@ -6151,6 +6366,16 @@ class Store:
                             "transports": dict(x["_axiomSend"].get("transports") or {}),
                             "conflict": bool(x["_axiomSend"].get("conflict")),
                         }} if x.get("_axiomSend") else {}),
+                        # v10.36: Axiom EVM send — chain/nonce from the decoded signed tx, call class, fanout
+                        # counts (no raw tx, body, header or signature)
+                        **({"axiomEvmSend": {
+                            "chainId": x["_axiomEvmSend"]["chainId"],
+                            "nonce": x["_axiomEvmSend"]["nonce"],
+                            "call": x["_axiomEvmSend"]["call"],
+                            "firstTransport": x["_axiomEvmSend"]["firstTransport"],
+                            "transports": dict(x["_axiomEvmSend"]["transports"]),
+                            "fanout": x["_axiomEvmSend"]["fanout"],
+                        }} if x.get("_axiomEvmSend") else {}),
                     },
                     "incomplete": incomplete,
                     "atWall": at_wall,
@@ -7138,6 +7363,11 @@ class SpeedexHkTiming:
                 STORE.note_frame_diag("fomoProviderStatusPoll")
             return
 
+        axiom_evm_transport = _axiom_evm_send_route(host, path, method)
+        if axiom_evm_transport:
+            self._handle_axiom_evm_send(flow, window, axiom_evm_transport, host, path, t_obs, t_wall, t_wall_ms)
+            return
+
         axiom_transport = _axiom_send_route(host, path, method)
         if axiom_transport:
             self._handle_axiom_send(flow, window, axiom_transport, host, path, t_obs, t_wall, t_wall_ms)
@@ -7295,6 +7525,44 @@ class SpeedexHkTiming:
                     args=(rid, leg, leg.get("chain"), h, _jsonrpc),
                     daemon=True,
                 ).start()
+
+    @staticmethod
+    def _handle_axiom_evm_send(flow, window, transport, host, path, t_obs, t_wall, t_wall_ms):
+        """v10.36 Axiom EVM send (exact host + POST + path already matched). Head snapshot frozen at hook entry;
+        the body is decoded in memory for hash/chainId/nonce/call class only (raw, r/s, headers dropped).
+        Order-out only: no success channel exists on EVM, so no receipt poll is started."""
+        head_snapshots = HEADS.snapshot(window[0], t_obs)
+        body = _request_bytes(flow.request)
+        status, txs, reason = _axiom_evm_send_txs(transport, getattr(flow.request, "headers", {}), body)
+        body = None
+        if status == "ignore":
+            STORE.note_axiom_evm_sequencer_other(window, t_obs)
+            return
+        if status != "ok":
+            STORE.note_axiom_evm_send_unproven(window, transport, reason, t_obs)
+            return
+        first = None
+        for facts in txs:
+            ev = {
+                "t": t_obs,
+                "tw": t_wall,
+                "twms": t_wall_ms,
+                "kind": "order_req",
+                "platform": AXIOM_PLATFORM,
+                "host": host,
+                "path": path,
+                "flowId": flow.id,
+                "bodySha": None,  # signed transaction body — no hash of it is kept
+                "headSnapshots": head_snapshots,
+                "orderRequestSource": AXIOM_EVM_SEND_SOURCE,
+                "transport": transport,
+            }
+            rid, leg, _verdict = STORE.axiom_evm_send_in_open_window(window, ev, facts, transport)
+            if leg is not None and first is None:
+                first = (leg, rid)
+        if first is not None:
+            flow.metadata["speedex_leg"] = first
+            flow.metadata["speedex_axiom_send"] = {"transport": transport}
 
     def response(self, flow):
         t_obs = _mono_ms()  # hook 入口冻结（同 request 侧）

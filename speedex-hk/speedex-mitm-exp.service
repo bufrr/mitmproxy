@@ -33,6 +33,7 @@ Type=simple
 # 端点同样强制认证。
 # v10.33：含 Axiom 精确主机（api.axiom.trade、cluster[a-z0-9-]*.axiom.trade、14 个
 # <region>.lunar-lander.hellomoon.io）——Axiom 解密兼容性先在本实例验收（overlay 文件 2026-11-22 段）。
+# v10.36：含 Axiom EVM 的精确 host sequencer.mainnet.chain.robinhood.com（overlay 文件 2026-11-23 段）。
 # ============================================================================
 WorkingDirectory=/opt/speedex-mitm-exp
 Environment=SPEEDEX_HK_CTRL_PORT=18072
@@ -47,7 +48,7 @@ ExecStart=/opt/speedex-mitm-exp/venv/bin/mitmdump \
   --set body_size_limit=2m \
   --set keep_host_header=false \
   --set block_global=false \
-  --set "allow_hosts=^(?:(.*\\.)?(turnkey\\.com|padre\\.gg|binance\\.com|fomo\\.family|relay\\.link)|(?:mainnet\\.(?:hudson|block-engine)\\.jito\\.wtf|sender\\.helius-rpc\\.com|cashback\\.circular\\.fi|sender\\.lamport\\.dev|api\\.axiom\\.trade|cluster[a-z0-9-]*\\.axiom\\.trade|greer-651y13-fast-mainnet\\.helius-rpc\\.com|(?:lax|nyc|fra|ams|ash|sgp|tyo|lon|syd|uae|chi|dal|sea|lit)\\.lunar-lander\\.hellomoon\\.io|(?:nozomi\\.temporal\\.xyz|(?:edge|pit1|ewr1|ash1|lax1|fra2|ams1|lon1|tyo1|sgp1|pit|ewr|ash|lax|fra|ams|lon|tyo|sgp)\\.nozomi\\.temporal\\.xyz)))(:\\d+)?$" \
+  --set "allow_hosts=^(?:(.*\\.)?(turnkey\\.com|padre\\.gg|binance\\.com|fomo\\.family|relay\\.link)|(?:mainnet\\.(?:hudson|block-engine)\\.jito\\.wtf|sender\\.helius-rpc\\.com|cashback\\.circular\\.fi|sender\\.lamport\\.dev|api\\.axiom\\.trade|cluster[a-z0-9-]*\\.axiom\\.trade|greer-651y13-fast-mainnet\\.helius-rpc\\.com|sequencer\\.mainnet\\.chain\\.robinhood\\.com|(?:lax|nyc|fra|ams|ash|sgp|tyo|lon|syd|uae|chi|dal|sea|lit)\\.lunar-lander\\.hellomoon\\.io|(?:nozomi\\.temporal\\.xyz|(?:edge|pit1|ewr1|ash1|lax1|fra2|ams1|lon1|tyo1|sgp1|pit|ewr|ash|lax|fra|ams|lon|tyo|sgp)\\.nozomi\\.temporal\\.xyz)))(:\\d+)?$" \
   -s /opt/speedex-mitm-exp/speedex_hk_timing.py \
   --quiet
 Restart=always

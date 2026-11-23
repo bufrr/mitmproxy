@@ -7046,7 +7046,7 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.11.23-axiom-sol-v10.35")
+        self.assertEqual(A.ADDON_VERSION, "2026.11.23-axiom-evm-v10.36")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 
@@ -11440,7 +11440,7 @@ class TestGmgnTradeHashV1032(unittest.TestCase):
             self.assertNotIn(self.WALLET, dumped, name)
             self.assertNotIn("122142992", dumped, name)
         self.assertEqual(surfaces["health"]["diag"].get("gmgnTradeHashArrivals"), 1)
-        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.23-axiom-sol-v10.35")
+        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.23-axiom-evm-v10.36")
 
 
 class TestAxiomSolana(unittest.TestCase):
@@ -11932,7 +11932,7 @@ class TestAxiomSolana(unittest.TestCase):
             for s in secrets:
                 self.assertNotIn(s, dumped, (name, s[:24]))
         self.assertIn(sig, json.dumps(surfaces["timelineFull"]), "the public signature is the anchor")
-        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.23-axiom-sol-v10.35")
+        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.23-axiom-evm-v10.36")
         self.assertEqual(surfaces["health"]["diag"].get("axiomUserTxAdopted"), 1)
 
     # ── v10.34: opaque api body prefix ──
@@ -12245,6 +12245,375 @@ class TestAxiomSolana(unittest.TestCase):
         raw, _ = self.tx()
         self.send("axiom-api", raw, origin="https://web3.okx.com")
         self.assertEqual(A.STORE.legs.get(self.run, []), [])
+
+
+# ── v10.36 Axiom EVM test signer ──────────────────────────────────────────────
+# No secp256k1/RLP library is installed offline, so the test builds and signs EIP-1559 txs itself with a minimal
+# pure-Python secp256k1 ECDSA over a THROWAWAY key (sha256 of a fixed test label below — never a real wallet,
+# never funded). Nothing here comes from a live capture body; addresses/calldata are synthetic.
+_SECP_P = 2**256 - 2**32 - 977
+_SECP_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+_SECP_G = (0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
+           0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8)
+_EVM_TEST_KEY = int.from_bytes(__import__("hashlib").sha256(b"speedex-hk-axiom-evm-throwaway-test-key").digest(), "big") % _SECP_N
+
+
+def _secp_add(a, b):
+    if a is None:
+        return b
+    if b is None:
+        return a
+    if a[0] == b[0] and (a[1] + b[1]) % _SECP_P == 0:
+        return None
+    if a == b:
+        lam = 3 * a[0] * a[0] * pow(2 * a[1], -1, _SECP_P) % _SECP_P
+    else:
+        lam = (b[1] - a[1]) * pow(b[0] - a[0], -1, _SECP_P) % _SECP_P
+    x = (lam * lam - a[0] - b[0]) % _SECP_P
+    return x, (lam * (a[0] - x) - a[1]) % _SECP_P
+
+
+def _secp_mul(k, pt=_SECP_G):
+    out = None
+    while k:
+        if k & 1:
+            out = _secp_add(out, pt)
+        pt = _secp_add(pt, pt)
+        k >>= 1
+    return out
+
+
+def _rlp_enc(item):
+    if isinstance(item, int):
+        item = item.to_bytes((item.bit_length() + 7) // 8, "big") if item else b""
+    if isinstance(item, bytes):
+        if len(item) == 1 and item[0] < 0x80:
+            return item
+        head = 0x80
+        payload = item
+    else:
+        payload = b"".join(_rlp_enc(x) for x in item)
+        head = 0xC0
+    if len(payload) < 56:
+        return bytes([head + len(payload)]) + payload
+    ln = len(payload).to_bytes((len(payload).bit_length() + 7) // 8, "big")
+    return bytes([head + 55 + len(ln)]) + ln + payload
+
+
+def _evm_type2_tx(chain_id, nonce, data, to=b"\x7a" * 20, key=_EVM_TEST_KEY, r_override=None):
+    """Signed EIP-1559 tx (0x-hex) over the throwaway key → (raw_hex, keccak hash)."""
+    unsigned = [chain_id, nonce, 1_000_000_000, 3_000_000_000, 250_000, to, 0, data, []]
+    digest = int.from_bytes(A._keccak256(b"\x02" + _rlp_enc(unsigned)), "big")
+    k = int.from_bytes(__import__("hashlib").sha256(key.to_bytes(32, "big") + digest.to_bytes(32, "big")).digest(), "big") % _SECP_N
+    R = _secp_mul(k)
+    r = R[0] % _SECP_N
+    s = pow(k, -1, _SECP_N) * (digest + r * key) % _SECP_N
+    y = R[1] & 1
+    if s > _SECP_N // 2:
+        s, y = _SECP_N - s, y ^ 1
+    raw = b"\x02" + _rlp_enc(unsigned + [y, r if r_override is None else r_override, s])
+    return "0x" + raw.hex(), "0x" + A._keccak256(raw).hex()
+
+
+def _evm_sig_valid(raw_hex):
+    """Test sanity: the fixture's (r, s) verifies against the throwaway public key."""
+    raw = bytes.fromhex(raw_hex[2:])
+    fields, _ = A._rlp_decode(raw, 1)
+    digest = int.from_bytes(A._keccak256(b"\x02" + _rlp_enc(fields[:9])), "big")
+    r, s = int.from_bytes(fields[10], "big"), int.from_bytes(fields[11], "big")
+    w = pow(s, -1, _SECP_N)
+    pt = _secp_add(_secp_mul(digest * w % _SECP_N), _secp_mul(r * w % _SECP_N, _secp_mul(_EVM_TEST_KEY)))
+    return pt is not None and pt[0] % _SECP_N == r
+
+
+_SWAP_DATA = bytes.fromhex("7ff36ab5") + b"\x00" * 31 + b"\x01" + b"\x00" * 64  # synthetic swap calldata
+_APPROVE_DATA = bytes.fromhex("095ea7b3") + b"\x00" * 12 + b"\x5b" * 20 + b"\xff" * 32  # approve(spender, max)
+
+
+class TestAxiomEvm(unittest.TestCase):
+    """v10.36: Axiom EVM (BSC + Robinhood) order-out legs. Sends on api.axiom.trade /wo/batched-(bnb|rh)-send-tx
+    and the Robinhood sequencer eth_sendRawTransaction; legs keyed by (chainId, hash); same-hash fanout folds;
+    approve txs are their own legs; unauthorized chains counted; no success channel. Txs are signed in the test
+    with a throwaway key (see _EVM_TEST_KEY); cookies/keys are synthetic."""
+
+    COOKIE = "synthetic-axiom-evm-cookie-value-42"
+
+    def setUp(self):
+        fresh()
+        self.clock = time.monotonic() * 1000 + 10
+        self.polls = []
+        for target, replacement in [("_mono_ms", lambda: self.clock),
+                                    ("_poll_receipt", lambda *a: self.polls.append(a[3]))]:
+            p = patch.object(A, target, replacement); p.start(); self.addCleanup(p.stop)
+        p = patch.object(A.HEADS, "snapshot", lambda rid, t: {c: {
+            "version": 1, "chain": c, "epoch": rid, "height": 40, "anchorTs": t,
+            "observedTs": t - 1, "sampleAgeMs": 1} for c in A.CHAINS})
+        p.start(); self.addCleanup(p.stop)
+        self.run = "axiom-evm-window"
+
+    def open(self, legs):
+        A.STORE.mark_open(self.run, manifest={"version": 1, "runId": self.run, "legs": legs})
+        self.clock += 100
+
+    def post(self, transport, txs=None, body=None, origin="https://axiom.trade", rpc_id=7, respond=True):
+        if transport == "rh-sequencer":
+            host, path = "sequencer.mainnet.chain.robinhood.com", "/"
+            if body is None:
+                body = json.dumps({"jsonrpc": "2.0", "id": rpc_id, "method": "eth_sendRawTransaction", "params": txs})
+        else:
+            host = "api.axiom.trade"
+            path = "/wo/batched-bnb-send-tx" if transport == "axiom-bnb-api" else "/wo/batched-rh-send-tx"
+            if body is None:
+                obj = {"txs": txs, "sherwood": False, "v": 2}
+                if transport == "axiom-bnb-api":
+                    obj.update(antiMevRpc=True, allAnswers=False)
+                body = json.dumps(obj)
+        headers = {"cookie": self.COOKIE, "authorization": "Bearer " + self.COOKIE,
+                   "content-type": "application/json"}
+        if origin is not None:
+            headers["origin"] = origin
+        f = FakeFlow(host, path, "POST", headers=headers)
+        f.request.content = body.encode() if isinstance(body, str) else body
+        A.addons[0].request(f)
+        if respond:
+            A.addons[0].response(f)
+        return f
+
+    def legs(self):
+        return [x for x in A.STORE.legs.get(self.run, []) if x.get("platform") == "axiom"]
+
+    def rows(self, full=True):
+        return [x for x in A.STORE.timeline(self.run, full=full)["legs"] if x.get("platform") == "axiom"
+                and x.get("anchorRole") in ("order", "approve")]
+
+    # ── decode ──
+    def test_tx_facts_from_signed_type2(self):
+        raw, h = _evm_type2_tx(56, 9, _SWAP_DATA)
+        self.assertTrue(_evm_sig_valid(raw), "fixture is a real signature over the throwaway key")
+        self.assertEqual(A._evm_raw_tx_hash(raw), h)
+        self.assertEqual(A._axiom_evm_tx_facts(raw), (
+            {"hash": h, "chainId": 56, "chain": "bsc", "nonce": 9, "call": "other"}, None))
+        raw_a, h_a = _evm_type2_tx(4663, 0, _APPROVE_DATA)
+        facts, _ = A._axiom_evm_tx_facts(raw_a.upper().replace("0X", "0x"))
+        self.assertEqual((facts["hash"], facts["chain"], facts["nonce"], facts["call"]),
+                         (h_a, "robinhood", 0, "approve"))
+        body = bytes.fromhex(raw[2:])
+        fields, _ = A._rlp_decode(body, 1)
+        legacy = "0x" + _rlp_enc([9, 1, 21000, b"\x7a" * 20, 0, b"", 0x93, 1, 1]).hex()
+        bad = [
+            ("not hex", "0x" + "zz" * 40, "tx-hex"),
+            ("no prefix", raw[2:], "tx-hex"),
+            ("not a string", 123, "tx-hex"),
+            ("legacy", legacy, "tx-type"),
+            ("type 1", "0x01" + raw[4:], "tx-type"),
+            ("trailing byte", raw + "00", "tx-rlp"),
+            ("truncated", raw[:-2], "tx-rlp"),
+            ("11 fields", "0x02" + _rlp_enc(fields[:11]).hex(), "tx-rlp"),
+            ("leading-zero nonce", "0x02" + _rlp_enc([fields[0], b"\x00\x09"] + fields[2:]).hex(), "tx-rlp"),
+            ("bad to", "0x02" + _rlp_enc(fields[:5] + [b"\x7a" * 19] + fields[6:]).hex(), "tx-rlp"),
+            ("yParity 2", "0x02" + _rlp_enc(fields[:9] + [b"\x02"] + fields[10:]).hex(), "tx-sig"),
+            ("r zero", _evm_type2_tx(56, 9, _SWAP_DATA, r_override=0)[0], "tx-sig"),
+            ("chainId 1", _evm_type2_tx(1, 9, _SWAP_DATA)[0], "chain-id"),
+            ("chainId 5042 (arc)", _evm_type2_tx(5042, 9, _SWAP_DATA)[0], "chain-id"),
+        ]
+        for name, value, reason in bad:
+            with self.subTest(name):
+                self.assertEqual(A._axiom_evm_tx_facts(value), (None, reason))
+
+    def test_exact_routes(self):
+        self.assertEqual(A._axiom_evm_send_route("api.axiom.trade", "/wo/batched-bnb-send-tx", "POST"), "axiom-bnb-api")
+        self.assertEqual(A._axiom_evm_send_route("api.axiom.trade", "/wo/batched-rh-send-tx", "POST"), "axiom-rh-api")
+        self.assertEqual(A._axiom_evm_send_route("sequencer.mainnet.chain.robinhood.com", "/", "POST"), "rh-sequencer")
+        for host, path, method in [
+            ("api.axiom.trade", "/wo/batched-bnb-send-tx", "OPTIONS"),
+            ("api.axiom.trade", "/wo/batched-send-tx-v4", "POST"),  # Solana route stays Solana
+            ("api.axiom.trade", "/wo/batched-eth-send-tx", "POST"),
+            ("api.axiom.trade.evil.example", "/wo/batched-rh-send-tx", "POST"),
+            ("sequencer.mainnet.chain.robinhood.com", "/rpc", "POST"),
+            ("sequencer.mainnet.chain.robinhood.com", "/", "GET"),
+            ("rpc.mainnet.chain.robinhood.com", "/", "POST"),  # OKX's RH RPC is not an Axiom route
+            ("evil.sequencer.mainnet.chain.robinhood.com", "/", "POST"),
+        ]:
+            self.assertIsNone(A._axiom_evm_send_route(host, path, method), (host, path, method))
+        for path in A.AXIOM_EVM_API_ROUTES:
+            self.assertIsNone(A._axiom_send_route("api.axiom.trade", path, "POST"))
+
+    # ── legs ──
+    def test_bsc_swap_then_approve_two_legs(self):
+        self.open([{"platform": "axiom", "chain": "bsc", "rounds": 1}])
+        swap, h_swap = _evm_type2_tx(56, 4, _SWAP_DATA)
+        appr, h_appr = _evm_type2_tx(56, 5, _APPROVE_DATA)
+        t_swap = self.clock
+        f1 = self.post("axiom-bnb-api", [swap])
+        self.clock += 8
+        t_appr = self.clock
+        self.post("axiom-bnb-api", [appr])
+        legs = self.legs()
+        self.assertEqual(len(legs), 2, "separate txs (different nonce/hash) are separate legs")
+        s, a = legs
+        self.assertIs(f1.metadata["speedex_leg"][0], s)
+        self.assertEqual((s["chain"], s["anchorRole"], s["orderRequestSource"], s["txHash"], s["tOrderOutMs"]),
+                         ("bsc", "order", "axiom-evm-send", h_swap, t_swap))
+        self.assertIsNotNone(s["slot"], "the swap binds the axiom×bsc slot")
+        self.assertEqual((a["chain"], a["anchorRole"], a["txHash"], a["tOrderOutMs"], a["slot"], a["unbound"]),
+                         ("bsc", "approve", h_appr, t_appr, None, False), "approve never takes a slot")
+        self.assertEqual(self.polls, [], "order-out only: no receipt poll")
+        self.assertEqual(A.STORE.diag["axiomEvmSendLeg"], 1)
+        self.assertEqual(A.STORE.diag["axiomEvmSendApproveLeg"], 1)
+        A.STORE.mark_close(self.run)
+        tl = A.STORE.timeline(self.run, full=True)
+        self.assertEqual((tl["counts"]["requested"], tl["counts"]["attempted"]), (1, 1))
+        rows = self.rows()
+        self.assertEqual([r["evidence"]["axiomEvmSend"] for r in rows], [
+            {"chainId": 56, "nonce": 4, "call": "other", "firstTransport": "axiom-bnb-api",
+             "transports": {"axiom-bnb-api": 1}, "fanout": 1},
+            {"chainId": 56, "nonce": 5, "call": "approve", "firstTransport": "axiom-bnb-api",
+             "transports": {"axiom-bnb-api": 1}, "fanout": 1},
+        ])
+        for r in rows:
+            self.assertEqual((r["orderRequestSource"], r["hkL1aMs"], r.get("successEvidence"), r["incomplete"]),
+                             ("axiom-evm-send", None, None, "no-success-observed"))
+            self.assertEqual(r["chainHead"]["anchorTs"], r["tOrderOutMs"], "chain head frozen at the send hook")
+        req = [e for e in A.STORE.events[self.run] if e["kind"] == "order_req"]
+        self.assertEqual([(e["host"], e["path"], e["bodySha"]) for e in req],
+                         [("api.axiom.trade", "/wo/batched-bnb-send-tx", None)] * 2)
+        ack = [e for e in A.STORE.events[self.run] if e["kind"] == "axiom_send_ack"]
+        self.assertEqual([(e["transport"], e["ok"]) for e in ack], [("axiom-bnb-api", True)] * 2)
+        dump = json.dumps([tl, A.STORE.timeline(self.run), list(A.STORE.events[self.run]), dict(A.STORE.diag)],
+                          default=str)
+        for secret in (swap[2:], appr[2:], swap[-130:], self.COOKIE):
+            self.assertNotIn(secret, dump, "raw tx / signature / headers never persisted")
+
+    def test_rh_api_and_sequencer_fanout_one_leg(self):
+        self.open([{"platform": "axiom", "chain": "robinhood", "rounds": 2}])
+        raw, h = _evm_type2_tx(4663, 12, _SWAP_DATA)
+        t_api = self.clock
+        self.post("axiom-rh-api", [raw])
+        self.clock += 2
+        f2 = self.post("rh-sequencer", [raw])
+        legs = self.legs()
+        self.assertEqual(len(legs), 1, "same hash = one leg")
+        leg = legs[0]
+        self.assertIs(f2.metadata["speedex_leg"][0], leg)
+        self.assertEqual((leg["chain"], leg["txHash"], leg["tOrderOutMs"]), ("robinhood", h, t_api))
+        self.assertEqual(leg["_axiomEvmSend"]["fanout"], 2)
+        self.assertEqual(leg["_axiomEvmSend"]["transports"], {"axiom-rh-api": 1, "rh-sequencer": 1})
+        self.assertEqual(A.STORE.diag["axiomEvmSendFold"], 1)
+        # sequencer first in another round: the first observation anchors, the api send folds
+        raw2, h2 = _evm_type2_tx(4663, 13, _SWAP_DATA)
+        self.clock += 3000
+        t_seq = self.clock
+        self.post("rh-sequencer", [raw2])
+        self.clock += 1
+        self.post("axiom-rh-api", [raw2])
+        leg2 = self.legs()[1]
+        self.assertEqual((leg2["txHash"], leg2["tOrderOutMs"], leg2["_axiomEvmSend"]["firstTransport"],
+                          leg2["_axiomEvmSend"]["fanout"]), (h2, t_seq, "rh-sequencer", 2))
+        self.assertEqual(A.STORE.timeline(self.run)["counts"]["attempted"], 2)
+
+    def test_chain_not_authorized_by_batch_not_adopted(self):
+        self.open([{"platform": "axiom", "chain": "bsc", "rounds": 1}, {"platform": "okx", "chain": "robinhood", "rounds": 1}])
+        rh, _ = _evm_type2_tx(4663, 1, _SWAP_DATA)
+        self.post("axiom-rh-api", [rh])
+        self.post("rh-sequencer", [rh])
+        self.assertEqual(self.legs(), [], "robinhood is not an axiom chain in this batch")
+        self.assertEqual(A.STORE.diag["axiomEvmSendChainUnauthorized"], 2)
+        self.assertEqual(A.STORE.run_diag[self.run]["axiomEvmSendChainUnauthorized"], 2)
+        # chainId comes from the signed tx: a BSC tx posted to the RH routes is a route/chain mismatch, no leg
+        bsc, _ = _evm_type2_tx(56, 1, _SWAP_DATA)
+        self.post("axiom-rh-api", [bsc])
+        self.post("rh-sequencer", [bsc])
+        self.post("axiom-bnb-api", [rh])
+        self.assertEqual(self.legs(), [])
+        for key in ("axiomEvmSendUnproven.axiom-rh-api.route-chain", "axiomEvmSendUnproven.rh-sequencer.route-chain",
+                    "axiomEvmSendUnproven.axiom-bnb-api.route-chain"):
+            self.assertEqual(A.STORE.diag[key], 1, key)
+        # a Solana-only Axiom batch does not authorize BSC either
+        fresh()
+        self.open([{"platform": "axiom", "chain": "solana", "rounds": 1}])
+        self.post("axiom-bnb-api", [bsc])
+        self.assertEqual((self.legs(), A.STORE.diag["axiomEvmSendChainUnauthorized"]), ([], 1))
+        # no detail manifest → no chain authorization to check (same as other platforms)
+        fresh()
+        A.STORE.mark_open(self.run)
+        self.clock += 100
+        self.post("axiom-bnb-api", [bsc])
+        self.assertEqual([x["chain"] for x in self.legs()], ["bsc"])
+
+    def test_malformed_bodies_count_fixed_reasons(self):
+        self.open([{"platform": "axiom", "chain": "bsc", "rounds": 1}, {"platform": "axiom", "chain": "robinhood", "rounds": 1}])
+        good, _ = _evm_type2_tx(56, 3, _SWAP_DATA)
+        rh, _ = _evm_type2_tx(4663, 3, _SWAP_DATA)
+        cases = [
+            ("axiom-bnb-api", dict(txs=[good], origin="https://evil.example"), "origin"),
+            ("axiom-bnb-api", dict(txs=[good], origin=None), "origin"),
+            ("axiom-bnb-api", dict(body="not json"), "body-shape"),
+            ("axiom-bnb-api", dict(body=json.dumps({"tx": good})), "body-shape"),
+            ("axiom-bnb-api", dict(txs=[]), "body-shape"),
+            ("axiom-bnb-api", dict(txs=[good] * 5), "body-shape"),
+            ("axiom-bnb-api", dict(body=b"\xff\xfe"), "body-shape"),
+            ("axiom-bnb-api", dict(txs=[good, "0x02c0"]), "tx-hex"),
+            ("axiom-bnb-api", dict(txs=["0x02" + "c1" * 20]), "tx-rlp"),
+            ("axiom-rh-api", dict(txs=[rh + "00"]), "tx-rlp"),
+            ("axiom-rh-api", dict(txs=[_evm_type2_tx(1, 1, b"")[0]]), "chain-id"),
+            ("rh-sequencer", dict(body=json.dumps([{"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction",
+                                                    "params": [rh]}])), "body-shape"),
+            ("rh-sequencer", dict(txs=[rh, rh]), "body-shape"),
+            ("rh-sequencer", dict(body=json.dumps({"id": 1, "method": "eth_sendRawTransaction", "params": [rh]})),
+             "body-shape"),
+            ("rh-sequencer", dict(txs=[rh], origin="https://web3.okx.com"), "origin"),
+            ("rh-sequencer", dict(txs=["0x" + "00" * 40]), "tx-type"),
+            ("axiom-bnb-api", dict(body=b"{" * (A.AXIOM_EVM_BODY_MAX + 1)), "size"),
+        ]
+        for transport, kw, reason in cases:
+            with self.subTest(f"{transport}:{reason}"):
+                before = A.STORE.diag[f"axiomEvmSendUnproven.{transport}.{reason}"]
+                self.post(transport, **kw)
+                self.assertEqual(A.STORE.diag[f"axiomEvmSendUnproven.{transport}.{reason}"], before + 1)
+        self.assertEqual(self.legs(), [], "a body that does not decode never opens a leg (no partial batch)")
+        # non-send sequencer JSON-RPC is not a send: counted separately, no reject
+        self.post("rh-sequencer", body=json.dumps({"jsonrpc": "2.0", "id": 2, "method": "eth_chainId", "params": []}))
+        self.assertEqual(A.STORE.diag["axiomEvmSequencerOther"], 1)
+        for key in A.STORE.diag:
+            if key.startswith("axiomEvmSendUnproven."):
+                _, transport, reason = key.split(".")
+                self.assertIn(transport, A.AXIOM_EVM_TRANSPORT_CHAIN_ID)
+                self.assertIn(reason, A.AXIOM_EVM_UNPROVEN_REASONS)
+        # outside a window nothing is counted per run and no leg appears
+        A.STORE.mark_close(self.run)
+        self.post("axiom-bnb-api", [good])
+        self.assertEqual(self.legs(), [])
+
+    def test_solana_axiom_unchanged_alongside_evm(self):
+        self.open([{"platform": "axiom", "chain": "solana", "rounds": 1}, {"platform": "axiom", "chain": "bsc", "rounds": 1}])
+        sol_raw, sig = TestAxiomSolana.tx()
+        f = FakeFlow("api.axiom.trade", "/wo/batched-send-tx-v4", "POST", headers={"origin": "https://axiom.trade"})
+        f.request._body = TestAxiomSolana.api_body(sol_raw)
+        t_sol = self.clock
+        A.addons[0].request(f)
+        A.addons[0].response(f)
+        self.clock += 5  # EVM send 5 ms later: different source, never a Solana fanout conflict
+        bsc, h = _evm_type2_tx(56, 2, _SWAP_DATA)
+        self.post("axiom-bnb-api", [bsc])
+        sol_leg, evm_leg = self.legs()
+        self.assertEqual((sol_leg["chain"], sol_leg["orderRequestSource"], sol_leg["txHash"], sol_leg["tOrderOutMs"]),
+                         ("solana", "axiom-solana-send", sig, t_sol))
+        self.assertFalse(sol_leg.get("_anchorVeto"))
+        self.assertNotIn("_axiomEvmSend", sol_leg)
+        self.assertEqual(self.polls, [sig], "Solana receipt poll as before; none for EVM")
+        self.assertEqual((evm_leg["chain"], evm_leg["txHash"]), ("bsc", h))
+        self.clock += 300
+        frame = FakeFlow("cluster9.axiom.trade", "/", "GET")
+        frame.websocket = types.SimpleNamespace(messages=[FakeWSMsg(json.dumps({
+            "room": "sol-v2|user-tx:" + TestAxiomSolana.USER,
+            "content": [sig, "2026-11-23T10:00:00.000Z", "buy", TestAxiomSolana.PAIR]}))])
+        A.addons[0].websocket_message(frame)
+        self.assertEqual(sol_leg["tSuccessPushMs"], self.clock)
+        self.assertIsNone(evm_leg["tSuccessPushMs"])
+        sol_row = next(r for r in self.rows() if r["chain"] == "solana")
+        self.assertNotIn("axiomEvmSend", sol_row["evidence"])
+        self.assertEqual(sol_row["evidence"]["axiomSend"],
+                         {"firstTransport": "axiom-api", "transports": {"axiom-api": 1}, "conflict": False})
 
 
 if __name__ == "__main__":
