@@ -99,7 +99,8 @@ fomo.md + tests/classify-ws.test.mjs 等夹具——改规则同步改本注释�
           api.axiom.trade /wo/batched-send-tx-v4 or <region>.lunar-lander.hellomoon.io /sendBatch-cors;
           signature derived in memory from the single-signer Solana v1 tx (trailing 64 bytes). Success =
           cluster*.axiom.trade WS room sol-v2|user-tx:<id>, content[0] == the leg's signature
-          (v10.34: opaque api body prefix; JSON-array/NDJSON user-tx batches; reason-coded rejects).
+          (v10.34: opaque api body prefix; JSON-array/NDJSON user-tx batches; reason-coded rejects;
+          v10.35: every batch entry tried by exact signature, same sig with both sides not adopted).
 
 成功判定统一锚纪律：成功状态/hash/id 必须与「请求/响应建立的
 独立锚」（leg._anchor：响应抽取 id、binance 请求体 clientOrderId、fomo 页面出站
@@ -354,7 +355,11 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # two different valid signatures → axiomUserTxAmbiguousBatch, none adopted), content ≥ 4 (first four checked),
 # room id 8-64 [0-9a-fA-F-]; rejects count axiomUserTxInvalid.<reason> (fixed set, no values; BINARY opcode
 # frames that are not UTF-8 JSON → .binary). Sig/side/user-tx room class strictness unchanged.
-ADDON_VERSION = "2026.11.22-axiom-sol-v10.34"
+# v10.35 (2026-11-23, review finding): a user-tx batch yields every valid (sig, side) entry, one per signature,
+# each matched against the send legs by exact signature (all observe_axiom_user_tx gates per entry), so a frame
+# carrying the previous round's sell and this round's buy no longer loses the buy; axiomUserTxAmbiguousBatch is
+# gone. One signature with both sides in a frame → not adopted, axiomUserTxAmbiguousSide. Timing unchanged.
+ADDON_VERSION = "2026.11.23-axiom-sol-v10.35"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -1000,24 +1005,27 @@ def _axiom_user_tx_item(obj):
 
 
 def _axiom_user_tx_frame(payload, is_text=True):
-    """cluster*.axiom.trade server frame → (diag key | None, sig | None, side | None).
+    """cluster*.axiom.trade server frame → (diag keys, [(sig, side), …]).
 
     Frames without "user-tx:" (public trades sol-v2|t:<mint>, prices, slots, blockhash, gas-prices,
     balance-updates-user) are skipped before any decode. The rest is decoded in memory as one JSON message, a
     JSON array of messages or newline-delimited JSON (≤ AXIOM_USER_TX_BATCH_MAX each); in a batch only items
-    whose room is a user-tx room are considered, the first valid one wins and two different valid signatures
-    adopt none (axiomUserTxAmbiguousBatch). Rejections count axiomUserTxInvalid.<reason> (fixed reason set,
-    never a value). mitmproxy hands decompressed bytes (permessage-deflate is undone by wsproto); a BINARY
-    opcode frame that is not UTF-8 JSON is axiomUserTxInvalid.binary."""
+    whose room is a user-tx room are considered. v10.35: every valid entry is returned (one per signature, in
+    frame order) — each must still match its own send leg exactly downstream. A signature that appears with
+    both sides in one frame is ambiguous: not returned, counted axiomUserTxAmbiguousSide once per signature.
+    "axiomUserTx" is counted once per frame that yields ≥ 1 entry. With no valid entry and no ambiguous
+    signature the frame counts axiomUserTxInvalid.<reason> (fixed reason set, never a value; first user-tx
+    item's reason, "room" if none). mitmproxy hands decompressed bytes (permessage-deflate is undone by
+    wsproto); a BINARY opcode frame that is not UTF-8 JSON is axiomUserTxInvalid.binary."""
     needle = b"user-tx:" if isinstance(payload, (bytes, bytearray)) else "user-tx:"
     try:
         if needle not in payload:
-            return None, None, None
+            return [], []
     except TypeError:
-        return None, None, None
+        return [], []
 
     def invalid(reason):
-        return "axiomUserTxInvalid." + reason, None, None
+        return ["axiomUserTxInvalid." + reason], []
 
     if isinstance(payload, (bytes, bytearray)):
         try:
@@ -1044,12 +1052,12 @@ def _axiom_user_tx_frame(payload, is_text=True):
     if batch is None:
         if not isinstance(obj, list):
             reason, sig, side = _axiom_user_tx_item(obj)
-            return (invalid(reason) if reason else ("axiomUserTx", sig, side))
+            return invalid(reason) if reason else (["axiomUserTx"], [(sig, side)])
         if len(obj) > AXIOM_USER_TX_BATCH_MAX:
             return invalid("batch-size")
         batch = obj
     first_reason = None
-    found = None
+    sides = {}  # sig → set of sides seen in this frame (dict keeps frame order)
     for item in batch:
         room = item.get("room") if isinstance(item, dict) else None
         if not isinstance(room, str) or "user-tx:" not in room:
@@ -1058,12 +1066,13 @@ def _axiom_user_tx_frame(payload, is_text=True):
         if reason:
             first_reason = first_reason or reason
             continue
-        if found is None:
-            found = (sig, side)
-        elif found[0] != sig:
-            return "axiomUserTxAmbiguousBatch", None, None
-    if found is not None:
-        return "axiomUserTx", found[0], found[1]
+        sides.setdefault(sig, set()).add(side)
+    entries = [(sig, next(iter(s))) for sig, s in sides.items() if len(s) == 1]
+    keys = ["axiomUserTxAmbiguousSide"] * (len(sides) - len(entries))
+    if entries:
+        keys.append("axiomUserTx")
+    if keys:
+        return keys, entries
     return invalid(first_reason or "room")
 
 
@@ -7620,15 +7629,18 @@ class SpeedexHkTiming:
                     is_text = bool(getattr(msg, "is_text", True))
                 except Exception:
                     is_text = True
-                key, sig, side = _axiom_user_tx_frame(msg.content, is_text)
-                if key:
+                keys, entries = _axiom_user_tx_frame(msg.content, is_text)
+                for key in keys:
                     STORE.note_frame_diag(key)
-                if sig:
+                if entries:
                     payload = msg.content
                     frame_sha = hashlib.sha256(
                         payload if isinstance(payload, bytes) else str(payload).encode()
                     ).hexdigest()[:16]
-                    STORE.observe_axiom_user_tx(sig, side, t_obs, frame_sha, host)
+                    # v10.35: each distinct signature of the frame is tried against the send legs on its own
+                    # (exact signature match; all gates per entry); same frame time t_obs for every entry.
+                    for sig, side in entries:
+                        STORE.observe_axiom_user_tx(sig, side, t_obs, frame_sha, host)
             return
         if AXIOM_HELIUS_WS_HOST_RE.fullmatch(host or ""):
             # v10.33: Axiom page Helius signatureSubscribe → mapped signatureNotification (err null) →

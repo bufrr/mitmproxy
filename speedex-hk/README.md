@@ -292,8 +292,7 @@ seen, rejected → `hkL1aMs` null, `incomplete: no-success-observed`). Every oth
 - **user-tx frame shapes**: mitmproxy hands every message as decompressed bytes (wsproto undoes permessage-deflate inside
   the connection; same code in mitmproxy 11.0.2 and 12.3.0), and the opcode stays visible. Accepted: one JSON message, a
   JSON array of messages or newline-delimited JSON (at most 32 items/lines each). In a batch only items whose `room` holds
-  `user-tx:` are evaluated; the first valid one wins, and two different valid signatures → `axiomUserTxAmbiguousBatch` with
-  nothing adopted. `content` needs ≥ 4 items; the first four are checked and trailing items are ignored. The room id is
+  `user-tx:` are evaluated; batch entry selection is per v10.35 below. `content` needs ≥ 4 items; the first four are checked and trailing items are ignored. The room id is
   any 8–64 `[0-9a-fA-F-]` (same as the EU consumer). Strictness is unchanged for the signature (base58 shape here, exact
   leg-signature match downstream), the side (`buy|sell`) and the `sol-v2|user-tx:` room class. Public `sol-v2|t:` frames
   never count.
@@ -303,3 +302,20 @@ seen, rejected → `hkL1aMs` null, `incomplete: no-success-observed`). Every oth
   valid item reports the first user-tx item's reason (`room` if none). No values are recorded.
 
 EU consumer: `axiomAddonSupported` (`web/shared-push-timing.mjs`) accepts `-v10.34`; no consumer change.
+
+## 2026.11.23-axiom-sol-v10.35
+
+Review fix for user-tx batches (v10.34 kept only the first valid entry). Every other platform is unchanged.
+
+- `_axiom_user_tx_frame` returns every valid `(sig, side)` entry of a JSON-array / NDJSON batch (at most 32 items/lines;
+  one entry per signature, frame order). Each entry is tried on its own against the send legs by exact signature, with
+  all existing gates per entry (window closed / vetoed / dup → `axiomUserTxLegIneligible`, `axiomUserTxBeforeSend`,
+  `axiomUserTxRepeat`, unknown → `axiomUserTxNoLeg`, first observation frozen). A frame carrying the previous round's sell
+  and this round's buy therefore no longer loses the buy. `axiomUserTxAmbiguousBatch` no longer exists.
+- One signature with both `buy` and `sell` in one frame is ambiguous: not adopted, `axiomUserTxAmbiguousSide` (once per
+  such signature). Other signatures in that frame are still tried.
+- `axiomUserTx` counts frames that yield at least one entry. Invalid items keep the v10.34 rule: a frame with no valid
+  entry and no ambiguous signature counts `axiomUserTxInvalid.<reason>` for its first user-tx item (`room` if none).
+- Timing unchanged: `tSuccessPushMs` is the proxy observation time of the frame for every entry it carries.
+
+EU consumer: `axiomAddonSupported` (`web/shared-push-timing.mjs`) accepts `-v10.35` (≥ v10.33); no consumer change.

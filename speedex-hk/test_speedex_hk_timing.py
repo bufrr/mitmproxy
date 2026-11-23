@@ -7046,7 +7046,7 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.11.22-axiom-sol-v10.34")
+        self.assertEqual(A.ADDON_VERSION, "2026.11.23-axiom-sol-v10.35")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 
@@ -11440,7 +11440,7 @@ class TestGmgnTradeHashV1032(unittest.TestCase):
             self.assertNotIn(self.WALLET, dumped, name)
             self.assertNotIn("122142992", dumped, name)
         self.assertEqual(surfaces["health"]["diag"].get("gmgnTradeHashArrivals"), 1)
-        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.22-axiom-sol-v10.34")
+        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.23-axiom-sol-v10.35")
 
 
 class TestAxiomSolana(unittest.TestCase):
@@ -11932,7 +11932,7 @@ class TestAxiomSolana(unittest.TestCase):
             for s in secrets:
                 self.assertNotIn(s, dumped, (name, s[:24]))
         self.assertIn(sig, json.dumps(surfaces["timelineFull"]), "the public signature is the anchor")
-        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.22-axiom-sol-v10.34")
+        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.23-axiom-sol-v10.35")
         self.assertEqual(surfaces["health"]["diag"].get("axiomUserTxAdopted"), 1)
 
     # ── v10.34: opaque api body prefix ──
@@ -11992,8 +11992,8 @@ class TestAxiomSolana(unittest.TestCase):
         _, sig = self.tx()
         room = "sol-v2|user-tx:" + self.USER
         ok = self.frame_obj(sig)
-        self.assertEqual(A._axiom_user_tx_frame(json.dumps(ok).encode()), ("axiomUserTx", sig, "buy"))
-        self.assertEqual(A._axiom_user_tx_frame(json.dumps(ok)), ("axiomUserTx", sig, "buy"))
+        self.assertEqual(A._axiom_user_tx_frame(json.dumps(ok).encode()), (["axiomUserTx"], [(sig, "buy")]))
+        self.assertEqual(A._axiom_user_tx_frame(json.dumps(ok)), (["axiomUserTx"], [(sig, "buy")]))
         cases = [
             ("not-json", b"42[\"user-tx:\"," + b"{}]", True),
             ("not-json", b"\xff\xfeuser-tx:", True),
@@ -12021,7 +12021,7 @@ class TestAxiomSolana(unittest.TestCase):
             with self.subTest(reason=reason, n=len(payload)):
                 self.assertIn(reason, A.AXIOM_USER_TX_INVALID_REASONS)
                 self.assertEqual(A._axiom_user_tx_frame(payload, is_text),
-                                 ("axiomUserTxInvalid." + reason, None, None))
+                                 (["axiomUserTxInvalid." + reason], []))
         # A scalar JSON number/bool/null cannot contain "user-tx:" (prefiltered), so those reasons are
         # checked on the item helper directly.
         self.assertEqual(A._axiom_user_tx_item(7)[0], "top-type-num")
@@ -12032,14 +12032,14 @@ class TestAxiomSolana(unittest.TestCase):
         for payload in (json.dumps({"room": "sol-v2|t:Mint", "content": ok["content"]}),
                         json.dumps({"room": "sol-v2|balance-updates-user:" + self.USER, "content": [1]}),
                         b"\x00\x01binary", "not json"):
-            self.assertEqual(A._axiom_user_tx_frame(payload, False), (None, None, None))
+            self.assertEqual(A._axiom_user_tx_frame(payload, False), ([], []))
 
     def test_user_tx_tolerated_shapes(self):
         _, sig = self.tx()
         _, other = self.tx(0x63)
         ok = self.frame_obj(sig, "sell")
         pub = {"room": "sol-v2|t:Mint" + "8" * 31, "content": [other, "t", "buy", self.PAIR]}
-        expect = ("axiomUserTx", sig, "sell")
+        expect = (["axiomUserTx"], [(sig, "sell")])
         for name, payload, is_text in [
             ("live single object as bytes", json.dumps(ok, separators=(",", ":")).encode(), True),
             ("binary opcode carrying json", json.dumps(ok).encode(), False),
@@ -12060,21 +12060,27 @@ class TestAxiomSolana(unittest.TestCase):
         ]:
             with self.subTest(name):
                 self.assertEqual(A._axiom_user_tx_frame(payload, is_text), expect)
-        amb = A._axiom_user_tx_frame(json.dumps([ok, self.frame_obj(other)]))
-        self.assertEqual(amb, ("axiomUserTxAmbiguousBatch", None, None))
-        amb = A._axiom_user_tx_frame(json.dumps(self.frame_obj(other)) + "\n" + json.dumps(ok))
-        self.assertEqual(amb, ("axiomUserTxAmbiguousBatch", None, None))
+        # v10.35: distinct valid signatures are all returned in frame order (each matched to its own leg later)
+        self.assertEqual(A._axiom_user_tx_frame(json.dumps([ok, self.frame_obj(other)])),
+                         (["axiomUserTx"], [(sig, "sell"), (other, "buy")]))
+        self.assertEqual(A._axiom_user_tx_frame(json.dumps(self.frame_obj(other)) + "\n" + json.dumps(ok)),
+                         (["axiomUserTx"], [(other, "buy"), (sig, "sell")]))
+        # same signature with both sides → that signature is ambiguous and not returned; others still are
+        self.assertEqual(A._axiom_user_tx_frame(json.dumps([ok, self.frame_obj(sig, "buy")])),
+                         (["axiomUserTxAmbiguousSide"], []))
+        self.assertEqual(A._axiom_user_tx_frame(json.dumps([ok, self.frame_obj(other), self.frame_obj(sig, "buy")])),
+                         (["axiomUserTxAmbiguousSide", "axiomUserTx"], [(other, "buy")]))
         # a batch whose only user-tx-looking item is malformed → that item's reason
         self.assertEqual(A._axiom_user_tx_frame(json.dumps([pub, self.frame_obj(sig, room="sol-v2|user-tx:x")])),
-                         ("axiomUserTxInvalid.room", None, None))
+                         (["axiomUserTxInvalid.room"], []))
         # NDJSON with one non-JSON line is not decoded at all
         self.assertEqual(A._axiom_user_tx_frame(json.dumps(ok) + "\nping"),
-                         ("axiomUserTxInvalid.not-json", None, None))
+                         (["axiomUserTxInvalid.not-json"], []))
         # public rooms never count, even inside a batch and even when they carry the leg's signature
         self.assertEqual(A._axiom_user_tx_frame(json.dumps([{"room": "sol-v2|t:Mint", "content": ok["content"]},
                                                             {"room": "user-tx:" + self.USER,
                                                              "content": ok["content"]}])),
-                         ("axiomUserTxInvalid.room", None, None))
+                         (["axiomUserTxInvalid.room"], []))
 
     def test_user_tx_batches_end_to_end(self):
         raw, sig = self.tx()
@@ -12082,11 +12088,13 @@ class TestAxiomSolana(unittest.TestCase):
         self.send("axiom-api", raw)
         leg = self.axiom_legs()[0]
         self.clock += 200
-        # ambiguous batch: two different user-tx signatures (one is the leg's) → nothing adopted
-        self.ws_frame(json.dumps([self.frame_obj(sig), self.frame_obj(other)]).encode())
+        # ambiguous side: the leg's signature as both buy and sell in one frame → nothing adopted
+        self.ws_frame(json.dumps([self.frame_obj(sig), self.frame_obj(sig, "sell")]).encode())
         self.assertIsNone(leg["tSuccessPushMs"])
-        self.assertEqual(A.STORE.diag["axiomUserTxAmbiguousBatch"], 1)
-        self.assertEqual(A.STORE.run_diag[self.run]["axiomUserTxAmbiguousBatch"], 1)
+        self.assertEqual(A.STORE.diag["axiomUserTxAmbiguousSide"], 1)
+        self.assertEqual(A.STORE.run_diag[self.run]["axiomUserTxAmbiguousSide"], 1)
+        self.assertEqual(A.STORE.diag.get("axiomUserTx", 0), 0)
+        self.assertEqual(A.STORE.diag.get("axiomUserTxAdopted", 0), 0)
         # non-JSON binary frame → reason binary, nothing adopted
         self.ws_frame(b"\x93\xa5room\xb0sol-v2|user-tx:" + bytes(range(0x80, 0x90)), is_text=False)
         self.assertIsNone(leg["tSuccessPushMs"])
@@ -12113,6 +12121,113 @@ class TestAxiomSolana(unittest.TestCase):
             self.assertNotIn(secret, dumped)
         self.assertFalse([k for k in A.STORE.diag if k.startswith("axiomUserTxInvalid.")
                           and k[len("axiomUserTxInvalid."):] not in A.AXIOM_USER_TX_INVALID_REASONS])
+
+    # ── v10.35: every batch entry is tried against the send legs by exact signature ──
+    def test_batch_matching_sig_second_entry_adopted(self):
+        raw, sig = self.tx()
+        _, prev_sell = self.tx(0x63)  # e.g. the previous round's sell, no open leg here
+        self.send("axiom-api", raw)
+        leg = self.axiom_legs()[0]
+        self.clock += 275
+        self.ws_frame(json.dumps([self.frame_obj(prev_sell, "sell"), self.frame_obj(sig, "buy")]).encode())
+        self.assertEqual(leg["tSuccessPushMs"], self.clock, "proxy observation time of the frame")
+        self.assertEqual(leg["successEvidence"]["txHash"], sig)
+        self.assertEqual(leg["successEvidence"]["side"], "buy")
+        self.assertEqual(A.STORE.diag["axiomUserTx"], 1)
+        self.assertEqual(A.STORE.diag["axiomUserTxAdopted"], 1)
+        self.assertEqual(A.STORE.diag["axiomUserTxNoLeg"], 1, "the other signature routes nowhere")
+        A.STORE.mark_close(self.run)
+        self.assertEqual(self.rows()[0]["hkL1aMs"], 275)
+
+    def test_batch_ndjson_matching_sig_second_line_adopted(self):
+        raw, sig = self.tx()
+        _, other = self.tx(0x63)
+        self.send("hellomoon", raw)
+        leg = self.axiom_legs()[0]
+        self.clock += 190
+        self.ws_frame(json.dumps(self.frame_obj(other, "sell")) + "\n" + json.dumps(self.frame_obj(sig, "sell")))
+        self.assertEqual(leg["tSuccessPushMs"], self.clock)
+        self.assertEqual(leg["successEvidence"]["side"], "sell")
+        self.assertEqual(A.STORE.diag["axiomUserTxAdopted"], 1)
+        self.assertEqual(A.STORE.diag["axiomUserTxNoLeg"], 1)
+
+    def test_batch_two_sigs_each_matches_only_its_own_leg(self):
+        raw_buy, sig_buy = self.tx(0x41)
+        raw_sell, sig_sell = self.tx(0x63)
+        _, stray = self.tx(0x05)
+        self.send("axiom-api", raw_buy)
+        buy_leg = self.axiom_legs()[0]
+        self.clock += 1500
+        self.send("axiom-api", raw_sell)
+        sell_leg = [x for x in self.axiom_legs() if x is not buy_leg][0]
+        self.clock += 300
+        # one matching signature + one stray → only the buy leg adopts; the sell leg stays open
+        self.ws_frame(json.dumps([self.frame_obj(stray, "sell"), self.frame_obj(sig_buy, "buy")]))
+        self.assertEqual(buy_leg["tSuccessPushMs"], self.clock)
+        self.assertEqual(buy_leg["successEvidence"]["txHash"], sig_buy)
+        self.assertIsNone(sell_leg["tSuccessPushMs"])
+        t_buy_success = self.clock
+        self.clock += 120
+        # previous round's buy (already adopted) + this round's sell in one frame → the sell is not lost
+        self.ws_frame(json.dumps([self.frame_obj(sig_buy, "buy"), self.frame_obj(sig_sell, "sell")]))
+        self.assertEqual(buy_leg["tSuccessPushMs"], t_buy_success, "first observation stays frozen")
+        self.assertEqual(sell_leg["tSuccessPushMs"], self.clock)
+        self.assertEqual(sell_leg["successEvidence"]["txHash"], sig_sell)
+        self.assertEqual(sell_leg["successEvidence"]["side"], "sell")
+        self.assertEqual(A.STORE.diag["axiomUserTxAdopted"], 2)
+        self.assertEqual(A.STORE.diag["axiomUserTxRepeat"], 1)
+        self.assertEqual(A.STORE.diag["axiomUserTxNoLeg"], 1)
+        self.assertEqual(A.STORE.diag.get("axiomUserTxAmbiguous", 0), 0)
+
+    def test_batch_entry_before_its_send_not_adopted(self):
+        raw_buy, sig_buy = self.tx(0x41)
+        raw_sell, sig_sell = self.tx(0x63)
+        self.send("axiom-api", raw_buy)
+        buy_leg = self.axiom_legs()[0]
+        self.clock += 1500  # beyond AXIOM_SEND_FANOUT_MS: a separate leg, not a conflicting fanout
+        self.send("axiom-api", raw_sell)
+        sell_leg = [x for x in self.axiom_legs() if x is not buy_leg][0]
+        self.clock += 100
+        sell_leg["tOrderOutMs"] = self.clock + 50  # synthetic: this leg's send time lies after the frame
+        self.ws_frame(json.dumps([self.frame_obj(sig_sell, "sell"), self.frame_obj(sig_buy, "buy")]))
+        self.assertIsNone(sell_leg["tSuccessPushMs"])
+        self.assertEqual(buy_leg["tSuccessPushMs"], self.clock)
+        self.assertEqual(A.STORE.diag["axiomUserTxBeforeSend"], 1)
+        self.assertEqual(A.STORE.diag["axiomUserTxAdopted"], 1)
+
+    def test_batch_same_sig_both_sides_not_adopted(self):
+        raw, sig = self.tx()
+        self.send("axiom-api", raw)
+        leg = self.axiom_legs()[0]
+        self.clock += 200
+        self.ws_frame("\n".join([json.dumps(self.frame_obj(sig, "sell")), json.dumps(self.frame_obj(sig, "buy"))]))
+        self.assertIsNone(leg["tSuccessPushMs"])
+        self.assertEqual(A.STORE.diag["axiomUserTxAmbiguousSide"], 1)
+        self.assertEqual(A.STORE.diag.get("axiomUserTxAdopted", 0), 0)
+        # a later unambiguous frame still adopts at its own observation time
+        self.clock += 40
+        self.ws_frame(json.dumps(self.frame_obj(sig, "buy")))
+        self.assertEqual(leg["tSuccessPushMs"], self.clock)
+
+    def test_batch_size_limit(self):
+        raw, sig = self.tx()
+        self.send("axiom-api", raw)
+        leg = self.axiom_legs()[0]
+        self.clock += 200
+        others = [self.tx(0x60 + i)[1] for i in range(A.AXIOM_USER_TX_BATCH_MAX)]
+        over = [self.frame_obj(o, "sell") for o in others] + [self.frame_obj(sig)]
+        self.assertEqual(len(over), A.AXIOM_USER_TX_BATCH_MAX + 1)
+        self.ws_frame(json.dumps(over))
+        self.ws_frame("\n".join(json.dumps(x) for x in over))
+        self.assertIsNone(leg["tSuccessPushMs"])
+        self.assertEqual(A.STORE.diag["axiomUserTxInvalid.batch-size"], 2)
+        # at the limit every distinct signature is returned (bounded by AXIOM_USER_TX_BATCH_MAX)
+        at = over[1:]
+        keys, entries = A._axiom_user_tx_frame(json.dumps(at))
+        self.assertEqual((keys, len(entries), entries[-1]), (["axiomUserTx"], A.AXIOM_USER_TX_BATCH_MAX, (sig, "buy")))
+        self.ws_frame(json.dumps(at))
+        self.assertEqual(leg["tSuccessPushMs"], self.clock)
+        self.assertEqual(A.STORE.diag["axiomUserTxNoLeg"], A.AXIOM_USER_TX_BATCH_MAX - 1)
 
     # ── other platforms unaffected ──
     def test_existing_platforms_unaffected(self):
