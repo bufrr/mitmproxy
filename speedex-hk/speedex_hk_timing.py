@@ -105,6 +105,9 @@ fomo.md + tests/classify-ws.test.mjs 等夹具——改规则同步改本注释�
           api.axiom.trade /wo/batched-(bnb|rh)-send-tx and the RH sequencer eth_sendRawTransaction; tx
           identity (chainId, keccak256(raw)) decoded in memory; no EVM success channel → no HK-L1a′.
           (v10.37) every leg of a multi-tx POST gets that flow's tFirstRespMs.
+          (v10.38) EVM success = cluster*.axiom.trade room bnb-v2|user-tx:<id> / rh-v2|user-tx:<id>,
+          content[0] == the order leg's exact (chainId, hash) (token/wallet shape only); order legs
+          poll the exact-hash receipt from the send (HK-L3′).
 
 成功判定统一锚纪律：成功状态/hash/id 必须与「请求/响应建立的
 独立锚」（leg._anchor：响应抽取 id、binance 请求体 clientOrderId、fomo 页面出站
@@ -369,12 +372,21 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # decoded in memory (hash = keccak256(raw), chainId 56/4663 from the signed tx, nonce); legs keyed by
 # (chainId, hash), first observation wins, same-hash fanout folds (fanout count), approve txs are their own
 # "approve" legs (no slot), chains the manifest did not authorize are counted, not adopted. No EVM success
-# push exists → no success adoption, no HK-L1a′, no receipt poll. Solana Axiom unchanged.
+# push exists → no success adoption, no HK-L1a′, no receipt poll. Solana Axiom unchanged. (Superseded by v10.38:
+# bnb-v2/rh-v2 user-tx success push + receipt poll for order legs.)
 # v10.37 (2026-11-23, review finding): an Axiom EVM POST carrying several txs (swap + approve) keeps every
 # distinct leg it opened or folded into (flow.metadata "speedex_axiom_evm_legs"); the response hook sets
 # tFirstRespMs on each from the same hook timestamp (first observation, open window only). Body still unread.
 # Every other path (incl. Axiom Solana) keeps the single speedex_leg reference, unchanged.
-ADDON_VERSION = "2026.11.23-axiom-evm-v10.37"
+# v10.38 (2026-11-24, owner-approved): Axiom EVM success push. The same cluster*.axiom.trade client socket carries
+# rooms bnb-v2|user-tx:<id> (chainId 56) and rh-v2|user-tx:<id> (4663), content [0x tx hash, iso time, side,
+# pair, token, wallet, …]. An entry is adopted only on the Axiom EVM order leg (anchorRole order, never approve)
+# of the same (chainId, lowercase hash), at/after its send, open window, first adoption frozen — the exact hash
+# pins the signed tx and so its signer; token/wallet are shape-checked only, never compared or kept. Success
+# evidence has the Solana Axiom shape (txHash lowercase). Order legs
+# now start the existing exact-hash EVM receipt poll at the send (HK-L3′), as Axiom Solana and OKX do. Solana
+# Axiom unchanged; allow_hosts unchanged.
+ADDON_VERSION = "2026.11.24-axiom-evm-push-v10.38"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -887,6 +899,10 @@ AXIOM_HELIUS_WS_HOST_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*-fast-mainnet\.he
 AXIOM_SEND_FANOUT_MS = 1000.0
 AXIOM_SUCCESS_CHANNEL = "axiom-user-tx-ws"
 AXIOM_USER_TX_ROOM_PREFIX = "sol-v2|user-tx:"
+# v10.38: EVM user-tx rooms on the same client socket → chainId of the order leg the entry may bind to.
+AXIOM_EVM_USER_TX_ROOMS = {"bnb-v2|user-tx:": 56, "rh-v2|user-tx:": 4663}
+_AXIOM_EVM_HASH_RE = re.compile(r"0x[0-9a-fA-F]{64}")
+_AXIOM_EVM_ADDR_RE = re.compile(r"0x[0-9a-fA-F]{40}")
 AXIOM_SEND_BODY_MAX = 2 + _SOL_TX_V1_MAX_BYTES
 # v10.34: live bodies carry a 9-char prefix of unknown alphabet (not base64 of 6 bytes) → the prefix is an
 # opaque bounded token (no '|' / ':'), matched only, never decoded or kept; exactly one ':' then one strict
@@ -899,6 +915,8 @@ AXIOM_USER_TX_INVALID_REASONS = (
     "binary", "not-json", "batch-size", "top-type-str", "top-type-num", "top-type-bool", "top-type-null",
     "room", "content-type", "content-len-0", "content-len-1", "content-len-2", "content-len-3",
     "sig", "at", "side", "pair",
+    # v10.38 EVM rooms only: content[0] not a 0x+64-hex hash, fewer than 6 items, token/wallet not a 0x+40-hex address
+    "hash", "content-len-4", "content-len-5", "token", "wallet",
 )
 _AXIOM_HELIUS_SUBS_KEY = "speedex_axiom_helius_subs"
 AXIOM_SEND_UNPROVEN_REASONS = ("origin", "size", "body-shape", "not-v1", "not-single-signer", "v1-layout")
@@ -982,11 +1000,26 @@ def _request_bytes(req):
         return b""
 
 
-def _axiom_user_tx_item(obj):
-    """One decoded message → (None, sig, side) or (reason, None, None); reason ∈ AXIOM_USER_TX_INVALID_REASONS.
+def _axiom_user_tx_room(room):
+    """user-tx room → chainId (None = Solana sol-v2) or False when it is not a user-tx room of a known chain
+    with an id of 8-64 [0-9a-fA-F-]."""
+    if not isinstance(room, str):
+        return False
+    for prefix, chain_id in ((AXIOM_USER_TX_ROOM_PREFIX, None), *AXIOM_EVM_USER_TX_ROOMS.items()):
+        if room.startswith(prefix):
+            return chain_id if _AXIOM_ROOM_ID_RE.fullmatch(room[len(prefix):]) else False
+    return False
 
-    {"room":"sol-v2|user-tx:<id 8-64 [0-9a-fA-F-]>","content":[sig, iso time, "buy"|"sell", pair, …]}: the
-    first four content items are checked, trailing items ignored. The id, time and pair are shapes only."""
+
+def _axiom_user_tx_item(obj):
+    """One decoded message → (None, key, side) or (reason, None, None); reason ∈ AXIOM_USER_TX_INVALID_REASONS.
+
+    Solana {"room":"sol-v2|user-tx:<id 8-64 [0-9a-fA-F-]>","content":[sig, iso time, "buy"|"sell", pair, …]}:
+    key = the base58 signature; the first four content items are checked, trailing items ignored.
+    v10.38 EVM {"room":"bnb-v2|user-tx:<id>" | "rh-v2|user-tx:<id>","content":[0x hash, iso time, side, pair,
+    token, wallet, …]}: key = (chainId, lowercase hash); the first six items are checked (token and wallet
+    must be 0x+40-hex addresses).
+    The id, time, pair, token and wallet are shapes only and never leave this function."""
     if not isinstance(obj, dict):
         if isinstance(obj, bool):
             return "top-type-bool", None, None
@@ -995,12 +1028,8 @@ def _axiom_user_tx_item(obj):
         if isinstance(obj, str):
             return "top-type-str", None, None
         return "top-type-null", None, None
-    room = obj.get("room")
-    if (
-        not isinstance(room, str)
-        or not room.startswith(AXIOM_USER_TX_ROOM_PREFIX)
-        or not _AXIOM_ROOM_ID_RE.fullmatch(room[len(AXIOM_USER_TX_ROOM_PREFIX):])
-    ):
+    chain_id = _axiom_user_tx_room(obj.get("room"))
+    if chain_id is False:
         return "room", None, None
     content = obj.get("content")
     if not isinstance(content, list):
@@ -1008,26 +1037,40 @@ def _axiom_user_tx_item(obj):
     if len(content) < 4:
         return f"content-len-{len(content)}", None, None
     sig, at, side, pair = content[:4]
-    if not isinstance(sig, str) or _SOL_SIG_RE.fullmatch(sig) is None:
-        return "sig", None, None
+    if chain_id is None:
+        if not isinstance(sig, str) or _SOL_SIG_RE.fullmatch(sig) is None:
+            return "sig", None, None
+    elif not isinstance(sig, str) or _AXIOM_EVM_HASH_RE.fullmatch(sig) is None:
+        return "hash", None, None
     if not isinstance(at, str):
         return "at", None, None
     if side not in ("buy", "sell"):
         return "side", None, None
     if not isinstance(pair, str):
         return "pair", None, None
-    return None, sig, side
+    if chain_id is None:
+        return None, sig, side
+    if len(content) < 6:
+        return f"content-len-{len(content)}", None, None
+    token, wallet = content[4:6]
+    if not isinstance(token, str) or _AXIOM_EVM_ADDR_RE.fullmatch(token) is None:
+        return "token", None, None
+    if not isinstance(wallet, str) or _AXIOM_EVM_ADDR_RE.fullmatch(wallet) is None:
+        return "wallet", None, None
+    return None, (chain_id, sig.lower()), side
 
 
 def _axiom_user_tx_frame(payload, is_text=True):
-    """cluster*.axiom.trade server frame → (diag keys, [(sig, side), …]).
+    """cluster*.axiom.trade server frame → (diag keys, [(key, side), …]); key = Solana signature (str) or, v10.38,
+    EVM (chainId, lowercase hash) tuple (see _axiom_user_tx_item).
 
     Frames without "user-tx:" (public trades sol-v2|t:<mint>, prices, slots, blockhash, gas-prices,
     balance-updates-user) are skipped before any decode. The rest is decoded in memory as one JSON message, a
     JSON array of messages or newline-delimited JSON (≤ AXIOM_USER_TX_BATCH_MAX each); in a batch only items
     whose room is a user-tx room are considered. v10.35: every valid entry is returned (one per signature, in
     frame order) — each must still match its own send leg exactly downstream. A signature that appears with
-    both sides in one frame is ambiguous: not returned, counted axiomUserTxAmbiguousSide once per signature.
+    both sides in one frame is ambiguous: not returned, counted axiomUserTxAmbiguousSide once per signature
+    (v10.38: an EVM (chainId, hash) seen with both sides in one frame is ambiguous the same way).
     "axiomUserTx" is counted once per frame that yields ≥ 1 entry. With no valid entry and no ambiguous
     signature the frame counts axiomUserTxInvalid.<reason> (fixed reason set, never a value; first user-tx
     item's reason, "room" if none). mitmproxy hands decompressed bytes (permessage-deflate is undone by
@@ -1072,17 +1115,17 @@ def _axiom_user_tx_frame(payload, is_text=True):
             return invalid("batch-size")
         batch = obj
     first_reason = None
-    sides = {}  # sig → set of sides seen in this frame (dict keeps frame order)
+    sides = {}  # tx identity (Solana sig | EVM (chainId, hash)) → set of sides seen in this frame (frame order kept)
     for item in batch:
         room = item.get("room") if isinstance(item, dict) else None
         if not isinstance(room, str) or "user-tx:" not in room:
             continue  # other rooms / non-message items in a batch are not user-tx evidence
-        reason, sig, side = _axiom_user_tx_item(item)
+        reason, key, side = _axiom_user_tx_item(item)
         if reason:
             first_reason = first_reason or reason
             continue
-        sides.setdefault(sig, set()).add(side)
-    entries = [(sig, next(iter(s))) for sig, s in sides.items() if len(s) == 1]
+        sides.setdefault(key, set()).add(side)
+    entries = [(key, next(iter(s))) for key, s in sides.items() if len(s) == 1]
     keys = ["axiomUserTxAmbiguousSide"] * (len(sides) - len(entries))
     if entries:
         keys.append("axiomUserTx")
@@ -1165,10 +1208,10 @@ def _axiom_helius_server_frame(flow, payload):
 # sequencer.mainnet.chain.robinhood.com (fanout of one tx). A buy on a new token sends the swap, then an
 # approve (selector 0x095ea7b3), each in its own POST ~8 ms apart: separate txs (nonce/hash) = separate legs,
 # only the same hash folds. txHash = keccak256(raw); chainId (56 bsc / 4663 robinhood) comes only from the
-# decoded signed tx (the route is a cross-check, never the source). There is no hash-carrying platform success
-# push on EVM (client-socket room <bnb-v2|rh-v2>|balance-updates-user:<uuid> has no hash) → order-out legs
-# only: no success adoption, no HK-L1a′, no receipt poll. Raw bytes, bodies, headers, r/s are never kept:
-# only hash, chainId, nonce and the approve/other class of the signed calldata leave the parser.
+# decoded signed tx (the route is a cross-check, never the source). v10.38: success = the client-socket room
+# <bnb-v2|rh-v2>|user-tx:<uuid> (content[0] = tx hash) on the order leg of that exact (chainId, hash); order legs
+# poll the exact-hash receipt from the send. Raw bytes, bodies, headers, r/s are never kept: only hash, chainId,
+# nonce and the approve/other class of the signed calldata leave the parser.
 AXIOM_EVM_SEND_SOURCE = "axiom-evm-send"
 AXIOM_EVM_API_ROUTES = {"/wo/batched-bnb-send-tx": "axiom-bnb-api", "/wo/batched-rh-send-tx": "axiom-rh-api"}
 AXIOM_RH_SEQUENCER_HOST = "sequencer.mainnet.chain.robinhood.com"
@@ -5629,50 +5672,66 @@ class Store:
         that leg's platform success (t_obs = frame hook entry). First adoption frozen; vetoed / closed /
         before-send / unknown signature → counted only. Returns the leg on adoption."""
         with self.lock:
-            rids = self._open_run_ids_locked(time.monotonic())
-            rid0 = rids[0] if rids else None
-            hits = [
-                leg for rid in rids for leg in self.legs.get(rid, [])
-                if leg.get("platform") == AXIOM_PLATFORM and leg.get("_axiomSig") == sig
-            ]
-            if len(hits) != 1:
-                self._axiom_diag_locked(rid0, "axiomUserTxNoLeg" if not hits else "axiomUserTxAmbiguous")
-                return None
-            leg = hits[0]
-            rid = leg.get("runId")
-            if leg.get("windowClosed") or leg.get("_anchorVeto") or leg.get("dup"):
-                self._axiom_diag_locked(rid, "axiomUserTxLegIneligible")
-                return None
-            t0 = leg.get("tOrderOutMs")
-            if not isinstance(t0, (int, float)) or t_obs < t0:
-                self._axiom_diag_locked(rid, "axiomUserTxBeforeSend")
-                return None
-            if leg.get("tSuccessPushMs") is not None:
-                self._axiom_diag_locked(rid, "axiomUserTxRepeat")
-                return None
-            leg["tSuccessPushMs"] = t_obs
-            leg["wsSha"] = frame_sha
-            leg["successAnchorKeys"] = ["txHash"]
-            digest = hashlib.sha256(sig.encode()).hexdigest()
-            leg["successEvidence"] = {
-                "version": 1,
-                "platform": AXIOM_PLATFORM,
-                "channel": AXIOM_SUCCESS_CHANNEL,
-                "status": "success",
-                "txHash": sig,
-                "txDigest": "-".join(digest[i:i+16] for i in range(0, 64, 16)),
-                "matchedKeys": ["txHash"],
-                "correlation": "user-tx-room+send-sig",
-                "observedAtMs": t_obs,
-                "frameSha": frame_sha,
-                "side": side if side in ("buy", "sell") else None,
-            }
-            self._axiom_diag_locked(rid, "axiomUserTxAdopted")
-            self._add_event_locked(rid, {
-                "t": t_obs, "tw": _wall_iso(), "kind": "ws_success", "platform": AXIOM_PLATFORM,
-                "host": host, "sha": frame_sha,
-            })
-            return leg
+            return self._observe_axiom_user_tx_locked(
+                lambda leg: leg.get("_axiomSig") == sig, sig, False, side, t_obs, frame_sha, host)
+
+    def observe_axiom_evm_user_tx(self, key, side, t_obs, frame_sha, host):
+        """v10.38: a bnb-v2|rh-v2 user-tx entry (chainId, lowercase hash) is the platform success of the Axiom EVM
+        order leg with that exact (chainId, hash) — never an approve leg. Same gates as Solana (open window,
+        at/after the send, first adoption frozen). Returns the leg on adoption, else None."""
+        with self.lock:
+            return self._observe_axiom_user_tx_locked(
+                lambda leg: leg.get("_axiomEvmKey") == key, key[1], True, side, t_obs, frame_sha, host)
+
+    def _observe_axiom_user_tx_locked(self, match, tx_hash, order_only, side, t_obs, frame_sha, host):
+        """(lock held) Shared Axiom user-tx adoption (Solana and EVM). order_only: EVM — approve legs never bind."""
+        rids = self._open_run_ids_locked(time.monotonic())
+        rid0 = rids[0] if rids else None
+        hits = [
+            leg for rid in rids for leg in self.legs.get(rid, [])
+            if leg.get("platform") == AXIOM_PLATFORM and match(leg)
+        ]
+        if len(hits) != 1:
+            self._axiom_diag_locked(rid0, "axiomUserTxNoLeg" if not hits else "axiomUserTxAmbiguous")
+            return None
+        leg = hits[0]
+        rid = leg.get("runId")
+        if (
+            leg.get("windowClosed") or leg.get("_anchorVeto") or leg.get("dup")
+            or (order_only and leg.get("anchorRole") != "order")
+        ):
+            self._axiom_diag_locked(rid, "axiomUserTxLegIneligible")
+            return None
+        t0 = leg.get("tOrderOutMs")
+        if not isinstance(t0, (int, float)) or t_obs < t0:
+            self._axiom_diag_locked(rid, "axiomUserTxBeforeSend")
+            return None
+        if leg.get("tSuccessPushMs") is not None:
+            self._axiom_diag_locked(rid, "axiomUserTxRepeat")
+            return None
+        leg["tSuccessPushMs"] = t_obs
+        leg["wsSha"] = frame_sha
+        leg["successAnchorKeys"] = ["txHash"]
+        digest = hashlib.sha256(tx_hash.encode()).hexdigest()
+        leg["successEvidence"] = {
+            "version": 1,
+            "platform": AXIOM_PLATFORM,
+            "channel": AXIOM_SUCCESS_CHANNEL,
+            "status": "success",
+            "txHash": tx_hash,
+            "txDigest": "-".join(digest[i:i+16] for i in range(0, 64, 16)),
+            "matchedKeys": ["txHash"],
+            "correlation": "user-tx-room+send-sig",
+            "observedAtMs": t_obs,
+            "frameSha": frame_sha,
+            "side": side if side in ("buy", "sell") else None,
+        }
+        self._axiom_diag_locked(rid, "axiomUserTxAdopted")
+        self._add_event_locked(rid, {
+            "t": t_obs, "tw": _wall_iso(), "kind": "ws_success", "platform": AXIOM_PLATFORM,
+            "host": host, "sha": frame_sha,
+        })
+        return leg
 
     # ── v10.36 Axiom EVM ──────────────────────────────────────────────────────
     def note_axiom_evm_send_unproven(self, window, transport, reason, t_obs):
@@ -7535,7 +7594,7 @@ class SpeedexHkTiming:
     def _handle_axiom_evm_send(flow, window, transport, host, path, t_obs, t_wall, t_wall_ms):
         """v10.36 Axiom EVM send (exact host + POST + path already matched). Head snapshot frozen at hook entry;
         the body is decoded in memory for hash/chainId/nonce/call class only (raw, r/s, headers dropped).
-        Order-out only: no success channel exists on EVM, so no receipt poll is started."""
+        v10.38: a new order leg (not approve) starts the existing exact-hash EVM receipt poll (HK-L3′)."""
         head_snapshots = HEADS.snapshot(window[0], t_obs)
         body = _request_bytes(flow.request)
         status, txs, reason = _axiom_evm_send_txs(transport, getattr(flow.request, "headers", {}), body)
@@ -7562,7 +7621,16 @@ class SpeedexHkTiming:
                 "orderRequestSource": AXIOM_EVM_SEND_SOURCE,
                 "transport": transport,
             }
-            rid, leg, _verdict = STORE.axiom_evm_send_in_open_window(window, ev, facts, transport)
+            rid, leg, verdict = STORE.axiom_evm_send_in_open_window(window, ev, facts, transport)
+            if leg is not None and verdict == "new" and leg.get("anchorRole") == "order":
+                # Exact hash + chain known at the request: start the EVM receipt observation (HK-L3′).
+                h = STORE.claim_receipt_poll(leg)
+                if h:
+                    threading.Thread(
+                        target=_poll_receipt,
+                        args=(rid, leg, leg.get("chain"), h, _jsonrpc),
+                        daemon=True,
+                    ).start()
             if leg is not None and not any(x is leg for x, _ in legs):
                 legs.append((leg, rid))
         if legs:
@@ -7917,8 +7985,12 @@ class SpeedexHkTiming:
                     ).hexdigest()[:16]
                     # v10.35: each distinct signature of the frame is tried against the send legs on its own
                     # (exact signature match; all gates per entry); same frame time t_obs for every entry.
-                    for sig, side in entries:
-                        STORE.observe_axiom_user_tx(sig, side, t_obs, frame_sha, host)
+                    # v10.38: EVM entries (tuple keys) bind by exact (chainId, hash) on the order leg.
+                    for key, side in entries:
+                        if isinstance(key, tuple):
+                            STORE.observe_axiom_evm_user_tx(key, side, t_obs, frame_sha, host)
+                        else:
+                            STORE.observe_axiom_user_tx(key, side, t_obs, frame_sha, host)
             return
         if AXIOM_HELIUS_WS_HOST_RE.fullmatch(host or ""):
             # v10.33: Axiom page Helius signatureSubscribe → mapped signatureNotification (err null) →

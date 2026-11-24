@@ -7046,7 +7046,7 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.11.23-axiom-evm-v10.37")
+        self.assertEqual(A.ADDON_VERSION, "2026.11.24-axiom-evm-push-v10.38")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 
@@ -11440,7 +11440,7 @@ class TestGmgnTradeHashV1032(unittest.TestCase):
             self.assertNotIn(self.WALLET, dumped, name)
             self.assertNotIn("122142992", dumped, name)
         self.assertEqual(surfaces["health"]["diag"].get("gmgnTradeHashArrivals"), 1)
-        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.23-axiom-evm-v10.37")
+        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.24-axiom-evm-push-v10.38")
 
 
 class TestAxiomSolana(unittest.TestCase):
@@ -11932,7 +11932,7 @@ class TestAxiomSolana(unittest.TestCase):
             for s in secrets:
                 self.assertNotIn(s, dumped, (name, s[:24]))
         self.assertIn(sig, json.dumps(surfaces["timelineFull"]), "the public signature is the anchor")
-        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.23-axiom-evm-v10.37")
+        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.24-axiom-evm-push-v10.38")
         self.assertEqual(surfaces["health"]["diag"].get("axiomUserTxAdopted"), 1)
 
     # ── v10.34: opaque api body prefix ──
@@ -12333,7 +12333,7 @@ _APPROVE_DATA = bytes.fromhex("095ea7b3") + b"\x00" * 12 + b"\x5b" * 20 + b"\xff
 class TestAxiomEvm(unittest.TestCase):
     """v10.36: Axiom EVM (BSC + Robinhood) order-out legs. Sends on api.axiom.trade /wo/batched-(bnb|rh)-send-tx
     and the Robinhood sequencer eth_sendRawTransaction; legs keyed by (chainId, hash); same-hash fanout folds;
-    approve txs are their own legs; unauthorized chains counted; no success channel. Txs are signed in the test
+    approve txs are their own legs; unauthorized chains counted (v10.38 success push: TestAxiomEvmPushV1038). Txs are signed in the test
     with a throwaway key (see _EVM_TEST_KEY); cookies/keys are synthetic."""
 
     COOKIE = "synthetic-axiom-evm-cookie-value-42"
@@ -12457,7 +12457,7 @@ class TestAxiomEvm(unittest.TestCase):
         self.assertIsNotNone(s["slot"], "the swap binds the axiom×bsc slot")
         self.assertEqual((a["chain"], a["anchorRole"], a["txHash"], a["tOrderOutMs"], a["slot"], a["unbound"]),
                          ("bsc", "approve", h_appr, t_appr, None, False), "approve never takes a slot")
-        self.assertEqual(self.polls, [], "order-out only: no receipt poll")
+        self.assertEqual(self.polls, [h_swap], "v10.38: the order leg polls its exact-hash receipt; approve does not")
         self.assertEqual(A.STORE.diag["axiomEvmSendLeg"], 1)
         self.assertEqual(A.STORE.diag["axiomEvmSendApproveLeg"], 1)
         A.STORE.mark_close(self.run)
@@ -12670,7 +12670,7 @@ class TestAxiomEvm(unittest.TestCase):
         self.assertNotIn("speedex_axiom_evm_legs", f.metadata, "Solana keeps the single-leg metadata shape")
         self.assertEqual(f.metadata["speedex_leg"], (sol_leg, self.run))
         self.assertEqual(sol_leg["tFirstRespMs"], t_sol)
-        self.assertEqual(self.polls, [sig], "Solana receipt poll as before; none for EVM")
+        self.assertEqual(self.polls, [sig, h], "Solana receipt poll as before; v10.38 EVM order leg polls too")
         self.assertEqual((evm_leg["chain"], evm_leg["txHash"]), ("bsc", h))
         self.clock += 300
         frame = FakeFlow("cluster9.axiom.trade", "/", "GET")
@@ -12684,6 +12684,291 @@ class TestAxiomEvm(unittest.TestCase):
         self.assertNotIn("axiomEvmSend", sol_row["evidence"])
         self.assertEqual(sol_row["evidence"]["axiomSend"],
                          {"firstTransport": "axiom-api", "transports": {"axiom-api": 1}, "conflict": False})
+
+
+_EVM_TEST_ADDR = "0x" + "3e" * 20  # synthetic wallet (content[5] shape only; never compared)
+_EVM_OTHER_ADDR = "0x" + "9f" * 20  # another synthetic wallet
+
+
+class TestAxiomEvmPushV1038(unittest.TestCase):
+    """v10.38: Axiom EVM success push from cluster*.axiom.trade rooms bnb-v2|user-tx:<id> / rh-v2|user-tx:<id>.
+    Adopted only on the order leg of the same exact (chainId, hash); content[4]/[5] are shape-checked only. Order
+    legs poll the exact-hash receipt from the send. Wallet/user/pair/token values are synthetic; txs are signed
+    with the throwaway test key."""
+
+    USER = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"  # synthetic user uuid
+    PAIR = "0x" + "5c" * 20  # synthetic pair address
+    TOKEN = "0x" + "7d" * 20  # synthetic token address
+    # same send harness as TestAxiomEvm (borrowed, not inherited, so its tests are not collected twice)
+    COOKIE = TestAxiomEvm.COOKIE
+    setUp = TestAxiomEvm.setUp
+    open = TestAxiomEvm.open
+    post = TestAxiomEvm.post
+    legs = TestAxiomEvm.legs
+    rows = TestAxiomEvm.rows
+
+    def frame_obj(self, tx_hash, side="buy", chain="bnb", wallet=None, content=None, room=None):
+        wallet = _EVM_TEST_ADDR if wallet is None else wallet
+        if content is None:
+            content = [tx_hash, "2026-11-24T08:00:00.000Z", side, self.PAIR, self.TOKEN, wallet]
+            content += [0.5, 1200.0, 0.01, 3, 0.0, 1, 2, 0.0, 0.0, 0, 0, 48000123, 0, "axiom", 7]
+        return {"room": room or f"{chain}-v2|user-tx:{self.USER}", "seq": "1795000000000-0", "content": content}
+
+    def frame(self, payload, is_text=True, host="cluster9.axiom.trade"):
+        if not isinstance(payload, (str, bytes)):
+            payload = json.dumps(payload, separators=(",", ":"))
+        msg = FakeWSMsg(payload)
+        msg.is_text = is_text
+        f = FakeFlow(host, "/", "GET")
+        f.websocket = types.SimpleNamespace(messages=[msg])
+        A.addons[0].websocket_message(f)
+
+    def swap(self, chain_id=56, nonce=4, transport=None):
+        raw, h = _evm_type2_tx(chain_id, nonce, _SWAP_DATA)
+        self.post(transport or ("axiom-bnb-api" if chain_id == 56 else "axiom-rh-api"), [raw])
+        leg = next(x for x in self.legs() if x["txHash"] == h)
+        return leg, h, raw
+
+    def adopted(self):
+        return A.STORE.diag.get("axiomUserTxAdopted", 0)
+
+    # ── parser ──
+    def test_evm_item_and_room_parse(self):
+        h = "0x" + "AB" * 32
+        wallet = "0x" + "C" * 40
+        self.assertEqual(A._axiom_user_tx_item(self.frame_obj(h, "sell", wallet=wallet)),
+                         (None, (56, h.lower()), "sell"))
+        self.assertEqual(A._axiom_user_tx_item(self.frame_obj(h, chain="rh"))[1][0], 4663)
+        self.assertEqual(A._axiom_user_tx_frame(json.dumps(self.frame_obj(h))),
+                         (["axiomUserTx"], [((56, h.lower()), "buy")]))
+        _, sol_sig = TestAxiomSolana.tx()
+        base = self.frame_obj(h)["content"]
+        room = "bnb-v2|user-tx:" + self.USER
+        cases = [
+            ("room", {"room": "eth-v2|user-tx:" + self.USER, "content": base}),
+            ("room", {"room": "bnb-v2|user-tx:short", "content": base}),
+            ("room", {"room": "bnb-v2|t:" + self.TOKEN + "|user-tx:" + self.USER, "content": base}),
+            ("room", {"room": "bnb-v2|balance-updates-user:" + self.USER + "|user-tx:", "content": base}),
+            ("hash", {"room": room, "content": [sol_sig] + base[1:]}),
+            ("hash", {"room": room, "content": ["0x" + "ab" * 31] + base[1:]}),
+            ("hash", {"room": room, "content": ["ab" * 32] + base[1:]}),
+            ("sig", {"room": "sol-v2|user-tx:" + self.USER, "content": base}),
+            ("at", {"room": room, "content": [h, None] + base[2:]}),
+            ("side", {"room": room, "content": [h, "t", "swap"] + base[3:]}),
+            ("pair", {"room": room, "content": [h, "t", "buy", None] + base[4:]}),
+            ("content-len-4", {"room": room, "content": base[:4]}),
+            ("content-len-5", {"room": room, "content": base[:5]}),
+            ("token", {"room": room, "content": base[:4] + [None] + base[5:]}),
+            ("token", {"room": room, "content": base[:4] + ["0x" + "7d" * 19] + base[5:]}),  # 39 bytes
+            ("token", {"room": room, "content": base[:4] + ["7d" * 20] + base[5:]}),  # no 0x
+            ("token", {"room": room, "content": base[:4] + ["PEPE"] + base[5:]}),  # symbol, not address
+            ("wallet", {"room": room, "content": base[:5] + ["0x" + "c" * 39] + base[6:]}),
+            ("wallet", {"room": room, "content": base[:5] + [None] + base[6:]}),
+            ("content-type", {"room": room, "content": {"0": h}}),
+        ]
+        for reason, obj in cases:
+            with self.subTest(reason=reason, room=obj["room"][:12]):
+                self.assertIn(reason, A.AXIOM_USER_TX_INVALID_REASONS)
+                self.assertEqual(A._axiom_user_tx_frame(json.dumps(obj)), (["axiomUserTxInvalid." + reason], []))
+        self.assertEqual(A._axiom_user_tx_frame(b"\x93\xa5room\xafbnb-v2|user-tx:" + bytes(range(0x80, 0x90)),
+                                                False), (["axiomUserTxInvalid.binary"], []))
+        # same (chainId, hash) with both sides in one frame → ambiguous, not returned; a second item with another
+        # (shape-valid) wallet is not a conflict: the wallet is never compared
+        other = "0x" + "cd" * 32
+        self.assertEqual(A._axiom_user_tx_frame(json.dumps([self.frame_obj(h), self.frame_obj(h, "sell")])),
+                         (["axiomUserTxAmbiguousSide"], []))
+        self.assertEqual(A._axiom_user_tx_frame(json.dumps([self.frame_obj(h), self.frame_obj(h, "sell"),
+                                                            self.frame_obj(other, "sell")])),
+                         (["axiomUserTxAmbiguousSide", "axiomUserTx"], [((56, other), "sell")]))
+        self.assertEqual(A._axiom_user_tx_frame(json.dumps([self.frame_obj(h), self.frame_obj(h, wallet=wallet)])),
+                         (["axiomUserTx"], [((56, h.lower()), "buy")]))
+        # same hash on two chains is two identities; mixed Solana + EVM batch keeps frame order
+        self.assertEqual(A._axiom_user_tx_frame(json.dumps([self.frame_obj(h), self.frame_obj(h, chain="rh"),
+                                                            TestAxiomSolana.frame_obj(TestAxiomSolana, sol_sig)])),
+                         (["axiomUserTx"], [((56, h.lower()), "buy"), ((4663, h.lower()), "buy"),
+                                            (sol_sig, "buy")]))
+
+    # ── adoption ──
+    def test_bsc_buy_success_l1a_and_receipt_l3(self):
+        self.open([{"platform": "axiom", "chain": "bsc", "rounds": 1}])
+        leg, h, _ = self.swap(56, 4)
+        self.assertEqual(self.polls, [h], "the exact-hash receipt poll starts at the send")
+        t0 = leg["tOrderOutMs"]
+        self.clock += 1012.5
+        # live frames may carry mixed-case hex: matched case-insensitively, stored lowercase
+        self.frame(self.frame_obj(h.upper().replace("0X", "0x"), wallet=_EVM_TEST_ADDR.upper().replace("0X", "0x")))
+        self.assertEqual(leg["tSuccessPushMs"], self.clock)
+        ev = leg["successEvidence"]
+        digest = __import__("hashlib").sha256(h.encode()).hexdigest()
+        self.assertEqual(ev, {
+            "version": 1, "platform": "axiom", "channel": "axiom-user-tx-ws", "status": "success", "txHash": h,
+            "txDigest": "-".join(digest[i:i + 16] for i in range(0, 64, 16)), "matchedKeys": ["txHash"],
+            "correlation": "user-tx-room+send-sig", "observedAtMs": self.clock, "frameSha": leg["wsSha"],
+            "side": "buy"})
+        self.assertEqual(set(ev), set(TestAxiomSolanaEvidenceKeys.KEYS), "same evidence shape as Solana Axiom")
+        self.assertEqual((A.STORE.diag["axiomUserTx"], self.adopted(), A.STORE.run_diag[self.run]["axiomUserTxAdopted"]),
+                         (1, 1, 1))
+        self.clock += 50
+        self.frame(self.frame_obj(h))  # repeat: first observation frozen
+        self.assertEqual(leg["tSuccessPushMs"], self.clock - 50)
+        self.assertEqual(A.STORE.diag["axiomUserTxRepeat"], 1)
+        self.clock += 400
+        A._settle_receipt(leg, {"rpc": "stub", "chain": "bsc", "pollIntervalMs": 800, "status": 1,
+                                "blockHash": "0x" + "11" * 32, "blockNumber": "0x2dc6c0b"})
+        A.STORE.mark_close(self.run)
+        tl = A.STORE.timeline(self.run, full=True)
+        row = self.rows()[0]
+        self.assertEqual((row["incomplete"], row["hkL1aMs"], row["hkL3Ms"], row["tReceiptMs"], row["anchorVeto"]),
+                         (None, 1012.5, 1462.5, t0 + 1462.5, False))
+        self.assertEqual(row["evidence"]["success"]["txHash"], h)
+        self.assertEqual(row["evidence"]["receipt"]["chain"], "bsc")
+        self.assertEqual((tl["counts"]["attempted"], tl["counts"]["observed"]), (1, 1))
+        short = next(r for r in A.STORE.timeline(self.run)["legs"] if r.get("platform") == "axiom")
+        self.assertNotEqual(short["evidence"]["success"]["txHash"], h, "default timeline shortens the hash")
+
+    def test_binds_on_exact_hash_regardless_of_wallet(self):
+        """The exact (chainId, hash) pins the signed tx; content[5] is shape-checked only, never compared."""
+        self.open([{"platform": "axiom", "chain": "bsc", "rounds": 2}, {"platform": "axiom", "chain": "robinhood",
+                                                                      "rounds": 1}])
+        leg, h, _ = self.swap(56, 4)
+        leg2, h2, _ = self.swap(56, 5)
+        leg3, h3, _ = self.swap(4663, 1)
+        self.clock += 700
+        self.frame(self.frame_obj(h, wallet=_EVM_OTHER_ADDR))
+        self.frame(self.frame_obj(h2, "sell", wallet="0x" + "AbCdEf" * 6 + "abcd"))
+        self.frame(self.frame_obj(h3, chain="rh", wallet="0x" + "0" * 40))
+        for x in (leg, leg2, leg3):
+            self.assertEqual(x["tSuccessPushMs"], self.clock)
+        self.assertEqual(self.adopted(), 3)
+        self.assertFalse([k for k in A.STORE.diag if "Sender" in k], "no sender counters exist any more")
+
+    def test_rh_buy_api_and_sequencer_fanout(self):
+        self.open([{"platform": "axiom", "chain": "robinhood", "rounds": 1}])
+        raw, h = _evm_type2_tx(4663, 2, _SWAP_DATA)
+        self.post("axiom-rh-api", [raw])
+        self.clock += 2
+        self.post("rh-sequencer", [raw])
+        (leg,) = self.legs()
+        self.assertEqual((leg["_axiomEvmSend"]["fanout"], self.polls), (2, [h]), "one leg, one poll")
+        self.clock += 398
+        self.frame(self.frame_obj(h, chain="rh"))
+        self.assertEqual(leg["tSuccessPushMs"] - leg["tOrderOutMs"], 400)
+        self.clock += 300
+        A._settle_receipt(leg, {"rpc": "stub", "chain": "robinhood", "pollIntervalMs": 800, "status": 1,
+                                "blockHash": "0x" + "22" * 32, "blockNumber": "0x99"})
+        A.STORE.mark_close(self.run)
+        row = self.rows()[0]
+        self.assertEqual((row["chain"], row["incomplete"], row["hkL1aMs"], row["hkL3Ms"]), ("robinhood", None, 400, 700))
+
+    def test_buy_and_sell_frames_each_on_own_leg(self):
+        self.open([{"platform": "axiom", "chain": "bsc", "rounds": 2}])
+        buy, h_buy, _ = self.swap(56, 4)
+        self.clock += 1000
+        self.frame(self.frame_obj(h_buy))
+        self.clock += 3000
+        sell, h_sell, _ = self.swap(56, 5)
+        self.clock += 900
+        # one frame carrying the previous buy (repeat) and this sell: the sell is adopted on the sell leg
+        self.frame([self.frame_obj(h_buy), self.frame_obj(h_sell, "sell")])
+        self.assertEqual(sell["tSuccessPushMs"] - sell["tOrderOutMs"], 900)
+        self.assertEqual((buy["successEvidence"]["side"], sell["successEvidence"]["side"]), ("buy", "sell"))
+        self.assertEqual(buy["tSuccessPushMs"] - buy["tOrderOutMs"], 1000)
+        self.assertEqual((self.adopted(), A.STORE.diag["axiomUserTxRepeat"]), (2, 1))
+
+    def test_rejections(self):
+        self.open([{"platform": "axiom", "chain": "bsc", "rounds": 1}, {"platform": "axiom", "chain": "robinhood",
+                                                                      "rounds": 1}])
+        leg, h, _ = self.swap(56, 4)
+        appr, h_appr = _evm_type2_tx(56, 5, _APPROVE_DATA)
+        self.post("axiom-bnb-api", [appr])
+        appr_leg = next(x for x in self.legs() if x["txHash"] == h_appr)
+        self.assertEqual(self.polls, [h], "approve legs never poll")
+        self.clock += 600
+        diag = A.STORE.diag
+        steps = [
+            (self.frame_obj(h, chain="rh"), "axiomUserTxNoLeg"),  # BSC hash in the Robinhood room
+            (self.frame_obj("0x" + "ee" * 32), "axiomUserTxNoLeg"),  # other hash
+            (self.frame_obj(h_appr), "axiomUserTxLegIneligible"),  # approve-leg hash
+            ([self.frame_obj(h), self.frame_obj(h, "sell")], "axiomUserTxAmbiguousSide"),  # side conflict
+            (self.frame_obj(h, wallet="0x" + "9" * 39), "axiomUserTxInvalid.wallet"),  # wallet shape still checked
+            (self.frame_obj(h, content=self.frame_obj(h)["content"][:5]), "axiomUserTxInvalid.content-len-5"),
+            (self.frame_obj(h, room="bnb-v2|user-tx:x"), "axiomUserTxInvalid.room"),
+        ]
+        for payload, key in steps:
+            with self.subTest(key=key):
+                before = diag.get(key, 0)
+                self.frame(payload)
+                self.assertEqual(diag.get(key, 0), before + 1)
+                self.assertIsNone(leg["tSuccessPushMs"])
+                self.assertIsNone(appr_leg["tSuccessPushMs"])
+        before = diag.get("axiomUserTxInvalid.binary", 0)
+        self.frame(b"\x93\xa5room\xafbnb-v2|user-tx:" + bytes(range(0x80, 0x90)), is_text=False)
+        self.assertEqual(diag["axiomUserTxInvalid.binary"], before + 1)
+        self.frame(self.frame_obj(h), host="cluster9.axiom.trade.evil.example")  # other host: not dispatched
+        self.assertIsNone(leg["tSuccessPushMs"])
+        # before the send hook (stale/replay) is not adopted
+        self.clock = leg["tOrderOutMs"] - 1
+        self.frame(self.frame_obj(h))
+        self.assertEqual(diag["axiomUserTxBeforeSend"], 1)
+        # the rejections consumed nothing: the exact frame still binds
+        self.clock = leg["tOrderOutMs"] + 1100
+        self.frame(self.frame_obj(h))
+        self.assertEqual(leg["tSuccessPushMs"], leg["tOrderOutMs"] + 1100)
+        A.STORE.mark_close(self.run)
+        rows = {r["anchorRole"]: r for r in self.rows()}
+        self.assertEqual(rows["approve"]["incomplete"], "no-success-observed")
+        self.assertIsNone(rows["approve"]["evidence"]["success"])
+
+    def test_closed_window_and_no_frame(self):
+        self.open([{"platform": "axiom", "chain": "bsc", "rounds": 2}])
+        leg, h, _ = self.swap(56, 4)
+        leg2, h2, _ = self.swap(56, 6)
+        # a receipt alone is not success: no frame → no-success-observed stays
+        self.clock += 1500
+        A._settle_receipt(leg2, {"rpc": "stub", "chain": "bsc", "pollIntervalMs": 800, "status": 1,
+                                 "blockHash": "0x" + "33" * 32, "blockNumber": "0x1"})
+        A.STORE.mark_close(self.run)
+        self.frame(self.frame_obj(h))
+        self.assertIsNone(leg["tSuccessPushMs"])
+        rows = {r["txHash"]: r for r in self.rows()}
+        self.assertEqual((rows[h]["incomplete"], rows[h]["hkL1aMs"]), ("no-success-observed", None))
+        self.assertEqual((rows[h2]["incomplete"], rows[h2]["hkL1aMs"]), ("no-success-observed", None))
+        self.assertIsNotNone(rows[h2]["hkL3Ms"])
+
+    def test_no_wallet_user_pair_or_raw_persisted(self):
+        self.open([{"platform": "axiom", "chain": "bsc", "rounds": 1}])
+        leg, h, raw = self.swap(56, 4)
+        self.clock += 1000
+        self.frame(self.frame_obj(h))
+        self.frame(self.frame_obj(h, wallet=_EVM_OTHER_ADDR))
+        A.STORE.mark_close(self.run)
+        dump = json.dumps([A.STORE.timeline(self.run, full=True), A.STORE.timeline(self.run),
+                           list(A.STORE.events[self.run]), dict(A.STORE.diag),
+                           {k: dict(v) for k, v in A.STORE.run_diag.items()}], default=str).lower()
+        for value in (_EVM_TEST_ADDR, _EVM_OTHER_ADDR, self.USER, self.PAIR, self.TOKEN, raw[2:].lower(),
+                      raw[-130:].lower(), "2026-11-24t08:00:00", "48000123", self.COOKIE.lower()):
+            self.assertNotIn(value.lower(), dump)
+        self.assertFalse([k for k in A.STORE.diag if k.startswith("axiomUserTxInvalid.")
+                          and k[len("axiomUserTxInvalid."):] not in A.AXIOM_USER_TX_INVALID_REASONS])
+
+
+class TestAxiomSolanaEvidenceKeys(unittest.TestCase):
+    """The success-evidence key set of a Solana Axiom leg (the EVM shape is asserted equal to it)."""
+
+    KEYS = ("version", "platform", "channel", "status", "txHash", "txDigest", "matchedKeys", "correlation",
+            "observedAtMs", "frameSha", "side")
+
+    def test_solana_evidence_keys(self):
+        t = TestAxiomSolana("test_user_tx_frame_is_success")
+        t.setUp()
+        try:
+            raw, sig = t.tx()
+            t.send("axiom-api", raw)
+            t.clock += 100
+            t.cluster(sig)
+            self.assertEqual(set(t.axiom_legs()[0]["successEvidence"]), set(self.KEYS))
+        finally:
+            t.doCleanups()
 
 
 if __name__ == "__main__":

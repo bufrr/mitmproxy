@@ -323,9 +323,9 @@ EU consumer: `axiomAddonSupported` (`web/shared-push-timing.mjs`) accepts `-v10.
 ## 2026.11.23-axiom-evm-v10.36
 
 Axiom EVM (BSC + Robinhood) order-out legs (live captures 2026-11-23). New `orderRequestSource="axiom-evm-send"` on platform
-`axiom`. **EVM has order-out legs only**: Axiom has no hash-carrying platform success push on EVM (the client-socket room
-`<bnb-v2|rh-v2>|balance-updates-user:<uuid>` carries no tx hash), so there is no success adoption, no HK-L1a′ and no
-receipt poll for these legs. Axiom Solana (`axiom-solana-send`, user-tx success, Helius arrival) is byte-identical.
+`axiom`. In v10.36/v10.37 EVM legs were order-out only (no success adoption, no HK-L1a′, no receipt poll); **v10.38 adds
+the success push and the receipt poll** (see below). Axiom Solana (`axiom-solana-send`, user-tx success, Helius arrival)
+is byte-identical.
 
 - **Sends (request hook, Origin exactly `https://axiom.trade`)**: `POST api.axiom.trade/wo/batched-bnb-send-tx`
   (transport `axiom-bnb-api`) and `/wo/batched-rh-send-tx` (`axiom-rh-api`), JSON object whose `txs` is a list of 1–4 raw
@@ -351,7 +351,7 @@ receipt poll for these legs. Axiom Solana (`axiom-solana-send`, user-tx success,
 - **Chain authorization**: with a detail manifest, a tx whose chain has no axiom (or platform-less) spec gets no leg and
   counts `axiomEvmSendChainUnauthorized`. Without a detail manifest there is nothing to check (same as other platforms).
 - **Timeline**: `evidence.axiomEvmSend={chainId, nonce, call, firstTransport, transports:{<transport>: n}, fanout}`;
-  `txHash` = the decoded hash; at window close `incomplete="no-success-observed"`, `hkL1aMs`/`hkL3Ms` null. The response
+  `txHash` = the decoded hash; without a success frame (v10.38) `incomplete="no-success-observed"`, `hkL1aMs` null. The response
   hook records only `axiom_send_ack` (transport/status), never the response body.
 - **Decrypt scope**: production and experiment units add exactly `sequencer\.mainnet\.chain\.robinhood\.com` (overlay
   section 2026-11-23). `api.axiom.trade` was already intercepted for Solana (v10.33) and covers both EVM send paths.
@@ -361,7 +361,7 @@ EU consumer: must run with v10.36 — accept `-v10.36` in `axiomAddonSupported` 
 `orderRequestSource` `axiom-evm-send`, `anchorRole` `approve` (excluded from attempted/metrics like other non-order roles),
 `evidence.axiomEvmSend` and the diag keys `axiomEvmSendLeg|ApproveLeg|Fold|ChainUnauthorized`, `axiomEvmSequencerOther`,
 `axiomEvmSendUnproven.<transport>.<reason>` in hk-timing-client / public-projector / shared-push-timing /
-docs/hk-proxy-timing.md. Axiom EVM legs supply no push/L1a value.
+docs/hk-proxy-timing.md. (v10.36/v10.37: Axiom EVM legs supply no push/L1a value; v10.38 adds it.)
 
 ## 2026.11.23-axiom-evm-v10.37
 
@@ -378,5 +378,42 @@ Review fix for multi-tx Axiom EVM POSTs. In v10.36, the response hook set `tFirs
 - Every other path (other platforms, Axiom Solana) sets no list and keeps the single `speedex_leg` reference,
   unchanged.
 
-EU consumer: `axiomAddonSupported` (`web/shared-push-timing.mjs`) accepts `-v10.37` (≥ v10.33); no shape change, no
-consumer change.
+EU consumer: `axiomAddonSupported` (`web/shared-push-timing.mjs`) requires addon ≥ v10.38 for Axiom BSC/Robinhood (EVM
+captures through v10.37 read `hk-platform-unsupported`); Axiom Solana stays ≥ v10.33.
+
+## 2026.11.24-axiom-evm-push-v10.38
+
+Axiom BSC / Robinhood success push (live passive capture 2026-11-24 of the Axiom client-socket shared worker; the last
+BSC and RH batches through v10.37 counted these frames as `axiomUserTxInvalid.room`). Owner-approved 2026-11-24.
+
+- **Frames**: server frames on the same `cluster[a-z0-9-]*.axiom.trade` client socket as Solana, room
+  `bnb-v2|user-tx:<id>` (chainId 56) or `rh-v2|user-tx:<id>` (4663), id 8-64 `[0-9a-fA-F-]` as for `sol-v2`. content:
+  [0] tx hash `0x`+64 hex (case-insensitive, kept lowercase), [1] ISO time, [2] `buy`|`sell`, [3] pair, [4] token,
+  [5] wallet `0x`+40 hex (token and wallet must both be `0x`+40-hex addresses), then numbers (trailing items not read). One frame per trade; same JSON-array / NDJSON batch
+  rules as Solana (≤ 32, every valid entry tried on its own). Only (chainId, hash, side) leave the parser; time, pair,
+  token, wallet and id are shape checks only and are never kept or compared.
+- **Binding (hash only)**: an entry binds to the Axiom EVM leg with the same chainId (from the room) and the exact
+  lowercase hash, `anchorRole:"order"` only (an approve leg → `axiomUserTxLegIneligible`), in an open window, at/after its
+  send hook, first adoption frozen — the Solana gates, one shared implementation (`_observe_axiom_user_tx_locked`). The
+  hash is keccak256 of the signed raw tx, so an exact (chainId, hash) match pins the tx and its signer; like Solana's
+  exact-signature binding, no wallet is compared (wallet/token consistency is checked runner-side). A hash in the other
+  chain's room has no leg (`axiomUserTxNoLeg`). One (chainId, hash) with both sides in one frame →
+  `axiomUserTxAmbiguousSide`, not adopted.
+- **Success evidence**: identical shape to Solana Axiom legs — `successEvidence={version:1, platform:"axiom",
+  channel:"axiom-user-tx-ws", status:"success", txHash:<lowercase 0x hash>, txDigest, matchedKeys:["txHash"],
+  correlation:"user-tx-room+send-sig", observedAtMs, frameSha, side}`, `tSuccessPushMs` = frame hook entry, `hkL1aMs`.
+- **Receipt / L3**: a new Axiom EVM order leg starts the existing exact-hash EVM receipt poll at its send
+  (`claim_receipt_poll` → `_poll_receipt`, `eth_getTransactionReceipt` on `CHAINS[bsc|robinhood]` RPCs, transactionHash ≡
+  leg hash, status 1, block identity), the same mechanism OKX/GMGN EVM legs use. An order leg with its success frame
+  ends like an OKX BSC leg: `incomplete:null`, `tSuccessPushMs`, `tReceiptMs`, `hkL1aMs`, `hkL3Ms`. No success frame →
+  `no-success-observed` as before (a receipt alone is never success; `hkL3Ms` may still be set, as for OKX legs).
+  Approve legs: no poll, no success.
+- **Counters** (fixed names, no values): existing `axiomUserTx`, `axiomUserTxAdopted|Repeat|BeforeSend|LegIneligible|NoLeg|
+  Ambiguous|AmbiguousSide`, no new counter; `AXIOM_USER_TX_INVALID_REASONS` adds `hash` (EVM content[0] shape),
+  `content-len-4`, `content-len-5`, `token`, `wallet`.
+- **Decrypt scope**: unchanged. The frames arrive on the already-intercepted `cluster*.axiom.trade`; receipt polls are the
+  addon's own outbound RPC calls (not proxied traffic), so no allow_hosts change.
+
+EU consumer: requires addon ≥ v10.38 for Axiom BSC/Robinhood (`axiomAddonSupported` minor ≥ 38 on EVM chains; older EVM
+captures read `hk-platform-unsupported`; Solana stays ≥ v10.33), reads the EVM
+success evidence and `hkL1aMs`/`hkL3Ms` of `axiom-evm-send` order legs, and registers the new invalid reasons.
