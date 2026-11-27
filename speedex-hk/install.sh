@@ -17,6 +17,11 @@
 #    flow_detail≥2/save_stream_file（全量抓包）；默认**只安装不启动**——启动须
 #    SOP（docs/plans/hk-selective-mitm.md）+ 当次授权 SPEEDEX_HK_EXP_START=1。
 #    addon 经 SPEEDEX_HK_CTRL_PORT 区分控制面端口（_ctrl_port()，非法回退 8072）。
+#  - SPEEDEX_HK_INSTANCE=local 安装**本机实例**（EU 主机自带 MITM 出口，2026-11-27）：独立 APP
+#    （/opt/speedex-mitm-local）、unit speedex-mitm-local、loopback-only 代理 8445 + 控制面 8073
+#    （端口避开 EU 侧 SSH 隧道段 18072-18271）、独立 CA confdir；allow_hosts 必须与生产 unit
+#    逐字一致（同口径采集）；须显式 SPEEDEX_HK_PYTHON（不跑 apt、不动本机系统 Python）；
+#    与实验实例共用隔离护栏，装完即 enable --now。
 set -euo pipefail
 umask 077
 
@@ -36,8 +41,15 @@ case "$INSTANCE" in
     CTRL_PORT=18072
     CA_BOOTSTRAP_PORT=28443
     ;;
+  local)
+    APP_DEFAULT=/opt/speedex-mitm-local
+    UNIT=speedex-mitm-local
+    LISTEN_PORT=8445
+    CTRL_PORT=8073
+    CA_BOOTSTRAP_PORT=28445
+    ;;
   *)
-    echo "install.sh: SPEEDEX_HK_INSTANCE 仅支持 production|experiment（收到：$INSTANCE）" >&2
+    echo "install.sh: SPEEDEX_HK_INSTANCE 仅支持 production|experiment|local（收到：$INSTANCE）" >&2
     exit 1
     ;;
 esac
@@ -52,8 +64,8 @@ SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP="$(realpath -m -- "$APP")"
 PROD_APP_REAL="$(realpath -m -- /opt/speedex-mitm)"
 
-if [ "$INSTANCE" = "experiment" ]; then
-  # 隔离护栏（fail-closed）：实验实例绝不得占用生产端口/路径/unit 名
+if [ "$INSTANCE" != "production" ]; then
+  # 隔离护栏（fail-closed）：实验/本机实例绝不得占用生产端口/路径/unit 名
   [ "$APP" != "$PROD_APP_REAL" ] && [ "${APP#"$PROD_APP_REAL"/}" = "$APP" ] || { echo "拒绝：实验实例不得使用生产 APP 目录或其子目录（规范化后：$APP）" >&2; exit 1; }
   [ "$LISTEN_PORT" != "8443" ] && [ "$CTRL_PORT" != "8072" ] || { echo "拒绝：实验实例不得使用生产端口 8443/8072" >&2; exit 1; }
   [ "$UNIT" != "speedex-mitm" ] || { echo "拒绝：实验实例不得使用生产 unit 名" >&2; exit 1; }
@@ -68,9 +80,19 @@ if [ "$INSTANCE" = "experiment" ]; then
   # 只查有效行——注释里对禁令的说明不触发
   ! grep -v '^[[:space:]]*#' "$SRC/$UNIT.service" | grep -Eq 'flow_detail=[23]|save_stream_file' || { echo "拒绝：实验 unit 含全量抓包选项（flow_detail≥2/save_stream_file）" >&2; exit 1; }
 fi
+if [ "$INSTANCE" = "local" ]; then
+  # 本机实例 = 与远端生产同口径采集：allow_hosts 行与生产 unit 逐字一致（不打印内容）
+  LOCAL_ALLOW="$(grep -o -- '--set "allow_hosts=[^"]*"' "$SRC/$UNIT.service" || true)"
+  PROD_ALLOW="$(grep -o -- '--set "allow_hosts=[^"]*"' "$SRC/speedex-mitm.service" || true)"
+  [ -n "$LOCAL_ALLOW" ] && [ "$LOCAL_ALLOW" = "$PROD_ALLOW" ] || { echo "拒绝：本机 unit allow_hosts 与生产 unit 不逐字一致" >&2; exit 1; }
+  # 不跑 apt、不改本机系统 Python：解释器必须显式给出（独立 3.12+，如 /opt/speedex-python/bin/python3）
+  [ -n "${SPEEDEX_HK_PYTHON:-}" ] || { echo "拒绝：local 实例须显式 SPEEDEX_HK_PYTHON（独立 Python ≥3.12）" >&2; exit 1; }
+fi
 
-apt-get update -qq
-apt-get install -y -qq python3-venv python3-pip
+if [ "$INSTANCE" != "local" ]; then
+  apt-get update -qq
+  apt-get install -y -qq python3-venv python3-pip
+fi
 # 目录创建即 0700；已有安装重验收紧
 install -d -m 700 "$APP"
 chmod 700 "$APP"
@@ -134,6 +156,8 @@ if [ ! -f "$APP/proxy.env" ]; then
   echo "== 已生成代理凭据（不打印——凭据见 $APP/proxy.env，0600）=="
   if [ "$INSTANCE" = "experiment" ]; then
     echo "   proxy 地址: 127.0.0.1:$LISTEN_PORT（loopback-only——经 SSH 隧道供隔离研究 Chrome）"
+  elif [ "$INSTANCE" = "local" ]; then
+    echo "   proxy 地址: 127.0.0.1:$LISTEN_PORT（loopback-only——本机研究 Chrome 直连）"
   else
     echo "   proxy 地址: $(curl -s -4 ifconfig.me || echo HK_IP):$LISTEN_PORT"
   fi
@@ -214,7 +238,7 @@ elif [ "$RESTART_NEEDED" = 1 ] && systemctl is-active --quiet "$UNIT"; then
 else
   systemctl enable --now "$UNIT"
 fi
-if [ "$INSTANCE" = "production" ] || [ "${SPEEDEX_HK_EXP_START:-0}" = "1" ]; then
+if [ "$INSTANCE" != "experiment" ] || [ "${SPEEDEX_HK_EXP_START:-0}" = "1" ]; then
   sleep 2
   systemctl is-active "$UNIT"
 fi

@@ -486,3 +486,64 @@ exec "$REALPY" "$@"
     fs.rmSync(fx.root, { recursive: true, force: true });
   }
 });
+
+// 本机实例（SPEEDEX_HK_INSTANCE=local，2026-11-27）：须显式 SPEEDEX_HK_PYTHON；不跑 apt；装 speedex-mitm-local
+// 并 enable --now；末尾打本机控制面 8073；本机 unit allow_hosts 与生产不一致 → 写入前拒绝。
+test('本机实例：缺 SPEEDEX_HK_PYTHON 拒绝；给定则不跑 apt、enable --now speedex-mitm-local、控制面 8073', async (t) => {
+  const fx = buildFixture({ active: false });
+  t.after(() => fs.rmSync(fx.root, { recursive: true, force: true }));
+  writeStub(path.join(fx.bin, 'apt-get'), `#!/bin/sh
+printf 'apt-get %s\\n' "$*" >> "$SYSTEMCTL_LOG"
+exit 0
+`);
+  const refused = runInstallRaw(fx, { SPEEDEX_HK_INSTANCE: 'local' });
+  assert.notEqual(refused.status, 0);
+  assert.match(refused.stderr, /SPEEDEX_HK_PYTHON/);
+  assert.ok(!fs.existsSync(fx.log), '拒绝发生在任何 apt/systemctl 之前');
+  const py312 = path.join(fx.root, 'py312');
+  writeStub(py312, STUBS.python3);
+  const out = runInstall(fx, { SPEEDEX_HK_INSTANCE: 'local', SPEEDEX_HK_PYTHON: py312 });
+  const log = await readFile(fx.log, 'utf8');
+  assert.doesNotMatch(log, /apt-get/, '本机实例不跑 apt');
+  assert.match(log, /systemctl enable --now speedex-mitm-local\n/);
+  assert.doesNotMatch(log, /speedex-mitm\n/, '不碰生产 unit');
+  assert.ok(fs.existsSync(path.join(fx.systemdDir, 'speedex-mitm-local.service')));
+  assert.ok(out.includes('控制面: 127.0.0.1:8073'));
+  for (const secret of [OLD_PASS, shaEntry('speedex', OLD_PASS)]) assert.ok(!out.includes(secret));
+});
+
+test('本机实例：unit allow_hosts 与生产 unit 不逐字一致 → 拒绝（不写 unit、不调 systemctl）', (t) => {
+  const fx = buildFixture({ active: false });
+  const src = fs.mkdtempSync(path.join(os.tmpdir(), 'speedex-hk-local-src-'));
+  t.after(() => {
+    fs.rmSync(fx.root, { recursive: true, force: true });
+    fs.rmSync(src, { recursive: true, force: true });
+  });
+  for (const f of ['install.sh', 'gen-htpasswd.sh', 'speedex-mitm.service', 'speedex-mitm-local.service', 'speedex_hk_timing.py']) {
+    fs.copyFileSync(path.join(HK_DIR, f), path.join(src, f));
+  }
+  const unitPath = path.join(src, 'speedex-mitm-local.service');
+  const before = fs.readFileSync(unitPath, 'utf8');
+  const tampered = before.replace('gmgn\\\\.ai|', '');
+  assert.notEqual(tampered, before, 'fixture must actually change allow_hosts');
+  fs.writeFileSync(unitPath, tampered);
+  const py312 = path.join(fx.root, 'py312');
+  writeStub(py312, STUBS.python3);
+  fs.rmSync(fx.log, { force: true });
+  let r;
+  try {
+    execFileSync('bash', [path.join(src, 'install.sh')], {
+      encoding: 'utf8',
+      env: installEnv(fx, { SPEEDEX_HK_INSTANCE: 'local', SPEEDEX_HK_PYTHON: py312 }),
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 60000,
+    });
+    r = { status: 0, stderr: '' };
+  } catch (e) {
+    r = { status: e.status, stderr: String(e.stderr || '') };
+  }
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /allow_hosts 与生产 unit 不逐字一致/);
+  assert.ok(!fs.existsSync(fx.log));
+  assert.ok(!fs.existsSync(path.join(fx.systemdDir, 'speedex-mitm-local.service')));
+});

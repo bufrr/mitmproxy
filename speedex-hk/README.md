@@ -433,3 +433,12 @@ Axiom client-socket host per egress (owner 2026-11-27: "fix the repo first … a
   `axiomAddonSupported` accepts v10.39 (Solana ≥ v10.33, EVM ≥ v10.38).
 - **Tests**: `test_socket_form_host_is_the_same_client_socket` (socket8 adopted as success, look-alikes not); install
   test allow/deny sets and overlay string.
+
+## Local instance (`SPEEDEX_HK_INSTANCE=local`, 2026-11-27)
+
+A MITM instance on the EU host itself (dashboard / research Chrome host), so EU-egress batches are captured with the same
+addon and the same `allow_hosts` as the remote nodes. `install.sh` local branch: APP `/opt/speedex-mitm-local`, unit
+`speedex-mitm-local.service`, proxy `127.0.0.1:8445` only (htpasswd auth), control plane `127.0.0.1:8073` (outside the EU
+side's SSH tunnel range 18072-18271), own CA confdir. It refuses to install unless the unit's `allow_hosts` line equals
+`speedex-mitm.service` byte for byte, requires an explicit `SPEEDEX_HK_PYTHON` (≥ 3.12; no apt, system Python untouched)
+and ends with `enable --now`. Consumer side: speedex registry node `local: true` (docs/hk-operations.md §1.2). Addon unchanged.

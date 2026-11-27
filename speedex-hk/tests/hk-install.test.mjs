@@ -137,6 +137,30 @@ test('实验端口漂移门：install.sh 实验分支 ↔ speedex-mitm-exp.servi
   assert.notEqual(exp.listen, exp.ctrl, '实验代理/控制面端口不得相同');
 });
 
+// 本机实例端口/口径门（2026-11-27）：install.sh local 分支常量 ↔ speedex-mitm-local.service 一致；
+// loopback-only；端口避开生产/实验与 EU 侧 SSH 隧道段 18072-18271；allow_hosts 与生产 unit 逐字一致。
+test('本机实例门：install.sh local 分支 ↔ speedex-mitm-local.service 一致、loopback-only、allow_hosts 同生产', () => {
+  const src = readSource('deploy/hk-proxy/install.sh');
+  const unit = readSource('deploy/hk-proxy/speedex-mitm-local.service');
+  const prodUnit = readSource('deploy/hk-proxy/speedex-mitm.service');
+  const block = src.match(/^\s*local\)([\s\S]*?);;/m);
+  assert.ok(block, 'install.sh 缺 local 分支');
+  const get = (key) => Number(block[1].match(new RegExp(`^\\s*${key}=(\\d+)\\s*$`, 'm'))?.[1]);
+  const local = { listen: get('LISTEN_PORT'), ctrl: get('CTRL_PORT') };
+  assert.deepEqual(local, { listen: 8445, ctrl: 8073 }, '本机端口锁定 8445/8073');
+  assert.equal(Number(unit.match(/--listen-port (\d+)/)?.[1]), local.listen);
+  assert.equal(Number(unit.match(/^Environment=SPEEDEX_HK_CTRL_PORT=(\d+)$/m)?.[1]), local.ctrl);
+  assert.match(unit, /--listen-host 127\.0\.0\.1 /, '本机 unit 必须 loopback-only');
+  assert.doesNotMatch(unit, /--listen-host 0\.0\.0\.0/);
+  for (const p of [local.listen, local.ctrl]) {
+    assert.ok(![8443, HK_CTRL_PORT, 18544, 18072].includes(p), `本机端口 ${p} 不得撞生产/实验端口`);
+    assert.ok(p < 18072 || p > 18271, `本机端口 ${p} 不得落在 EU 侧 SSH 隧道段`);
+  }
+  const allow = (txt) => txt.match(/--set "allow_hosts=[^"]*"/)?.[0];
+  assert.ok(allow(unit) && allow(unit) === allow(prodUnit), 'allow_hosts 必须与生产 unit 逐字一致');
+  for (const app of unit.match(/\/opt\/[a-z-]+/g)) assert.equal(app, '/opt/speedex-mitm-local', '本机 unit 只引用自身 APP');
+});
+
 // GNU realpath -m 能力门（2026-09-09 review）：install.sh 的隔离门是 GNU 语义，部署目标
 // 全为 Linux；macOS 系统 realpath 无 -m——本测试在**无能力的平台**不退化为假绿：
 // 静态钉住「规范化实现存在」并显式记录 capability skip（tests/AGENTS：能力 skip 显式登记）。

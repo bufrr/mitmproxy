@@ -1,0 +1,38 @@
+[Unit]
+Description=speedex timing proxy — LOCAL instance on the EU host (mitmdump + speedex_hk_timing addon, loopback-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 本机实例（SPEEDEX_HK_INSTANCE=local，2026-11-27）：EU 主机（dashboard/研究 Chrome/批次所在）自带的
+# MITM 出口，采集口径与远端生产实例相同——allow_hosts 必须与 speedex-mitm.service 逐字一致
+# （install.sh 本机分支校验）。与生产 unit 的差别只有：
+#   - APP /opt/speedex-mitm-local（独立 htpasswd / proxy.env / CA confdir）
+#   - 代理只听 127.0.0.1:8445（研究 Chrome 本机直连；不公网监听）
+#   - 控制面 127.0.0.1:8073（SPEEDEX_HK_CTRL_PORT；speedex 侧直连，无 SSH；避开 EU 侧 SSH 隧道段 18072-18271）
+# 认证照旧走 htpasswd 文件（0600，凭据不上 argv/environ）——loopback 端点同样强制认证。
+WorkingDirectory=/opt/speedex-mitm-local
+Environment=SPEEDEX_HK_CTRL_PORT=8073
+ExecStart=/opt/speedex-mitm-local/venv/bin/mitmdump \
+  --mode regular \
+  --listen-host 127.0.0.1 \
+  --listen-port 8445 \
+  --proxyauth @/opt/speedex-mitm-local/htpasswd \
+  --set confdir=/opt/speedex-mitm-local/.mitmproxy \
+  --set flow_detail=1 \
+  --set stream_large_bodies=256k \
+  --set body_size_limit=2m \
+  --set keep_host_header=false \
+  --set block_global=false \
+  --set "allow_hosts=(?:^(.*\\.)?(gmgn\\.ai|ws\\.gmgn\\.ai|web3\\.okx\\.com|wsdexpri\\.okx\\.com|www\\.okx\\.(?:com|ac)|turnkey\\.com|padre\\.gg|binance\\.com|fomo\\.family|relay\\.link)(:\\d+)?$)|(?:^(?:okx\\.(?:bsc-rpc\\.com|(?:rpc|builder)\\.48\\.club|bsc\\.blockrazor\\.xyz|bscnetwork\\.blockrazor\\.io)|(?:frankfurt|hongkong|newyork|tokyo)2?\\.solana\\.blockrazor\\.io|rpc\\.mainnet\\.(?:arc\\.io|chain\\.robinhood\\.com))(:\\d+)?$)|(?:^(?:mainnet\\.(?:hudson|block-engine)\\.jito\\.wtf|sender\\.helius-rpc\\.com|atlas-mainnet\\.helius-rpc\\.com|cashback\\.circular\\.fi|sender\\.lamport\\.dev|(?:nozomi\\.temporal\\.xyz|(?:edge|pit1|ewr1|ash1|lax1|fra2|ams1|lon1|tyo1|sgp1|pit|ewr|ash|lax|fra|ams|lon|tyo|sgp)\\.nozomi\\.temporal\\.xyz))(:\\d+)?$)|(?:^(?:api\\.axiom\\.trade|(?:cluster[a-z0-9-]*|socket[0-9]+)\\.axiom\\.trade|greer-651y13-fast-mainnet\\.helius-rpc\\.com|sequencer\\.mainnet\\.chain\\.robinhood\\.com|(?:lax|nyc|fra|ams|ash|sgp|tyo|lon|syd|uae|chi|dal|sea|lit)\\.lunar-lander\\.hellomoon\\.io)(:\\d+)?$)" \
+  -s /opt/speedex-mitm-local/speedex_hk_timing.py \
+  --quiet
+Restart=always
+RestartSec=3
+# 与生产同律：mitmproxy RSS 常态 150-300MB，留余量
+MemoryMax=700M
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
