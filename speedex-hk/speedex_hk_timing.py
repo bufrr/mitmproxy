@@ -386,7 +386,11 @@ MARK_TTL_S = 1800.0  # 窗口兜底寿命（EU 崩了没 close 时防环境流�
 # evidence has the Solana Axiom shape (txHash lowercase). Order legs
 # now start the existing exact-hash EVM receipt poll at the send (HK-L3′), as Axiom Solana and OKX do. Solana
 # Axiom unchanged; allow_hosts unchanged.
-ADDON_VERSION = "2026.11.24-axiom-evm-push-v10.38"
+# v10.39 (2026-11-27, owner "fix the repo first … apply to all proxy server"): Axiom's client socket may also be
+# socket<N>.axiom.trade (socket8 through a Singapore egress: the page received its user-tx frames, the addon tunnelled
+# it undecrypted → no Axiom success on every chain). Host match + allow_hosts widened to the socket form; frame
+# parsing, rooms, correlation and adoption unchanged.
+ADDON_VERSION = "2026.11.27-axiom-socket-host-v10.39"
 # 实例身份——启动时间+pid+短随机；热重载后新旧模块实例 id 不同
 INSTANCE_ID = f"{int(time.time())}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
@@ -888,9 +892,10 @@ AXIOM_HELLOMOON_REGIONS = (
 )
 AXIOM_HELLOMOON_HOSTS = frozenset(f"{r}.lunar-lander.hellomoon.io" for r in AXIOM_HELLOMOON_REGIONS)
 AXIOM_HELLOMOON_SEND_PATH = "/sendBatch-cors"
-# First-party Axiom WS hosts (observed cluster9 / cluster-atl1 / cluster-euc2). Addon dispatch only; the
+# First-party Axiom client-socket WS hosts: cluster form (observed cluster9 / cluster-atl1 / cluster-euc2) and, since
+# v10.39, socket form (socket8, served on a Singapore egress 2026-11-27, same rooms/frames). Addon dispatch only; the
 # decrypt scope (allow_hosts) carries the same exact-form pattern.
-AXIOM_CLUSTER_WS_HOST_RE = re.compile(r"cluster[a-z0-9-]*\.axiom\.trade")
+AXIOM_CLIENT_WS_HOST_RE = re.compile(r"(?:cluster[a-z0-9-]*|socket[0-9]+)\.axiom\.trade")
 # Helius "<name>-fast-mainnet" WS form. Addon dispatch only: decryption still needs the exact host in
 # allow_hosts, and an arrival is recorded only for an Axiom leg whose anchor signature equals the mapped one.
 # Never matches atlas-mainnet (OKX, dispatched earlier) or sender.helius-rpc.com (FOMO HTTP transport).
@@ -7967,7 +7972,7 @@ class SpeedexHkTiming:
                 STORE.note_channel_arrival("solana", sig, HELIUS_CHANNEL, "transactionNotification", t_obs,
                                            platform="okx")
             return
-        if AXIOM_CLUSTER_WS_HOST_RE.fullmatch(host or ""):
+        if AXIOM_CLIENT_WS_HOST_RE.fullmatch(host or ""):
             # v10.33: Axiom user-tx room → platform success of the leg with that exact send signature.
             # Client frames and every other room are ignored (prefilter before decode); nothing is retained.
             if not msg.from_client:

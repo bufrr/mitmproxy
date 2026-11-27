@@ -252,7 +252,7 @@ and every other platform's behaviour are unchanged (no new `RULES` entry: Axiom 
   signature within `AXIOM_SEND_FANOUT_MS` = 1000 ms of the latest leg's first send vetoes that leg
   (`_anchorVeto`, `incomplete="axiom-send-sig-conflict"`, `hkL1aMs` null) and the conflicting signature never gets a
   leg in that run (`axiomSendSigConflict`, `axiomSendConflictSig`). Sends after 1 s with a new signature are a new trade.
-- **Success (HK-L1a′)**: a server frame on `cluster[a-z0-9-]*.axiom.trade` (WS opened from a page shared worker)
+- **Success (HK-L1a′)**: a server frame on `cluster[a-z0-9-]*.axiom.trade` or (v10.39) `socket[0-9]+.axiom.trade` (WS opened from a page shared worker; Axiom picks the host per egress — socket8 through a Singapore egress, 2026-11-27)
   `{"room":"sol-v2|user-tx:<id>","content":[<sig>,<iso time>,"buy"|"sell",<pair>,…]}` (accepted shapes per v10.34 below) whose
   `content[0]` equals an open, non-vetoed Axiom leg's signature, at or after its send hook → `tSuccessPushMs` (frame hook
   entry, first adoption frozen), `successEvidence={version:1, platform:"axiom", channel:"axiom-user-tx-ws",
@@ -265,7 +265,7 @@ and every other platform's behaviour are unchanged (no new `RULES` entry: Axiom 
   subId→sig (connection-level, separate from OKX maps), and a mapped `signatureNotification` with `value.err` present and
   null records `channelArrivals {channel:"helius", api:"signatureNotification", ms}` on the Axiom leg with that anchor
   signature (`note_channel_arrival(..., platform="axiom")`, first arrival frozen). Not success. Diag `axiomHelius*`.
-- **Decrypt scope**: production and experiment units add exactly `api.axiom.trade`, `cluster[a-z0-9-]*.axiom.trade`
+- **Decrypt scope**: production and experiment units add exactly `api.axiom.trade`, `cluster[a-z0-9-]*.axiom.trade`, `socket[0-9]+.axiom.trade` (v10.39)
   (first-party form) and the 14 Hellomoon hosts (overlay section 2026-11-22). The Axiom page's Helius WS is added
   as one exact host, `greer-651y13-fast-mainnet.helius-rpc.com` (read from the live page 2026-11-22; no query key);
   the addon dispatches the form `[a-z0-9]+(-[a-z0-9]+)*-fast-mainnet.helius-rpc.com` (never atlas-mainnet/sender), so
@@ -386,7 +386,7 @@ captures through v10.37 read `hk-platform-unsupported`); Axiom Solana stays ≥ 
 Axiom BSC / Robinhood success push (live passive capture 2026-11-24 of the Axiom client-socket shared worker; the last
 BSC and RH batches through v10.37 counted these frames as `axiomUserTxInvalid.room`). Owner-approved 2026-11-24.
 
-- **Frames**: server frames on the same `cluster[a-z0-9-]*.axiom.trade` client socket as Solana, room
+- **Frames**: server frames on the same client socket as Solana (`cluster[a-z0-9-]*.axiom.trade` or `socket[0-9]+.axiom.trade`), room
   `bnb-v2|user-tx:<id>` (chainId 56) or `rh-v2|user-tx:<id>` (4663), id 8-64 `[0-9a-fA-F-]` as for `sol-v2`. content:
   [0] tx hash `0x`+64 hex (case-insensitive, kept lowercase), [1] ISO time, [2] `buy`|`sell`, [3] pair, [4] token,
   [5] wallet `0x`+40 hex (token and wallet must both be `0x`+40-hex addresses), then numbers (trailing items not read). One frame per trade; same JSON-array / NDJSON batch
@@ -417,3 +417,19 @@ BSC and RH batches through v10.37 counted these frames as `axiomUserTxInvalid.ro
 EU consumer: requires addon ≥ v10.38 for Axiom BSC/Robinhood (`axiomAddonSupported` minor ≥ 38 on EVM chains; older EVM
 captures read `hk-platform-unsupported`; Solana stays ≥ v10.33), reads the EVM
 success evidence and `hkL1aMs`/`hkL3Ms` of `axiom-evm-send` order legs, and registers the new invalid reasons.
+
+## 2026.11.27-axiom-socket-host-v10.39
+
+Axiom client-socket host per egress (owner 2026-11-27: "fix the repo first … apply to all proxy server").
+
+- **Cause**: through the HK-old node (hk-yt-1, egress geolocated to Singapore) Axiom's `client-socket` shared worker
+  connected to `socket8.axiom.trade` instead of a `cluster*` host (no-spend CDP capture 2026-11-27 10:49 +08). The page
+  received its `<chain>-v2|user-tx` frames, but the addon only decrypted/dispatched `cluster[a-z0-9-]*.axiom.trade`, so
+  batch 1795746999971-5lq7m had no Axiom success leg on any chain (`no-success-observed`, no `axiomUserTx` counter).
+- **Change**: `AXIOM_CLIENT_WS_HOST_RE` (was `AXIOM_CLUSTER_WS_HOST_RE`) = `(?:cluster[a-z0-9-]*|socket[0-9]+)\.axiom\.trade`,
+  full match; production / experiment `allow_hosts` and the overlay example carry the same alternation. Look-alikes
+  (`socket.axiom.trade`, `socketx.*`, `xsocket8.*`, `evil.socket8.*`, `socket8.axiom.trade.evil.example`) stay out.
+- **Unchanged**: frame shapes, rooms, correlation, adoption, freezing, receipts and every other host. EU
+  `axiomAddonSupported` accepts v10.39 (Solana ≥ v10.33, EVM ≥ v10.38).
+- **Tests**: `test_socket_form_host_is_the_same_client_socket` (socket8 adopted as success, look-alikes not); install
+  test allow/deny sets and overlay string.

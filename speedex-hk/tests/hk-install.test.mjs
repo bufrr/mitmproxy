@@ -257,14 +257,16 @@ test('Helius Atlas v10.30：生产 allow_hosts 只加精确 atlas-mainnet.helius
   assert.ok(!exp.includes('atlas-mainnet'), '实验 unit 不得加入 atlas host（OKX 透传）');
 });
 
-test('Axiom v10.33：生产/实验/overlay 只放行 api.axiom.trade、cluster*.axiom.trade 与 14 个精确 Hellomoon 区域（无第三方通配）', () => {
+test('Axiom v10.33/v10.39：生产/实验/overlay 只放行 api.axiom.trade、cluster*.axiom.trade、socketN.axiom.trade 与 14 个精确 Hellomoon 区域（无第三方通配）', () => {
   const regions = ['lax', 'nyc', 'fra', 'ams', 'ash', 'sgp', 'tyo', 'lon', 'syd', 'uae', 'chi', 'dal', 'sea', 'lit'];
   // greer-651y13-fast-mainnet.helius-rpc.com: the Axiom page's Helius WS, exact host read from the live page 2026-11-22
   const hosts = ['api.axiom.trade', 'cluster9.axiom.trade', 'cluster-atl1.axiom.trade', 'cluster-euc2.axiom.trade',
+    'socket8.axiom.trade', 'socket12.axiom.trade',
     'greer-651y13-fast-mainnet.helius-rpc.com', ...regions.map((r) => `${r}.lunar-lander.hellomoon.io`)];
   const rejected = [
     'axiom.trade', 'www.axiom.trade', 'evil.api.axiom.trade', 'api.axiom.trade.evil.example', 'xcluster9.axiom.trade',
-    'evil.cluster9.axiom.trade', 'cluster9.axiom.trade.evil.example', 'lunar-lander.hellomoon.io', 'pit.lunar-lander.hellomoon.io',
+    'evil.cluster9.axiom.trade', 'cluster9.axiom.trade.evil.example',
+    'socket.axiom.trade', 'socketx.axiom.trade', 'xsocket8.axiom.trade', 'evil.socket8.axiom.trade', 'socket8.axiom.trade.evil.example', 'lunar-lander.hellomoon.io', 'pit.lunar-lander.hellomoon.io',
     'tyo.lunar-lander.hellomoon.io.evil.example', 'evil.tyo.lunar-lander.hellomoon.io', 'hellomoon.io',
     'synthname-fast-mainnet.helius-rpc.com', 'mainnet.helius-rpc.com', 'xgreer-651y13-fast-mainnet.helius-rpc.com',
     'evil.greer-651y13-fast-mainnet.helius-rpc.com', 'greer-651y13-fast-mainnet.helius-rpc.com.evil.example',
@@ -293,7 +295,7 @@ test('Axiom v10.33：生产/实验/overlay 只放行 api.axiom.trade、cluster*.
     assert.ok(allowProd.test(`${host}:443`), `生产既有 host ${host} 丢失`);
   }
   const overlay = readSource('deploy/hk-proxy/selective-decrypt.overlay.example');
-  assert.ok(overlay.includes(String.raw`^(?:api\.axiom\.trade|cluster[a-z0-9-]*\.axiom\.trade|greer-651y13-fast-mainnet\.helius-rpc\.com|(?:lax|nyc|fra|ams|ash|sgp|tyo|lon|syd|uae|chi|dal|sea|lit)\.lunar-lander\.hellomoon\.io)(:\d+)?$`),
+  assert.ok(overlay.includes(String.raw`^(?:api\.axiom\.trade|(?:cluster[a-z0-9-]*|socket[0-9]+)\.axiom\.trade|greer-651y13-fast-mainnet\.helius-rpc\.com|(?:lax|nyc|fra|ams|ash|sgp|tyo|lon|syd|uae|chi|dal|sea|lit)\.lunar-lander\.hellomoon\.io)(:\d+)?$`),
     'overlay 缺带边界/端口的 Axiom regex');
 });
 

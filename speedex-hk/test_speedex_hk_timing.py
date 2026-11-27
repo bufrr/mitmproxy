@@ -7046,7 +7046,7 @@ class TestHeadPollCadenceWsFallbackV105(unittest.TestCase):
         self.assertIn("subscribe-error:-32601", d["lastErr"]["bsc"])
 
     def test_health_exposes_head_ws_and_version(self):
-        self.assertEqual(A.ADDON_VERSION, "2026.11.24-axiom-evm-push-v10.38")
+        self.assertEqual(A.ADDON_VERSION, "2026.11.27-axiom-socket-host-v10.39")
         src = Path(A.__file__).read_text(encoding="utf-8")
         self.assertIn('"headWs": HEADS.ws_diag_snapshot()', src)
 
@@ -11440,7 +11440,7 @@ class TestGmgnTradeHashV1032(unittest.TestCase):
             self.assertNotIn(self.WALLET, dumped, name)
             self.assertNotIn("122142992", dumped, name)
         self.assertEqual(surfaces["health"]["diag"].get("gmgnTradeHashArrivals"), 1)
-        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.24-axiom-evm-push-v10.38")
+        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.27-axiom-socket-host-v10.39")
 
 
 class TestAxiomSolana(unittest.TestCase):
@@ -11770,6 +11770,24 @@ class TestAxiomSolana(unittest.TestCase):
         default_row = self.rows(full=False)[0]
         self.assertNotEqual(default_row["evidence"]["success"]["txHash"], sig, "default timeline shortens the hash")
 
+    def test_socket_form_host_is_the_same_client_socket(self):
+        # v10.39: socket8.axiom.trade (Singapore egress 2026-11-27) carries the same user-tx rooms as cluster*.
+        raw, sig = self.tx()
+        self.send("axiom-api", raw)
+        leg = self.axiom_legs()[0]
+        self.clock += 210.0
+        for host in ("socketx.axiom.trade", "xsocket8.axiom.trade", "evil.socket8.axiom.trade",
+                     "socket8.axiom.trade.evil.example", "socket.axiom.trade", "socket8-a.axiom.trade"):
+            with self.subTest(host=host):
+                self.cluster(sig, "buy", host=host)
+                self.assertIsNone(leg["tSuccessPushMs"], f"{host} must not dispatch")
+        self.cluster(sig, "buy", host="socket8.axiom.trade")
+        self.assertEqual(leg["tSuccessPushMs"], self.clock)
+        self.assertEqual(leg["successEvidence"]["channel"], "axiom-user-tx-ws")
+        self.assertEqual(leg["successEvidence"]["txHash"], sig)
+        for host in ("socket8.axiom.trade", "socket12.axiom.trade", "cluster9.axiom.trade", "cluster-atl1.axiom.trade"):
+            self.assertIsNotNone(A.AXIOM_CLIENT_WS_HOST_RE.fullmatch(host), host)
+
     def test_wrong_signature_public_and_malformed_frames_ignored(self):
         raw, sig = self.tx()
         _, other = self.tx(0x63)
@@ -11932,7 +11950,7 @@ class TestAxiomSolana(unittest.TestCase):
             for s in secrets:
                 self.assertNotIn(s, dumped, (name, s[:24]))
         self.assertIn(sig, json.dumps(surfaces["timelineFull"]), "the public signature is the anchor")
-        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.24-axiom-evm-push-v10.38")
+        self.assertEqual(surfaces["health"]["addonVersion"], "2026.11.27-axiom-socket-host-v10.39")
         self.assertEqual(surfaces["health"]["diag"].get("axiomUserTxAdopted"), 1)
 
     # ── v10.34: opaque api body prefix ──
